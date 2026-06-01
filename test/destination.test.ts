@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   resolveDestination,
+  makeSandboxCreator,
   DestinationArgsError,
   DestinationApiError,
   writePermissionMessage,
@@ -14,6 +15,7 @@ import {
   type DestinationSelection,
   type RepoRef,
 } from "../src/destination.js";
+import type { Octokit } from "@octokit/rest";
 import type { RepoVerification } from "../src/github.js";
 import type { SavedDestination } from "../src/config.js";
 
@@ -394,6 +396,223 @@ test("VAL-CREATE-004 (resolver half): --sandbox X --create-sandbox creates missi
     );
     assert.ok(!h.calls.some((c) => c.fn === "create"));
   }
+});
+
+// --- Sandbox creation wrapper (makeSandboxCreator + createPrivateRepo) ---
+
+/** An HTTP-status-bearing error shaped like an Octokit failure. */
+function httpError(status: number): Error & { status: number } {
+  const err = new Error(`HTTP ${status}`) as Error & { status: number };
+  err.status = status;
+  return err;
+}
+
+/** A recorded call against the fake Octokit's create surface. */
+interface FakeOctokitCall {
+  method:
+    | "getAuthenticated"
+    | "createForAuthenticatedUser"
+    | "createInOrg";
+  args: unknown;
+}
+
+/**
+ * Build a fake Octokit exposing only the methods the creation wrapper uses.
+ * Records each call. `authedLogin` is the login `users.getAuthenticated` reports;
+ * `failStatus` (if set) makes the create call throw that HTTP status.
+ */
+function makeFakeOctokit(opts: {
+  authedLogin: string;
+  failStatus?: number;
+}): { octokit: Octokit; calls: FakeOctokitCall[] } {
+  const calls: FakeOctokitCall[] = [];
+  const fake = {
+    users: {
+      getAuthenticated: async () => {
+        calls.push({ method: "getAuthenticated", args: undefined });
+        return { data: { login: opts.authedLogin } };
+      },
+    },
+    repos: {
+      createForAuthenticatedUser: async (args: unknown) => {
+        calls.push({ method: "createForAuthenticatedUser", args });
+        if (opts.failStatus !== undefined) throw httpError(opts.failStatus);
+        const a = args as { name: string };
+        return {
+          data: { name: a.name, owner: { login: opts.authedLogin } },
+        };
+      },
+      createInOrg: async (args: unknown) => {
+        calls.push({ method: "createInOrg", args });
+        if (opts.failStatus !== undefined) throw httpError(opts.failStatus);
+        const a = args as { org: string; name: string };
+        return { data: { name: a.name, owner: { login: a.org } } };
+      },
+    },
+  };
+  return { octokit: fake as unknown as Octokit, calls };
+}
+
+// --- VAL-CREATE-001 ---
+test("VAL-CREATE-001: personal-account owner → createForAuthenticatedUser, private", async () => {
+  const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
+  const create = makeSandboxCreator(octokit);
+  const result = await create({ owner: "me", name: "pr-backtest-sandbox" });
+
+  assert.deepEqual(result, { owner: "me", repo: "pr-backtest-sandbox" });
+  // Authenticated-user create was used (NOT createInOrg).
+  const createCall = calls.find(
+    (c) => c.method === "createForAuthenticatedUser",
+  );
+  assert.ok(createCall, "createForAuthenticatedUser was called");
+  assert.ok(
+    !calls.some((c) => c.method === "createInOrg"),
+    "createInOrg not called for a personal account",
+  );
+  // The recorded create-call args set private: true and a default branch.
+  const args = createCall.args as { private: unknown; auto_init: unknown };
+  assert.equal(args.private, true, "repo created private");
+  assert.equal(args.auto_init, true, "repo auto-initialized");
+});
+
+test("VAL-CREATE-001: org owner → createInOrg, private, owner defaults to source owner", async () => {
+  // authed login differs from the requested (source) owner → org route.
+  const { octokit, calls } = makeFakeOctokit({ authedLogin: "personal-me" });
+  const create = makeSandboxCreator(octokit);
+  // Owner is the SOURCE owner (acme) passed by the resolver.
+  const result = await create({ owner: "acme", name: "backtest" });
+
+  assert.deepEqual(result, { owner: "acme", repo: "backtest" });
+  const createCall = calls.find((c) => c.method === "createInOrg");
+  assert.ok(createCall, "createInOrg was called for an org owner");
+  assert.ok(
+    !calls.some((c) => c.method === "createForAuthenticatedUser"),
+    "createForAuthenticatedUser not called for an org",
+  );
+  const args = createCall.args as {
+    org: unknown;
+    private: unknown;
+    auto_init: unknown;
+  };
+  assert.equal(args.org, "acme", "created inside the source owner's org");
+  assert.equal(args.private, true, "repo created private");
+  assert.equal(args.auto_init, true, "repo auto-initialized");
+});
+
+// --- VAL-CREATE-002 (creator half) ---
+test("VAL-CREATE-002: 403 from create → DestinationApiError naming owner + permission, never writes source", async () => {
+  const { octokit, calls } = makeFakeOctokit({
+    authedLogin: "personal-me",
+    failStatus: 403,
+  });
+  const create = makeSandboxCreator(octokit);
+  await assert.rejects(
+    () => create({ owner: SOURCE.owner, name: "backtest" }),
+    (err: unknown) => {
+      assert.ok(err instanceof DestinationApiError);
+      assert.match(err.message, /acme/); // names the owner
+      assert.match(err.message, /permission/i); // names the missing permission
+      return true;
+    },
+  );
+  // The wrapper attempted to create under the org owner — it never targeted any
+  // repo as a write fallback (only the org-create + getAuthenticated calls ran).
+  assert.ok(
+    calls.every(
+      (c) =>
+        c.method === "getAuthenticated" || c.method === "createInOrg",
+    ),
+    "no unexpected calls after a 403",
+  );
+});
+
+// --- VAL-CREATE-002 (both branches through the resolver) ---
+test("VAL-CREATE-002: 403 — non-interactive exits 2; interactive re-prompts", async () => {
+  const failingCreate = makeSandboxCreator(
+    makeFakeOctokit({ authedLogin: "personal-me", failStatus: 403 }).octokit,
+  );
+
+  // Non-interactive: --sandbox acme/new --create-sandbox, missing → create 403 → exit 2.
+  {
+    const calls: RecordedCall[] = [];
+    const resolvers: DestinationResolvers = {
+      getFlags: () => ({ sandbox: "acme/new", createSandbox: true }),
+      getDefaultDestination: () => undefined,
+      getIsTTY: () => false,
+      verifyDestination: async (owner, repo) => {
+        calls.push({ fn: "verify", args: [owner, repo] });
+        return { exists: false, canPush: false };
+      },
+      createSandbox: async (req) => {
+        calls.push({ fn: "create", args: [req.owner, req.name] });
+        return failingCreate(req);
+      },
+      prompt: async () => {
+        throw new Error("prompt should not be called non-interactively");
+      },
+    };
+    await assert.rejects(
+      () => resolveDestination(SOURCE, resolvers),
+      (err: unknown) => {
+        assert.ok(err instanceof DestinationApiError);
+        assert.match(err.message, /acme/);
+        assert.match(err.message, /permission/i);
+        return true;
+      },
+    );
+    // Source never written: only acme/new was the create target, source acme/api never.
+    assertSourceNeverWritten(calls);
+  }
+
+  // Interactive: create-sandbox 403 → re-present the menu, then pick primary (writable).
+  {
+    let promptCount = 0;
+    const calls: RecordedCall[] = [];
+    const resolvers: DestinationResolvers = {
+      getFlags: () => ({}),
+      getDefaultDestination: () => undefined,
+      getIsTTY: () => true,
+      verifyDestination: async (owner, repo) => {
+        calls.push({ fn: "verify", args: [owner, repo] });
+        return { exists: true, canPush: true };
+      },
+      createSandbox: async (req) => {
+        calls.push({ fn: "create", args: [req.owner, req.name] });
+        return failingCreate(req); // always 403
+      },
+      prompt: async (choices) => {
+        calls.push({ fn: "prompt", args: [choices] });
+        promptCount += 1;
+        return promptCount === 1
+          ? { kind: "create-sandbox" }
+          : { kind: "primary", repo: SOURCE };
+      },
+    };
+    const result = await resolveDestination(SOURCE, resolvers);
+    assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+    assert.ok(promptCount >= 2, "menu re-presented after create 403");
+  }
+});
+
+// --- VAL-INV-002 (token safety on the create path) ---
+test("VAL-INV-002: creation wrapper receives octokit, never a token; no token in args", async () => {
+  // makeSandboxCreator's parameter is an Octokit instance, not a string token.
+  // We pass a fake octokit; the request carries only owner + name (no token).
+  const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
+  const create = makeSandboxCreator(octokit);
+  await create({ owner: "me", name: "sbx" });
+  // No recorded call arg contains anything resembling a token; the create call
+  // args are exactly { name, private, auto_init } — no auth/token field.
+  const createCall = calls.find(
+    (c) => c.method === "createForAuthenticatedUser",
+  );
+  assert.ok(createCall);
+  const args = createCall.args as Record<string, unknown>;
+  assert.deepEqual(Object.keys(args).sort(), [
+    "auto_init",
+    "name",
+    "private",
+  ]);
 });
 
 test("default seams throw clearly (create + prompt)", async () => {

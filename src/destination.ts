@@ -16,7 +16,9 @@
  * an Octokit instance through their injected seams, never a raw token
  * (INV-TOKEN). No message in this module ever echoes a token.
  */
+import type { Octokit } from "@octokit/rest";
 import type { RepoVerification } from "./github.js";
+import { createPrivateRepo, isHttpStatus } from "./github.js";
 import type { SavedDestination } from "./config.js";
 import { parseRepoSlug } from "./parseUrl.js";
 import { warn } from "./log.js";
@@ -183,6 +185,63 @@ export const unimplementedSandboxCreator: SandboxCreator = async () => {
     "Sandbox creation is not available in this build.",
   );
 };
+
+/**
+ * Build the REAL {@link SandboxCreator} backed by an Octokit instance.
+ *
+ * Creates a PRIVATE repo (INV-PRIVATE) via {@link createPrivateRepo}, which
+ * routes personal-account owners to `repos.createForAuthenticatedUser` and org
+ * owners to `repos.createInOrg`. The owner defaults to the source owner upstream
+ * (the resolver passes it in); this factory does not re-derive it.
+ *
+ * Failure handling (VAL-CREATE-002): a 403 / insufficient-permission from the
+ * create call is re-wrapped as a {@link DestinationApiError} naming the owner and
+ * the missing permission, so the caller maps it to exit 2 (non-interactive) or
+ * re-presents the menu (interactive) — it NEVER falls through to writing the
+ * source repo. Other create failures are also surfaced as a `DestinationApiError`
+ * (exit 2) rather than leaking a raw Octokit error.
+ *
+ * SECURITY: takes an `octokit` instance, never a raw token (INV-TOKEN). No
+ * message produced here echoes the token.
+ */
+export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
+  return async (request) => {
+    try {
+      const created = await createPrivateRepo(
+        octokit,
+        request.owner,
+        request.name,
+      );
+      return { owner: created.owner, repo: created.repo };
+    } catch (err: unknown) {
+      if (isHttpStatus(err, 403)) {
+        throw new DestinationApiError(
+          `Cannot create a sandbox repository under ${request.owner}: ` +
+            "the token lacks permission to create repositories there " +
+            "(needs Administration:write / repo-creation rights on that " +
+            "account or org). Choose an owner you can create repos in, or a " +
+            "different destination.",
+        );
+      }
+      if (isHttpStatus(err, 404)) {
+        throw new DestinationApiError(
+          `Cannot create a sandbox repository under ${request.owner}: ` +
+            "that owner was not found or is not visible to the token.",
+        );
+      }
+      if (isHttpStatus(err, 422)) {
+        throw new DestinationApiError(
+          `Cannot create sandbox ${request.owner}/${request.name}: ` +
+            "GitHub rejected the creation (the name may already be in use or " +
+            "be invalid).",
+        );
+      }
+      throw new DestinationApiError(
+        `Failed to create a sandbox repository under ${request.owner}.`,
+      );
+    }
+  };
+}
 
 /** Default prompt seam: throws until feature 4 (interactive-menu) wires the real prompt. */
 export const unimplementedPrompt: DestinationPrompt = async () => {
@@ -413,10 +472,23 @@ async function resolveInteractive(
 
     if (selection.kind === "create-sandbox") {
       // Feature 3's creator owns name/owner prompting; default owner is the source.
-      const created = await resolvers.createSandbox({
-        owner: source.owner,
-        name: "pr-backtest-sandbox",
-      });
+      // VAL-CREATE-002 (interactive): a creation failure (e.g. a 403 because the
+      // source owner is an org the token cannot create repos in) surfaces its
+      // message and re-presents the menu — it NEVER falls through to writing the
+      // source repo.
+      let created: RepoRef;
+      try {
+        created = await resolvers.createSandbox({
+          owner: source.owner,
+          name: "pr-backtest-sandbox",
+        });
+      } catch (err: unknown) {
+        if (err instanceof DestinationApiError) {
+          warn(err.message);
+          continue;
+        }
+        throw err;
+      }
       if (sameRepo(created, source)) {
         return { owner: created.owner, repo: created.repo, isSandbox: false };
       }
