@@ -19,7 +19,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "test": "node --import tsx --test test/*.test.ts",
     "prepare": "tsc",
     "prepublishOnly": "tsc"
   },
