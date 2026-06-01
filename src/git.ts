@@ -51,7 +51,7 @@ export class UnfetchableCommitError extends Error {
  * Build the SPEC §6.5 unfetchable-commit message for a given SHA + PR number.
  *
  * `remote` names where the fetch was attempted: `origin` (same-repo runs) or
- * `source` (`--fork` mode, where commits come from the PR's original repo).
+ * `source` (sandbox mode, where commits come from the PR's original repo).
  */
 export function buildUnfetchableMessage(
   sha: string,
@@ -165,7 +165,7 @@ export async function cloneRepo(
 /**
  * Add a `source` remote pointing at the repo the PR actually lives in.
  *
- * Used in `--fork` mode: the clone is the fork (origin), and the PR's commits
+ * Used in sandbox mode: the clone is the fork (origin), and the PR's commits
  * are fetched from this `source` remote. The token is supplied via the same
  * GIT_ASKPASS env already configured on `git`, so a token with read on the
  * source and write on the fork covers both. The URL carries no secret.

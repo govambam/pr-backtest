@@ -17,7 +17,7 @@ export interface ParsedPrUrl {
   number: number;
 }
 
-/** An `owner/repo` pair, e.g. the `--fork` target. */
+/** An `owner/repo` pair, e.g. the `--sandbox` destination. */
 export interface RepoSlug {
   owner: string;
   repo: string;
@@ -27,13 +27,14 @@ export interface RepoSlug {
 const REPO_SLUG_RE = /^([\w.-]+)\/([\w.-]+)$/;
 
 /**
- * Parse an `owner/repo` slug (used by `--fork`). Tolerates a leading
+ * Parse an `owner/repo` slug (used by `--sandbox` and the interactive
+ * destination prompt). Tolerates a leading
  * `https://github.com/` prefix and a trailing `.git` / slash. Throws a clear
  * `Error` on anything that is not a single `owner/repo` pair.
  */
 export function parseRepoSlug(slug: string): RepoSlug {
   if (typeof slug !== "string" || slug.trim() === "") {
-    throw new Error("Invalid --fork value: expected a non-empty owner/repo.");
+    throw new Error("Invalid repository: expected a non-empty owner/repo.");
   }
   const cleaned = slug
     .trim()
@@ -46,7 +47,7 @@ export function parseRepoSlug(slug: string): RepoSlug {
   const isDots = (s: string): boolean => /^\.+$/.test(s);
   if (!match || !match[1] || !match[2] || isDots(match[1]) || isDots(match[2])) {
     throw new Error(
-      `Invalid --fork value: "${slug}". Expected an owner/repo slug, e.g. myuser/myfork.`,
+      `Invalid repository: "${slug}". Expected an owner/repo slug, e.g. myuser/sandbox.`,
     );
   }
   return { owner: match[1], repo: match[2] };

@@ -28,6 +28,6 @@ test("allows dots, hyphens, and underscores in names", () => {
 
 test("rejects empty, single-segment, three-segment, and dot-only-segment input", () => {
   for (const bad of ["", "   ", "noslash", "a/b/c", "/", "owner/", "../x", "a/..", "./x"]) {
-    assert.throws(() => parseRepoSlug(bad), /Invalid --fork value/);
+    assert.throws(() => parseRepoSlug(bad), /Invalid repository/);
   }
 });
