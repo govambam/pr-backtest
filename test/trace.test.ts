@@ -17,8 +17,18 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
+import type { SimpleGit } from "simple-git";
+
 import { makeOctokit } from "../src/github.js";
+import { fetchCommit } from "../src/git.js";
 import { setVerbose, setTtyOverride } from "../src/log.js";
+
+/** A fake `SimpleGit` whose `fetch` resolves — enough to drive `traceOp`. */
+function fakeGitOk(): SimpleGit {
+  return {
+    fetch: async () => ({}) as never,
+  } as unknown as SimpleGit;
+}
 
 /**
  * Capture everything written to `process.stderr` for the duration of `run`,
@@ -169,6 +179,26 @@ test("VAL-API-003: default mode (verbose off) prints zero per-request lines", as
   assert.equal(calls.length, 1, "the request still ran (hook still times it)");
   const lines = out.split("\n").filter((l) => l.includes("→"));
   assert.equal(lines.length, 0, `expected no per-request line, got: ${out}`);
+});
+
+test("VAL-GIT-003: on a TTY a git op rewrites its start line in place (carriage return)", async () => {
+  setTtyOverride(true);
+  const out = await captureStderr(async () => {
+    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
+  });
+  // TTY: the in-progress line is overwritten in place — a `\r` is present and
+  // the completion marker (`✓`) appears.
+  assert.ok(out.includes("\r"), `expected an in-place rewrite (\\r), got: ${JSON.stringify(out)}`);
+  assert.match(out, /✓/);
+});
+
+test("VAL-GIT-003: with no TTY a git op prints only the completion line, no carriage returns", async () => {
+  setTtyOverride(false);
+  const out = await captureStderr(async () => {
+    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
+  });
+  assert.ok(!out.includes("\r"), `expected no carriage return off-TTY, got: ${JSON.stringify(out)}`);
+  assert.match(out, /✓/);
 });
 
 test("VAL-API-004: a request to a non-api.github.com host is a hard error (throws)", async () => {

@@ -100,6 +100,43 @@ export function redactedRepoRef(owner: string, repo: string): string {
   return `github.com/${owner}/${repo}`;
 }
 
+// ---------------------------------------------------------------------------
+// Constructed git display commands (VAL-GIT-001 / VAL-GIT-002).
+//
+// Each helper builds the `git …` argv string that MIRRORS the real command
+// simple-git runs, assembled purely from the tool's own inputs (the
+// `repoHttpsUrl`, the SHA, the refspec, the remote name) — NEVER captured from
+// simple-git's internal argv and NEVER from the git child's stdout/stderr.
+// Because the token travels via GIT_ASKPASS (never in the URL or on the command
+// line), the displayed command equals the real one and is secret-free; the URL
+// carries only the `x-access-token` username. `redact()` is still the final net
+// when these strings are written.
+// ---------------------------------------------------------------------------
+
+/** `git clone --no-checkout <repoHttpsUrl> <cloneTarget>` — mirrors {@link cloneRepo}. */
+export function cloneDisplayCommand(
+  owner: string,
+  repo: string,
+  cloneTarget: string,
+): string {
+  return `git clone --no-checkout ${repoHttpsUrl(owner, repo)} ${cloneTarget}`;
+}
+
+/** `git remote add source <repoHttpsUrl>` — mirrors {@link addSourceRemote}. */
+export function addRemoteDisplayCommand(owner: string, repo: string): string {
+  return `git remote add source ${repoHttpsUrl(owner, repo)}`;
+}
+
+/** `git fetch <remote> <sha>` — mirrors {@link fetchCommit}. */
+export function fetchDisplayCommand(remote: string, sha: string): string {
+  return `git fetch ${remote} ${sha}`;
+}
+
+/** `git push origin <sha>:refs/heads/<branch>` — mirrors {@link pushBranchFromSha}. */
+export function pushDisplayCommand(sha: string, branch: string): string {
+  return `git push origin ${sha}:refs/heads/${branch}`;
+}
+
 /**
  * Write a GIT_ASKPASS helper into `tmpDir` and return its path.
  *
@@ -151,14 +188,21 @@ export async function cloneRepo(
   const askpassPath = writeAskpassHelper(tmpDir);
   const env = gitEnv(token, askpassPath);
   const cloneTarget = join(tmpDir, "repo");
+  const trace = log.traceOp(`Cloning ${redactedRepoRef(owner, repo)}`);
+  const start = Date.now();
   try {
     await simpleGit()
       .env(env)
       .clone(repoHttpsUrl(owner, repo), cloneTarget, ["--no-checkout"]);
   } catch {
+    trace.fail();
     // Never surface raw git stderr.
     throw new Error(`Failed to clone ${redactedRepoRef(owner, repo)}.`);
   }
+  trace.done();
+  log.verboseLine(
+    `$ ${cloneDisplayCommand(owner, repo, cloneTarget)}  ${Date.now() - start}ms`,
+  );
   return simpleGit(cloneTarget).env(env);
 }
 
@@ -175,7 +219,20 @@ export async function addSourceRemote(
   owner: string,
   repo: string,
 ): Promise<void> {
-  await git.addRemote("source", repoHttpsUrl(owner, repo));
+  const trace = log.traceOp(`Adding source remote ${redactedRepoRef(owner, repo)}`);
+  const start = Date.now();
+  try {
+    await git.addRemote("source", repoHttpsUrl(owner, repo));
+  } catch (err: unknown) {
+    trace.fail();
+    // Preserve the existing error type/behavior (INV-NO-BEHAVIOR-CHANGE): this
+    // op did not previously swallow git stderr, so rethrow unchanged.
+    throw err;
+  }
+  trace.done();
+  log.verboseLine(
+    `$ ${addRemoteDisplayCommand(owner, repo)}  ${Date.now() - start}ms`,
+  );
 }
 
 /**
@@ -191,13 +248,17 @@ export async function fetchCommit(
   prNumber: number,
   remote = "origin",
 ): Promise<void> {
-  log.step(`Fetching commit ${shortSha(sha)} from ${remote}`);
+  const trace = log.traceOp(`Fetching ${shortSha(sha)} from ${remote}`);
+  const start = Date.now();
   try {
     await git.fetch(remote, sha);
   } catch {
+    trace.fail();
     // Deliberately do not surface raw git stderr — it leaks little and confuses.
     throw new UnfetchableCommitError(sha, prNumber, remote);
   }
+  trace.done();
+  log.verboseLine(`$ ${fetchDisplayCommand(remote, sha)}  ${Date.now() - start}ms`);
 }
 
 /**
@@ -216,13 +277,17 @@ export async function pushBranchFromSha(
   branch: string,
 ): Promise<void> {
   const refspec = `${sha}:refs/heads/${branch}`;
-  log.step(`Pushing ${shortSha(sha)} → ${branch}`);
+  const trace = log.traceOp(`Pushing ${shortSha(sha)} → ${branch}`);
+  const start = Date.now();
   try {
     await git.push("origin", refspec);
   } catch {
+    trace.fail();
     // Never surface raw git stderr — it can echo the credential header.
     throw new Error(`Failed to push ${shortSha(sha)} → ${branch}.`);
   }
+  trace.done();
+  log.verboseLine(`$ ${pushDisplayCommand(sha, branch)}  ${Date.now() - start}ms`);
 }
 
 /** Synchronously remove `tmpDir`, ignoring errors. */
