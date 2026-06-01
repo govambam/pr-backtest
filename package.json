@@ -1,6 +1,6 @@
 {
   "name": "pr-backtest",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Recreate a GitHub PR at a chosen commit so PR-review bots can review it as it existed at that moment.",
   "type": "module",
   "license": "MIT",

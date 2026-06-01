@@ -43,6 +43,7 @@ pr-backtest <pr-url> [--commit <ref>] [-y]
 | `<pr-url>` | Yes | — | Full GitHub PR URL, e.g. `https://github.com/acme/api/pull/123` |
 | `--commit <ref>` | No | `initial` | `initial` (first non-merge commit of the PR) or a full SHA. The created PR's head will be at this commit; its base will be the commit's parent. |
 | `-y`, `--yes` | No | `false` | Skip the confirmation prompt. For scripting. |
+| `--fork <owner/repo>` | No | — | Create the backtest branches and PR in this fork instead of the PR's own repo. The PR is still **read** from the URL's repo; only the **writes** (branch pushes, PR creation) are redirected to the fork. See §5 "Same-repo by default, optional `--fork`". |
 
 ### Subcommands
 | Command | Description |
@@ -178,6 +179,12 @@ URL=$(pr-backtest https://github.com/acme/api/pull/123 -y)
 11. **Print PR URL** to stdout.
 12. **Clean up temp dir.**
 
+### With `--fork <owner/repo>`
+The PR is still **read** from the URL's repo (steps 1–4 are unchanged — `getPullRequest` / `listCommits` / `getCommit` all hit the original repo). Only the **writes** are redirected to the fork:
+- Step 5 (existing-PR check), step 7 (clone), step 9 (branch pushes), and step 10 (PR creation) all target the **fork**, not the original repo.
+- Step 8 fetches the target/base commits from a `source` remote pointing at the original repo (added to the fork clone), because a fresh fork does not contain the PR's branches/refs — only the shared object network. This is why the token needs **read** on the original repo and **write** on the fork.
+- The original repo is therefore never written to: no branches, no PR. See §5.
+
 ### Safety properties
 - `main` is never checked out, written to, or pushed to.
 - The temp clone directory is always removed on exit (success or failure), via a `finally` block and `process.on('exit')` handler.
@@ -187,8 +194,17 @@ URL=$(pr-backtest https://github.com/acme/api/pull/123 -y)
 
 ## 5. Key design decisions
 
-### Same-repo push, no fork option
-The original simulator forked because it ran on public OSS repos and didn't want to clutter someone else's project. The target user here owns the repo. New branches with `backtest-pr*` prefixes are isolated from `main` — opening a PR doesn't merge anything. If a user wants extra isolation, they can manually fork their repo first and point the tool at the fork's URL. No tool-level flag needed.
+### Same-repo by default, optional `--fork`
+By default the tool pushes branches and opens the simulated PR in the PR's own repo. The `backtest-pr*` branches are isolated from `main` — opening a PR doesn't merge anything — so for most users (who own the repo) this is fine.
+
+For users who want the writes to land somewhere the tool's token can't reach their real repo, `--fork <owner/repo>` redirects all writes to a fork. **The key intent: read from the original, write to the fork.** The PR data and its commits are read from the URL's repo via the API; the branches and PR are created in the fork. The commits are fetched from a `source` remote (the original repo) into the fork clone — a plain fork doesn't carry the PR's refs, only the shared git object network, so a SHA-targeted fetch from `source` is the reliable path.
+
+Access implications, stated honestly:
+- The token needs **read** on the original repo (to read the PR + fetch the commits) and **write** on the fork (to push branches + open the PR).
+- If the original repo is **public**, a token scoped to *only the fork* is enough — public reads don't require access on the source. This is the original Macroscope simulator's case (public OSS repos), and the strongest isolation story: the token literally cannot write to the source.
+- If the original repo is **private**, the token must also have read on it. The blast radius is still smaller than write-on-source, but it is not "the token can't touch the real repo at all."
+
+The earlier version of this spec said "no tool-level flag needed; just point the tool at the fork's URL." That was wrong: forking does not copy PRs, so the fork has no PR to read, and a fork-scoped token cannot write to the original repo named in an upstream PR URL. `--fork` is the correct mechanism.
 
 ### Direct branch-from-SHA, no cherry-pick
 The original simulator had a 3-strategy fallback (merge-commit → pr-head-fetch → cherry-pick) because it was always replaying the *full* PR state, and squash/rebase merges made finding the right SHA pair tricky. Our scope is different — we target a single specific commit, not "the whole PR state."

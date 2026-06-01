@@ -153,16 +153,37 @@ export async function cloneRepo(
 }
 
 /**
- * Fetch a single, specific commit SHA from origin.
+ * Add a `source` remote pointing at the repo the PR actually lives in.
  *
- * This is a targeted `git fetch origin <sha>` — never a full-branch checkout.
+ * Used in `--fork` mode: the clone is the fork (origin), and the PR's commits
+ * are fetched from this `source` remote. The token is supplied via the same
+ * GIT_ASKPASS env already configured on `git`, so a token with read on the
+ * source and write on the fork covers both. The URL carries no secret.
+ */
+export async function addSourceRemote(
+  git: SimpleGit,
+  owner: string,
+  repo: string,
+): Promise<void> {
+  await git.addRemote("source", repoHttpsUrl(owner, repo));
+}
+
+/**
+ * Fetch a single, specific commit SHA from a remote (default `origin`).
+ *
+ * This is a targeted `git fetch <remote> <sha>` — never a full-branch checkout.
  * On any failure we throw {@link UnfetchableCommitError} carrying the SPEC §6.5
  * message; the raw git stderr is swallowed (it is not user-actionable).
  */
-export async function fetchCommit(git: SimpleGit, sha: string, prNumber: number): Promise<void> {
-  log.step(`Fetching commit ${shortSha(sha)} from origin`);
+export async function fetchCommit(
+  git: SimpleGit,
+  sha: string,
+  prNumber: number,
+  remote = "origin",
+): Promise<void> {
+  log.step(`Fetching commit ${shortSha(sha)} from ${remote}`);
   try {
-    await git.fetch("origin", sha);
+    await git.fetch(remote, sha);
   } catch {
     // Deliberately do not surface raw git stderr — it leaks little and confuses.
     throw new UnfetchableCommitError(sha, prNumber);

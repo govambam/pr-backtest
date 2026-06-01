@@ -25,6 +25,9 @@ pr-backtest https://github.com/acme/api/pull/123 --commit a1b2c3d
 
 # Skip the confirmation prompt (for scripting)
 pr-backtest https://github.com/acme/api/pull/123 -y
+
+# Create the backtest branches + PR in a fork, not the PR's own repo
+pr-backtest https://github.com/acme/api/pull/123 --fork myuser/api
 ```
 
 On first run it prompts for a GitHub token (and offers to reuse your `gh` CLI login if you have one). The new PR's URL is printed to stdout. Run `pr-backtest logout` to remove a saved token.
@@ -60,7 +63,13 @@ https://github.com/acme/api/pull/451
 
 A token like this can't reach your other repos, create repos, or touch org settings.
 
-**For maximum isolation, fork first.** Fork the repo, create a fine-grained token scoped only to that fork, and run pr-backtest against PR URLs on your fork. The token then physically can't touch your real repo — every backtest branch and PR lands on the fork instead.
+**For maximum isolation, use a fork.** Fork the repo, then pass `--fork <owner/repo>`:
+
+```bash
+pr-backtest https://github.com/acme/api/pull/123 --fork myuser/api
+```
+
+pr-backtest reads the PR from the original repo but creates the backtest branches and PR in your fork — the original repo is never written to. If the original repo is **public**, a token scoped to only the fork is enough. If it's **private**, the token also needs read access on the original repo (to read the PR and fetch its commits) — still narrower than granting write access there.
 
 ## License
 
