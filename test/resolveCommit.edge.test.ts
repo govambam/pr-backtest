@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveBase, resolveCommit, type PrCommit } from "../src/resolveCommit.js";
+import { resolveBase, resolveTarget, type PrCommit } from "../src/resolveCommit.js";
 
 test("resolveBase throws for a root commit (no listed parent, lookup returns empty)", () => {
   const root: PrCommit = { sha: "a".repeat(40), parents: [] };
@@ -20,7 +20,7 @@ test("an abbreviated SHA that matches multiple PR commits is rejected as ambiguo
     { sha: "abcdef1" + "1".repeat(33), parents: [{ sha: parent }] },
   ];
   assert.throws(
-    () => resolveCommit("abcdef1", commits, () => parent),
+    () => resolveTarget("abcdef1", commits),
     /ambiguous/,
   );
 });

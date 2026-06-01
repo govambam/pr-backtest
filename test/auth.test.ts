@@ -139,7 +139,7 @@ test("options.makeOctokit injection seam is honored on the default validation pa
 
   assert.equal(seamUsed, true, "the injected factory must be used");
   assert.equal(seenToken, "ghp_injected_token_value");
-  assert.equal(result.username, "injected-user");
+  assert.equal(result.token, "ghp_injected_token_value");
 });
 
 test("the shared makeOctokit factory traces GET /user (so the default validation call is traced)", async () => {

@@ -2,10 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  resolveCommit,
   resolveTarget,
   resolveBase,
   type PrCommit,
+  type GetParentSha,
 } from "../src/resolveCommit.js";
 
 // A small fixture PR: parent -> A -> B, with a leading merge commit M (2 parents).
@@ -22,12 +22,18 @@ const commits: PrCommit[] = [
 ];
 
 // getParentSha stub: should not be hit when commits carry their own parents.
-const failParent = (sha: string): string => {
+const failParent: GetParentSha = (sha) => {
   throw new Error(`getParentSha should not have been called (sha=${sha})`);
 };
 
+/** Resolve the target + base in one step, the way index.ts wires them. */
+function resolve(commitOption: string, getParentSha: GetParentSha) {
+  const target = resolveTarget(commitOption, commits);
+  return { targetSha: target.sha, baseSha: resolveBase(target, getParentSha) };
+}
+
 test("initial: selects the earliest non-merge commit, skipping a leading merge commit", () => {
-  const result = resolveCommit("initial", commits, failParent);
+  const result = resolve("initial", failParent);
   assert.equal(result.targetSha, A);
   assert.equal(result.baseSha, PARENT);
 });
@@ -37,61 +43,62 @@ test("initial: throws a clear error when every commit is a merge commit", () => 
     { sha: M, parents: [{ sha: PARENT }, { sha: A }] },
   ];
   assert.throws(
-    () => resolveCommit("initial", allMerges, failParent),
+    () => resolveTarget("initial", allMerges),
     /no non-merge commits/,
   );
 });
 
 test("explicit full SHA: matched directly, base is its parent", () => {
-  const result = resolveCommit(B, commits, failParent);
+  const result = resolve(B, failParent);
   assert.equal(result.targetSha, B);
   assert.equal(result.baseSha, A);
 });
 
 test("explicit abbreviation (>=7 chars): prefix-matches the full SHA", () => {
-  const abbrev = B.slice(0, 8);
-  const result = resolveCommit(abbrev, commits, failParent);
+  const result = resolve(B.slice(0, 8), failParent);
   assert.equal(result.targetSha, B);
   assert.equal(result.baseSha, A);
 });
 
 test("explicit SHA: case-insensitive matching", () => {
-  const result = resolveCommit(A.toUpperCase(), commits, failParent);
+  const result = resolve(A.toUpperCase(), failParent);
   assert.equal(result.targetSha, A);
   assert.equal(result.baseSha, PARENT);
 });
 
 test("non-member SHA is rejected with a clear error", () => {
   assert.throws(
-    () => resolveCommit("deadbeef", commits, failParent),
+    () => resolveTarget("deadbeef", commits),
     /does not match any commit/,
   );
 });
 
 test("invalid --commit input (not initial, not a >=7-char hex SHA) is rejected", () => {
   assert.throws(
-    () => resolveCommit("HEAD~1", commits, failParent),
+    () => resolveTarget("HEAD~1", commits),
     /Invalid --commit value/,
   );
   // too short to be a usable abbreviation
   assert.throws(
-    () => resolveCommit("abc12", commits, failParent),
+    () => resolveTarget("abc12", commits),
     /Invalid --commit value/,
   );
   // non-hex characters
   assert.throws(
-    () => resolveCommit("zzzzzzz", commits, failParent),
+    () => resolveTarget("zzzzzzz", commits),
     /Invalid --commit value/,
   );
 });
 
 test("invalid input is rejected BEFORE any parent lookup", () => {
   let called = false;
-  const trackingParent = (_sha: string): string => {
+  const trackingParent: GetParentSha = () => {
     called = true;
     return PARENT;
   };
-  assert.throws(() => resolveCommit("nope", commits, trackingParent));
+  // resolveTarget validates and throws before a base (and thus any parent
+  // lookup) is ever computed.
+  assert.throws(() => resolve("nope", trackingParent));
   assert.equal(called, false);
 });
 

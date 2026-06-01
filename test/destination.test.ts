@@ -12,8 +12,6 @@ import {
   DestinationArgsError,
   DestinationApiError,
   writePermissionMessage,
-  unimplementedSandboxCreator,
-  unimplementedPrompt,
   type DestinationResolvers,
   type DestinationFlags,
   type DestinationChoice,
@@ -688,17 +686,6 @@ test("creation wrapper receives octokit, never a token; no token in args", async
   ]);
 });
 
-test("default seams throw clearly (create + prompt)", async () => {
-  await assert.rejects(
-    () => unimplementedSandboxCreator({ owner: "a", name: "b" }),
-    (err: unknown) => err instanceof DestinationApiError,
-  );
-  await assert.rejects(
-    () => unimplementedPrompt([]),
-    (err: unknown) => err instanceof DestinationArgsError,
-  );
-});
-
 // Interactive prompt — the real prompts impl.
 // `prompts.inject([...])` feeds scripted answers, so these run with no TTY.
 
@@ -765,7 +752,6 @@ test("different-repo prompts for a slug, parses it, returns it in repo", async (
   const sel = await prompt(NO_SAVED_CHOICES);
   assert.equal(sel.kind, "different-repo");
   assert.deepEqual(sel.repo, { owner: "you", repo: "other" });
-  assert.equal(sel.remember, false);
 });
 
 // --- bad slug re-prompts ---
@@ -784,8 +770,7 @@ test("remember-yes triggers persistence via mergeConfig", async () => {
   // Use the REAL saveDefault (mergeConfig) by not injecting one.
   prompts.inject(["different-repo", "you/other", true]);
   const prompt = makeInteractivePrompt({ isTTY: () => true });
-  const sel = await prompt(NO_SAVED_CHOICES);
-  assert.equal(sel.remember, true);
+  await prompt(NO_SAVED_CHOICES);
   // mergeConfig wrote the default destination; read it back.
   const cfg = readConfig();
   assert.deepEqual(cfg?.defaultDestination, { owner: "you", repo: "other" });
@@ -801,7 +786,6 @@ test("different-repo equal to the saved default skips the remember prompt", asyn
   const sel = await prompt(SAVED_CHOICES);
   assert.equal(sel.kind, "different-repo");
   assert.deepEqual(sel.repo, { owner: "me", repo: "sandbox" });
-  assert.equal(sel.remember, false);
   assert.equal(saved.saved.length, 0, "no persistence for an already-default repo");
 });
 

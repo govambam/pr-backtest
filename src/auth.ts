@@ -190,8 +190,6 @@ async function defaultGetInteractiveToken(): Promise<string | null> {
 /** The validated, ready-to-use result returned to callers. */
 export interface AuthResult {
   token: string;
-  username: string;
-  source: TokenSource;
 }
 
 /** Options for {@link resolveToken} (primarily for testing / injection). */
@@ -251,5 +249,5 @@ export async function resolveToken(
     success(`Token saved (mode 0600).`);
   }
 
-  return { token: resolved.token, username: login, source: resolved.source };
+  return { token: resolved.token };
 }

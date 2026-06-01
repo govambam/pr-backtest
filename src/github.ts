@@ -11,14 +11,7 @@ import { formatElapsed, isVerbose, verboseLine } from "./log.js";
 
 /** The PR fields the rest of the tool consumes. */
 export interface PullRequest {
-  number: number;
   title: string;
-  htmlUrl: string;
-  headRef: string;
-  baseRef: string;
-  headSha: string;
-  baseSha: string;
-  state: string;
   /** The PR author's login (empty string if GitHub returns no user). */
   user: string;
 }
@@ -125,14 +118,7 @@ export async function getPullRequest(
       pull_number: number,
     });
     return {
-      number: data.number,
       title: data.title,
-      htmlUrl: data.html_url,
-      headRef: data.head.ref,
-      baseRef: data.base.ref,
-      headSha: data.head.sha,
-      baseSha: data.base.sha,
-      state: data.state,
       user: data.user?.login ?? "",
     };
   } catch (err: unknown) {
@@ -149,7 +135,7 @@ export async function getPullRequest(
 /**
  * List a PR's commits in API order via `pulls.listCommits`, paginated so PRs
  * with more than one page of commits are fully covered. Shaped as `PrCommit[]`
- * for `resolveCommit`.
+ * for `resolveTarget`.
  */
 export async function listPullRequestCommits(
   octokit: Octokit,
@@ -171,7 +157,7 @@ export async function listPullRequestCommits(
 
 /**
  * Look up a commit's first-parent SHA via `repos.getCommit`. Used as the
- * `getParentSha` callback for `resolveCommit` when a listed commit carries no
+ * `getParentSha` callback for `resolveBase` when a listed commit carries no
  * parent of its own. Returns the empty string for a root commit (no parents).
  */
 export async function getCommitParentSha(

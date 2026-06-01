@@ -58,7 +58,6 @@ export interface ResolvedDestination {
  * maps this to exit code 1, alongside `NoTokenNonInteractiveError`.
  */
 export class DestinationArgsError extends Error {
-  readonly kind = "destination-args" as const;
   constructor(message: string) {
     super(message);
     this.name = "DestinationArgsError";
@@ -71,7 +70,6 @@ export class DestinationArgsError extends Error {
  * (the API-error class). Never carries a token.
  */
 export class DestinationApiError extends Error {
-  readonly kind = "destination-api" as const;
   constructor(message: string) {
     super(message);
     this.name = "DestinationApiError";
@@ -132,15 +130,12 @@ export interface DestinationChoice {
  * - `create-sandbox` requests the creation sub-flow; `repo` carries the
  *   user-edited owner/name the resolver passes to the creator.
  *
- * `remember` is NOT a `DestinationChoiceKind`; it is a separate boolean flag set
- * by the prompt seam to record that a non-primary, non-default destination was
- * saved as the default (the persist sub-flow runs inside the prompt seam).
+ * Remembering a non-primary destination as the default is a side effect of the
+ * prompt seam (it persists directly); it is not carried back on the selection.
  */
 export interface DestinationSelection {
   kind: DestinationChoiceKind;
   repo?: RepoRef;
-  /** Whether this non-primary destination was remembered as the default. */
-  remember?: boolean;
 }
 
 /**
@@ -159,8 +154,7 @@ export type DestinationPrompt = (
  *
  * Given a requested name and owner (defaulting to the source owner) it creates
  * a PRIVATE repo via the existing Octokit instance and returns the created
- * destination. The default implementation throws so an unwired create path fails
- * loudly rather than silently writing the wrong place.
+ * destination.
  */
 export type SandboxCreator = (request: {
   owner: string;
@@ -182,13 +176,6 @@ export interface DestinationResolvers {
   /** Sandbox-creation seam. */
   createSandbox: SandboxCreator;
 }
-
-/** Default create seam: throws until a real creator is wired in. */
-export const unimplementedSandboxCreator: SandboxCreator = async () => {
-  throw new DestinationApiError(
-    "No sandbox creator was wired in.",
-  );
-};
 
 /**
  * Build the real {@link SandboxCreator} backed by an Octokit instance.
@@ -247,13 +234,6 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
   };
 }
 
-/** Default prompt seam: throws until a real prompt is wired in. */
-export const unimplementedPrompt: DestinationPrompt = async () => {
-  throw new DestinationArgsError(
-    "No interactive destination prompt was wired in.",
-  );
-};
-
 /** The default name a fresh sandbox is created under (matches the resolver). */
 const DEFAULT_SANDBOX_NAME = "pr-backtest-sandbox";
 
@@ -299,8 +279,8 @@ export interface InteractivePromptOptions {
  *   and passes those values to the creator (falling back to the source owner and
  *   the default name only when the selection carries no repo).
  *
- * Remember-as-default: because the resolver never reads `selection.remember`,
- * persistence lives HERE. After the user selects a concrete non-primary
+ * Remember-as-default: persistence lives HERE, as a side effect — the selection
+ * carries no remember flag. After the user selects a concrete non-primary
  * destination (`different-repo`) that is not already the saved default, we ask
  * once and, on yes, persist via the injected `saveDefault` (defaulting to
  * {@link mergeConfig}). `saved-sandbox` is already the default, so it is never
@@ -358,8 +338,8 @@ export function makeInteractivePrompt(
     if (chosen.kind === "different-repo") {
       const repo = await promptForSlug();
       // Offer to remember it unless it is already the saved default.
-      const remember = await maybeRememberAndPersist(repo, choices, saveDefault);
-      return { kind: chosen.kind, repo, remember };
+      await maybeRememberAndPersist(repo, choices, saveDefault);
+      return { kind: chosen.kind, repo };
     }
 
     // create-sandbox: collect an editable owner/name (advisory — see the doc

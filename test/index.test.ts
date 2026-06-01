@@ -104,14 +104,7 @@ function makeDeps(overrides: Partial<RunBacktestDeps> = {}): {
     getPullRequest: async () => {
       order.push("read-pr");
       return {
-        number: 123,
         title: "Add retry to fetch",
-        htmlUrl: PR_URL,
-        headRef: "feature",
-        baseRef: "main",
-        headSha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        baseSha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
-        state: "open",
         user: "octocat",
       };
     },
