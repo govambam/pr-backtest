@@ -687,9 +687,11 @@ async function resolveInteractive(
       // source repo.
       let created: RepoRef;
       try {
+        // Honor an edited owner/name from the prompt (§5 intent); fall back to
+        // the source owner + default name when the selection carries no repo.
         created = await resolvers.createSandbox({
-          owner: source.owner,
-          name: "pr-backtest-sandbox",
+          owner: selection.repo?.owner ?? source.owner,
+          name: selection.repo?.repo ?? DEFAULT_SANDBOX_NAME,
         });
       } catch (err: unknown) {
         if (err instanceof DestinationApiError) {

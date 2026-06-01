@@ -33,9 +33,18 @@ import {
   isHttpStatus,
   listPullRequestCommits,
   makeOctokit,
+  verifyRepo,
 } from "./github.js";
+import { readConfig } from "./config.js";
+import {
+  DestinationApiError,
+  DestinationArgsError,
+  makeInteractivePrompt,
+  makeSandboxCreator,
+  resolveDestination,
+} from "./destination.js";
 import { error, info, registerSecret, step, success } from "./log.js";
-import { parseRepoSlug, parseUrl } from "./parseUrl.js";
+import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
 import { resolveBase, resolveTarget } from "./resolveCommit.js";
 
@@ -56,8 +65,12 @@ export interface RunBacktestOptions {
   prUrl: string;
   commit: string;
   yes: boolean;
-  /** Optional `owner/repo` fork to create the backtest branches and PR in. */
-  fork?: string;
+  /** `--primary`: land the backtest in the PR's own repo (no prompt). */
+  primary?: boolean;
+  /** `--sandbox <owner/repo>`: land the backtest in this repo (no prompt). */
+  sandbox?: string;
+  /** `--create-sandbox`: with `--sandbox`, create the repo if missing. */
+  createSandbox?: boolean;
 }
 
 /** Extract a human-readable message from an unknown thrown value. */
@@ -84,24 +97,9 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 1b. Resolve where writes go. Without --fork this is the PR's own repo;
-  //     with --fork the PR is still READ from its repo, but the branches and
-  //     simulated PR are CREATED in the fork (the real repo is never written).
-  let destOwner = owner;
-  let destRepo = repo;
-  if (opts.fork) {
-    try {
-      const slug = parseRepoSlug(opts.fork);
-      destOwner = slug.owner;
-      destRepo = slug.repo;
-    } catch (err) {
-      error(messageOf(err));
-      process.exit(EXIT.BAD_ARGS);
-    }
-  }
-  const isFork = destOwner !== owner || destRepo !== repo;
-
-  // 2. Resolve and validate a token, then build the Octokit instance.
+  // 2. Resolve and validate a token, then build the Octokit instance. The token
+  //    is resolved BEFORE the destination because the resolver needs the Octokit
+  //    instance to verify (and possibly create) the destination repo.
   let token: string;
   try {
     const auth = await resolveToken();
@@ -118,6 +116,50 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // Belt-and-suspenders: scrub the token from any output for the rest of the run.
   registerSecret(token);
   const octokit = makeOctokit(token);
+
+  // 2b. Resolve where writes go. The source PR is always READ from `owner/repo`;
+  //     the destination is where the branches and simulated PR are CREATED. The
+  //     resolver verifies the destination (existence + write permission) BEFORE
+  //     any clone (VAL-VERIFY-004) and never writes the source (INV-READONLY).
+  //
+  //     Exit-code mapping (index.ts owns process.exit): a DestinationArgsError
+  //     (e.g. both --primary and --sandbox, or no destination non-interactively)
+  //     maps to exit 1; a DestinationApiError (404 / not-writable / failed
+  //     creation) maps to exit 2.
+  let destOwner: string;
+  let destRepo: string;
+  let isSandbox: boolean;
+  try {
+    const resolved = await resolveDestination(
+      { owner, repo },
+      {
+        getFlags: () => ({
+          primary: opts.primary,
+          sandbox: opts.sandbox,
+          createSandbox: opts.createSandbox,
+        }),
+        getDefaultDestination: () => readConfig()?.defaultDestination,
+        getIsTTY: () => process.stdin.isTTY === true,
+        verifyDestination: (vOwner, vRepo) =>
+          verifyRepo(octokit, vOwner, vRepo),
+        createSandbox: makeSandboxCreator(octokit),
+        prompt: makeInteractivePrompt(),
+      },
+    );
+    destOwner = resolved.owner;
+    destRepo = resolved.repo;
+    isSandbox = resolved.isSandbox;
+  } catch (err) {
+    if (err instanceof DestinationArgsError) {
+      error(messageOf(err));
+      process.exit(EXIT.BAD_ARGS);
+    }
+    if (err instanceof DestinationApiError) {
+      error(messageOf(err));
+      process.exit(EXIT.API_ERROR);
+    }
+    throw err;
+  }
 
   // 3. Fetch the PR and its commits. Any GitHub/API error maps to exit 2.
   let prTitle: string;
@@ -208,10 +250,10 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     step(`Cloning ${redactedRepoRef(destOwner, destRepo)}`);
     const git = await cloneRepo(destOwner, destRepo, token, tmpDir);
 
-    // In fork mode the commits live in the PR's repo, not the fork — fetch
-    // them from a `source` remote. Otherwise origin (the clone) has them.
-    const commitRemote = isFork ? "source" : "origin";
-    if (isFork) {
+    // In sandbox mode the commits live in the PR's repo, not the sandbox —
+    // fetch them from a `source` remote. Otherwise origin (the clone) has them.
+    const commitRemote = isSandbox ? "source" : "origin";
+    if (isSandbox) {
       await addSourceRemote(git, owner, repo);
     }
 
