@@ -4,7 +4,7 @@ This file establishes the rules and context for any Claude Code session working 
 
 ## What this project is
 
-`pr-backtest` is a standalone open-source CLI tool that recreates a GitHub PR at a chosen commit so PR-review bots (e.g., Macroscope) can review the code as it existed at that moment. The full specification is in `SPEC.md`. Read it first.
+`pr-backtest` is a standalone open-source CLI tool that recreates a GitHub PR at a chosen commit so PR-review bots (e.g., Macroscope) can review the code as it existed at that moment. The full specification is in `SPEC.md` — a local design document kept for development and review. It and the `specs/` mission artifacts are gitignored and **not** shipped in the published package; read `SPEC.md` first.
 
 This project is **not** a fork or subset of any other project. It is a clean, standalone npm package with its own license (MIT), its own dependencies, and its own git history.
 
@@ -16,7 +16,7 @@ A directory called `reference/` contains source files from an internal project t
 
 ### Rules for using `reference/`
 
-1. **Read for guidance, do not copy verbatim.** The original code is ~1600 LOC, embedded in a Next.js API route, and tangled with SSE streaming, database calls, auth, and proprietary config. The output here is a ~570 LOC standalone CLI. Simplification is required — copying blocks unchanged will pull in dependencies and patterns that don't belong.
+1. **Read for guidance, do not copy verbatim.** The original code is ~1600 LOC, embedded in a Next.js API route, and tangled with SSE streaming, database calls, auth, and proprietary config. The output here is a small, single-purpose standalone CLI. Simplification is required — copying blocks unchanged will pull in dependencies and patterns that don't belong.
 
 2. **Never import from `reference/`.** It is gitignored. Imports would break for anyone who clones this repo from GitHub.
 
@@ -34,7 +34,7 @@ A directory called `reference/` contains source files from an internal project t
    - All auth references (`getAuthSession`)
    - All config references (`config.githubToken`, `GITHUB_ORG`, etc.) — replace with the auth flow described in SPEC.md §3
 
-5. **The `reference/` directory will be deleted** after v0 is complete. Treat it as scaffolding.
+5. **The `reference/` directory is local-only scaffolding** (gitignored, never shipped). v0 and the follow-on features (destination model, live activity trace) are complete; delete `reference/` before publishing the repo.
 
 ## Dependency policy
 
@@ -49,10 +49,12 @@ A directory called `reference/` contains source files from an internal project t
 - No webapp, no server, no persistent state beyond the config file at `~/.config/pr-backtest/config.json`.
 - All network calls go through the Octokit instance or `simple-git` — no direct `fetch`/`https` calls to other hosts.
 - Temp directories are always cleaned up via `finally` blocks and a `process.on('exit')` handler. A failed run must not leak `/tmp/pr-backtest-*` directories.
+- **The source repo is read-only.** Never push branches or open a PR in the repo a PR is read from unless the user explicitly selects it as the destination (`--primary`). Sandbox destinations receive all writes; the source is only ever read.
+- **The GitHub token never leaks.** It lives only in the `0600` config (or `GITHUB_TOKEN` / `gh`), and must never appear in logs, the live activity trace, a git URL, a git command line, or the temp clone — git auth flows through `GIT_ASKPASS`.
 
 ## What "done" looks like
 
-See SPEC.md §11 for the formal definition of done. Summary: working CLI, README covering install/setup/usage/safety/privacy/limitations, unit tests for `parseUrl` and `resolveCommit`, one integration test against a public fixture PR, MIT license, ready to push to GitHub.
+See SPEC.md §11 for the formal definition of done. Summary: working CLI, README covering install/setup/usage/destination/trace/safety/privacy/limitations, unit tests across the parsing, commit-resolution, destination, config, auth, and trace modules, one integration test against a public fixture PR, MIT license, ready to push to GitHub.
 
 ## When in doubt
 
