@@ -123,7 +123,7 @@ To revoke a token, use <https://github.com/settings/personal-access-tokens> (fin
 ## Contributing
 
 ```bash
-git clone https://github.com/<owner>/pr-backtest
+git clone https://github.com/govambam/pr-backtest
 cd pr-backtest
 npm install
 npm run build

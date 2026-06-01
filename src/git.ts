@@ -8,22 +8,26 @@
  *  - No commit rewriting and no cross-reference stripping: commits are pushed
  *    exactly as-is, straight from their SHA.
  *  - The auth token is NEVER embedded in the remote URL (which git would persist
- *    to `.git/config` on disk). The remote is a plain, token-free HTTPS URL;
- *    credentials are supplied per-invocation via an in-memory `-c
- *    http.extraHeader` config that git never writes to disk (see VAL-CROSS-002).
+ *    to `.git/config` on disk) and NEVER passed on the git command line (which
+ *    is world-readable via `ps`/`/proc/<pid>/cmdline`). Instead the token is
+ *    handed to git through `GIT_ASKPASS`: a tiny helper script (holding no
+ *    secret) reads it from the git child's environment, which is owner-readable
+ *    only (see VAL-CROSS-002). The remote URL carries only the `x-access-token`
+ *    username, which is not secret.
  *  - clone/fetch/push errors are caught here and rethrown as token-free domain
- *    errors; raw git stderr (which can echo command args) never reaches a caller.
- *    The derived credential is also registered with the logger as a scrubbed
- *    secret, as belt-and-suspenders.
+ *    errors; raw git stderr never reaches a caller.
  *  - The temp clone directory is always removed — on success, on failure, on
  *    process exit, AND on SIGINT/SIGTERM (Ctrl-C).
  */
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { simpleGit, type SimpleGit } from "simple-git";
 import * as log from "./log.js";
 import { shortSha } from "./util.js";
+
+/** Env var name the askpass helper reads the token from. */
+const TOKEN_ENV = "PR_BACKTEST_GIT_TOKEN";
 
 /**
  * Thrown when a specific commit SHA cannot be fetched from origin.
@@ -73,24 +77,12 @@ export function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pr-backtest-"));
 }
 
-/** Plain, token-free HTTPS URL for the repo (the persisted remote). */
-export function repoHttpsUrl(owner: string, repo: string): string {
-  return `https://github.com/${owner}/${repo}.git`;
-}
-
 /**
- * Build the in-memory git config entries that authenticate HTTPS operations
- * without persisting any credential to disk.
- *
- * Returns a single `http.extraHeader=AUTHORIZATION: basic <base64>` entry,
- * passed to git as `-c` on every invocation (never written to `.git/config`).
- * The base64 credential is registered with the logger as a scrubbed secret so
- * it can never leak through an error string either.
+ * HTTPS URL carrying only the `x-access-token` username (no secret). Git asks
+ * GIT_ASKPASS for the password, which is the token.
  */
-export function buildAuthConfig(token: string): string[] {
-  const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
-  log.registerSecret(basic);
-  return [`http.extraHeader=AUTHORIZATION: basic ${basic}`];
+export function repoHttpsUrl(owner: string, repo: string): string {
+  return `https://x-access-token@github.com/${owner}/${repo}.git`;
 }
 
 /** A token-free, log-safe reference to the repo, e.g. `github.com/acme/api`. */
@@ -99,13 +91,44 @@ export function redactedRepoRef(owner: string, repo: string): string {
 }
 
 /**
- * Clone the upstream repo over HTTPS into `tmpDir`, authenticated.
+ * Write a GIT_ASKPASS helper into `tmpDir` and return its path.
  *
- * The persisted remote URL is token-free; the token is supplied only via an
- * in-memory `-c http.extraHeader` credential (see {@link buildAuthConfig}), so
- * nothing secret is written into `tmpDir/.git/config`. We clone `--no-checkout`
- * since we never need a working tree — we push commits straight from their SHAs.
- * The returned `SimpleGit` carries the same credential so fetch/push authenticate.
+ * The helper holds NO secret — it simply echoes whatever git asks for from the
+ * {@link TOKEN_ENV} environment variable (which we set, owner-readable, on the
+ * git child). git invokes it for the HTTPS password prompt.
+ */
+function writeAskpassHelper(tmpDir: string): string {
+  const helperPath = join(tmpDir, "askpass.sh");
+  // Echo the token for a password prompt; empty for a username prompt (the URL
+  // already carries the username).
+  writeFileSync(
+    helperPath,
+    `#!/bin/sh\ncase "$1" in *Username*) printf '' ;; *) printf '%s' "$${TOKEN_ENV}" ;; esac\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(helperPath, 0o700);
+  return helperPath;
+}
+
+/** Build the git child environment that wires up GIT_ASKPASS with the token. */
+function gitEnv(token: string, askpassPath: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_ASKPASS: askpassPath,
+    GIT_TERMINAL_PROMPT: "0",
+    [TOKEN_ENV]: token,
+  };
+}
+
+/**
+ * Clone the upstream repo over HTTPS into `tmpDir/repo`, authenticated.
+ *
+ * The token never appears in the remote URL, on disk in `.git/config`, or on
+ * the git command line — it is supplied via GIT_ASKPASS reading the git child's
+ * environment (see {@link writeAskpassHelper}). We clone `--no-checkout` since
+ * we never need a working tree. The returned `SimpleGit` carries the same env
+ * so fetch/push authenticate. The askpass helper lives at the `tmpDir` root
+ * (not the clone target) so the clone destination stays empty.
  *
  * Errors are caught and rethrown token-free; raw git stderr never escapes.
  */
@@ -115,18 +138,18 @@ export async function cloneRepo(
   token: string,
   tmpDir: string,
 ): Promise<SimpleGit> {
-  const authConfig = buildAuthConfig(token);
+  const askpassPath = writeAskpassHelper(tmpDir);
+  const env = gitEnv(token, askpassPath);
+  const cloneTarget = join(tmpDir, "repo");
   try {
-    await simpleGit({ config: authConfig }).clone(
-      repoHttpsUrl(owner, repo),
-      tmpDir,
-      ["--no-checkout"],
-    );
+    await simpleGit()
+      .env(env)
+      .clone(repoHttpsUrl(owner, repo), cloneTarget, ["--no-checkout"]);
   } catch {
-    // Never surface raw git stderr — it can echo the credential header.
+    // Never surface raw git stderr.
     throw new Error(`Failed to clone ${redactedRepoRef(owner, repo)}.`);
   }
-  return simpleGit(tmpDir, { config: authConfig });
+  return simpleGit(cloneTarget).env(env);
 }
 
 /**
