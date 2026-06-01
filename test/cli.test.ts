@@ -72,14 +72,19 @@ test("VAL-CLI-001: --help no longer mentions the removed --fork flag", () => {
 
 // --- VAL-DEST-003 (CLI level): both flags do not succeed, exit 1 ---
 
-test("VAL-DEST-003: --primary --sandbox x/y <url> exits 1 (bad args), no network", () => {
-  const { status, stdout } = runCli([
+test("VAL-DEST-003: --primary --sandbox x/y <url> exits 1 with a conflict message, no token error", () => {
+  const { status, stdout, stderr } = runCli([
     "--primary",
     "--sandbox",
     "x/y",
     "https://github.com/acme/api/pull/123",
   ]);
   assert.equal(status, 1, "both-flags invocation exits with the bad-args code 1");
+  // The EARLY guard (index.ts step 1b) fires before token resolution, so the
+  // message is the flag-conflict message — NOT a token error (which would be
+  // exit 2). This proves bad args are validated before any network call.
+  assert.match(stderr, /--primary or --sandbox, not both/);
+  assert.doesNotMatch(stderr, /token/i);
   // It must not have produced a success PR URL on stdout.
   assert.doesNotMatch(stdout, /https:\/\/github\.com\/.*\/pull\/\d+/);
 });

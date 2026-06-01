@@ -75,10 +75,14 @@ program
 
 program
   .command("logout")
-  .description("Delete the saved GitHub token from the config file.")
+  .description(
+    "Delete the saved config (GitHub token and any saved default destination).",
+  )
   .action(() => {
     deleteConfig();
-    success("Logged out: saved token removed.");
+    success(
+      "Logged out: saved token and any saved default destination removed.",
+    );
     process.exit(0);
   });
 

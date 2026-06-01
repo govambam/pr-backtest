@@ -129,13 +129,17 @@ export interface DestinationChoice {
  * - `primary` / `saved-sandbox` carry the chosen repo.
  * - `different-repo` carries the user-entered `owner/repo` slug (already parsed
  *   into a {@link RepoRef}).
- * - `create-sandbox` requests the creation sub-flow (feature 3 fills it in).
- * - `remember` requests that a non-primary, non-default destination be saved as
- *   the default (the menu/persist sub-flow lives in feature 4).
+ * - `create-sandbox` requests the creation sub-flow; `repo` carries the
+ *   user-edited owner/name the resolver passes to the creator.
+ *
+ * `remember` is NOT a `DestinationChoiceKind`; it is a separate boolean flag set
+ * by the prompt seam to record that a non-primary, non-default destination was
+ * saved as the default (the persist sub-flow runs inside the prompt seam).
  */
 export interface DestinationSelection {
   kind: DestinationChoiceKind;
   repo?: RepoRef;
+  /** Whether this non-primary destination was remembered as the default. */
   remember?: boolean;
 }
 
@@ -292,12 +296,10 @@ export interface InteractivePromptOptions {
  *   with {@link parseRepoSlug}, re-prompting on a parse error; return it in
  *   `repo`. Verification stays in the resolver.
  * - `create-sandbox` → let the user edit the owner (default = source owner) and
- *   name (default `pr-backtest-sandbox`). NOTE (seam limitation): the resolver's
- *   `create-sandbox` branch creates `{ owner: source.owner, name: DEFAULT }` and
- *   ignores the selection's `repo`, so an EDITED owner/name cannot reach the
- *   creator without a resolver-logic change (out of scope for this feature). The
- *   edited values are still collected and returned in `repo` so a future resolver
- *   tweak can consume them; today they are advisory only.
+ *   name (default `pr-backtest-sandbox`). The edited owner/name are returned in
+ *   `repo`, and the resolver's `create-sandbox` branch reads `selection.repo`
+ *   and passes those values to the creator (falling back to the source owner and
+ *   the default name only when the selection carries no repo).
  *
  * Remember-as-default (VAL-INT-003 / §4.1 step 5): because the resolver never
  * reads `selection.remember`, persistence lives HERE. After the user selects a
@@ -441,7 +443,7 @@ async function maybeRememberAndPersist(
   saveDefault: (dest: SavedDestination) => void,
 ): Promise<boolean> {
   const saved = choices.find((c) => c.kind === "saved-sandbox")?.repo;
-  if (saved && saved.owner === dest.owner && saved.repo === dest.repo) {
+  if (saved && sameRepo(saved, dest)) {
     // Already the saved default; do not re-offer (§4.1 step 5).
     return false;
   }
@@ -459,9 +461,63 @@ async function maybeRememberAndPersist(
   return false;
 }
 
-/** True when two repo refs name the same `owner/repo`. */
+/**
+ * Run the injected destination verify, mapping any non-404 failure (403/500/
+ * network) to a {@link DestinationApiError} so the caller maps it to exit 2.
+ *
+ * `verifyRepo` already turns a 404 into `{ exists: false, canPush: false }` and
+ * only rethrows OTHER errors. Letting those escape raw would land in cli.ts's
+ * generic catch → exit 1, mis-classifying an API failure as bad args. We never
+ * echo the underlying error (it could, in theory, carry request detail) — just
+ * a fixed, token-free message naming the repo. (VAL-VERIFY: non-404 → exit 2.)
+ */
+async function verifyDestination(
+  verify: DestinationResolvers["verifyDestination"],
+  owner: string,
+  repo: string,
+): Promise<RepoVerification> {
+  try {
+    return await verify(owner, repo);
+  } catch (err: unknown) {
+    if (err instanceof DestinationApiError || err instanceof DestinationArgsError) {
+      throw err;
+    }
+    throw new DestinationApiError(
+      `Could not verify destination ${owner}/${repo}: ` +
+        "GitHub returned an unexpected error (not a 404). " +
+        "Check the repository name and your network/token, then retry.",
+    );
+  }
+}
+
+/**
+ * Parse a `--sandbox` slug, mapping a malformed value to a
+ * {@link DestinationArgsError} (exit 1) rather than the plain `Error`
+ * `parseRepoSlug` throws — so a bad slug is contextual and its exit code is
+ * intentional, not an accident of the generic cli.ts catch.
+ */
+function parseSandboxSlug(value: string): RepoRef {
+  try {
+    const parsed = parseRepoSlug(value);
+    return { owner: parsed.owner, repo: parsed.repo };
+  } catch (err: unknown) {
+    throw new DestinationArgsError(
+      `Invalid --sandbox value: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * True when two repo refs name the same `owner/repo`. GitHub owner and repo
+ * names are case-insensitive, so this compares case-insensitively — matching
+ * `createPrivateRepo`'s personal-account check and keeping the read-only
+ * guarantee from being defeated by a mixed-case `--sandbox` value.
+ */
 function sameRepo(a: RepoRef, b: RepoRef): boolean {
-  return a.owner === b.owner && a.repo === b.repo;
+  return (
+    a.owner.toLowerCase() === b.owner.toLowerCase() &&
+    a.repo.toLowerCase() === b.repo.toLowerCase()
+  );
 }
 
 /**
@@ -491,13 +547,12 @@ export async function resolveDestination(
     );
   }
 
+
   // --- Flag tier (highest precedence) ---
 
   // --primary → destination = source (VAL-DEST-001). Still verified (VAL-VERIFY-003).
   if (flags.primary === true) {
     await verifyResolved(
-      source,
-      /* isSandbox */ false,
       source,
       resolvers,
       savedSandboxAlternative(source, resolvers),
@@ -507,10 +562,10 @@ export async function resolveDestination(
 
   // --sandbox <owner/repo>
   if (typeof flags.sandbox === "string") {
-    const slug = parseRepoSlug(flags.sandbox);
+    const slug = parseSandboxSlug(flags.sandbox);
     // VAL-DEST-007: --sandbox == source behaves like --primary.
     if (sameRepo(slug, source)) {
-      await verifyResolved(slug, false, source, resolvers, null);
+      await verifyResolved(slug, resolvers, null);
       return { owner: source.owner, repo: source.repo, isSandbox: false };
     }
     const dest = await resolveSandboxFlag(slug, flags, source, resolvers);
@@ -527,10 +582,10 @@ export async function resolveDestination(
   const saved = resolvers.getDefaultDestination();
   if (saved) {
     if (sameRepo(saved, source)) {
-      await verifyResolved(saved, false, source, resolvers, null);
+      await verifyResolved(saved, resolvers, null);
       return { owner: saved.owner, repo: saved.repo, isSandbox: false };
     }
-    await verifyResolved(saved, true, source, resolvers, null);
+    await verifyResolved(saved, resolvers, null);
     return { owner: saved.owner, repo: saved.repo, isSandbox: true };
   }
 
@@ -550,7 +605,11 @@ async function resolveSandboxFlag(
   source: RepoRef,
   resolvers: DestinationResolvers,
 ): Promise<RepoRef> {
-  const verification = await resolvers.verifyDestination(slug.owner, slug.repo);
+  const verification = await verifyDestination(
+    resolvers.verifyDestination,
+    slug.owner,
+    slug.repo,
+  );
 
   if (!verification.exists) {
     // VAL-CREATE-004: missing → create only with --create-sandbox, else exit 2.
@@ -588,12 +647,14 @@ async function resolveSandboxFlag(
  */
 async function verifyResolved(
   dest: RepoRef,
-  _isSandbox: boolean,
-  _source: RepoRef,
   resolvers: DestinationResolvers,
   writableAlt: RepoRef | null,
 ): Promise<void> {
-  const verification = await resolvers.verifyDestination(dest.owner, dest.repo);
+  const verification = await verifyDestination(
+    resolvers.verifyDestination,
+    dest.owner,
+    dest.repo,
+  );
 
   if (!verification.exists) {
     // VAL-VERIFY-001 (non-interactive saved-default 404) and the primary case:
@@ -665,7 +726,11 @@ async function resolveInteractive(
     const selection = await resolvers.prompt(choices);
 
     if (selection.kind === "primary") {
-      const ver = await resolvers.verifyDestination(source.owner, source.repo);
+      const ver = await verifyDestination(
+        resolvers.verifyDestination,
+        source.owner,
+        source.repo,
+      );
       if (!ver.exists || !ver.canPush) {
         // VAL-VERIFY-003: §6.1 message (with saved-sandbox alternative if known),
         // then re-present the menu rather than proceeding.
@@ -707,7 +772,7 @@ async function resolveInteractive(
     }
 
     // saved-sandbox or different-repo: a concrete destination to verify.
-    const dest = selectionRepo(selection);
+    const dest = selection.repo;
     if (!dest) {
       // Defensive: a prompt that returns no repo for these kinds is a bug, not
       // a reason to fall back to the source.
@@ -715,27 +780,25 @@ async function resolveInteractive(
         "Interactive selection returned no destination repository.",
       );
     }
-    if (sameRepo(dest, source)) {
-      const ver = await resolvers.verifyDestination(dest.owner, dest.repo);
-      if (!ver.exists || !ver.canPush) {
-        emitWriteFailure(dest, null, ver.exists);
-        continue;
-      }
-      return { owner: dest.owner, repo: dest.repo, isSandbox: false };
-    }
-    const ver = await resolvers.verifyDestination(dest.owner, dest.repo);
+    // The verify-then-emit logic is identical whether or not the chosen repo
+    // equals the source; only the resulting `isSandbox` differs, which
+    // `sameRepo` already decides. VAL-VERIFY-001/002: re-present on failure,
+    // never fall back.
+    const ver = await verifyDestination(
+      resolvers.verifyDestination,
+      dest.owner,
+      dest.repo,
+    );
     if (!ver.exists || !ver.canPush) {
-      // VAL-VERIFY-001/002: re-present the menu; never fall back.
       emitWriteFailure(dest, null, ver.exists);
       continue;
     }
-    return { owner: dest.owner, repo: dest.repo, isSandbox: true };
+    return {
+      owner: dest.owner,
+      repo: dest.repo,
+      isSandbox: !sameRepo(dest, source),
+    };
   }
-}
-
-/** Extract the concrete repo a selection points at, if any. */
-function selectionRepo(selection: DestinationSelection): RepoRef | null {
-  return selection.repo ?? null;
 }
 
 /**

@@ -204,6 +204,88 @@ test("VAL-DEST-007: --sandbox equal to source resolves as destination==source, i
   assert.ok(!h.calls.some((c) => c.fn === "prompt"));
 });
 
+// --- VAL-DEST-007 (case-insensitive) ---
+test("VAL-DEST-007: --sandbox with different case than source resolves as primary (isSandbox false)", async () => {
+  // Mixed-case owner AND repo vs the lowercase source acme/api.
+  const h = makeHarness({
+    flags: { sandbox: "Acme/API" },
+    verify: () => ({ exists: true, canPush: true }),
+  });
+  const result = await resolveDestination(SOURCE, h.resolvers);
+  // Treated as the primary: destination == source, never a sandbox write.
+  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.ok(!h.calls.some((c) => c.fn === "prompt"));
+});
+
+// --- #3: malformed --sandbox slug → DestinationArgsError (exit 1) ---
+test("malformed --sandbox value throws DestinationArgsError (bad args), not a raw Error", async () => {
+  const h = makeHarness({ flags: { sandbox: "not-a-valid-slug" } });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => {
+      assert.ok(
+        err instanceof DestinationArgsError,
+        "a malformed slug is a bad-args error, not an API error or raw Error",
+      );
+      assert.match(err.message, /--sandbox/);
+      return true;
+    },
+  );
+  // No verify/create ran for an unparseable slug.
+  assert.equal(h.calls.filter((c) => c.fn !== "prompt").length, 0);
+});
+
+// --- #3: non-404 verify error → DestinationApiError (exit 2) ---
+test("non-404 verify failure (403) maps to DestinationApiError, not a raw escape", async () => {
+  const h = makeHarness({
+    flags: { sandbox: "me/sandbox" },
+    verify: () => {
+      throw httpError(403);
+    },
+  });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => {
+      assert.ok(
+        err instanceof DestinationApiError,
+        "a 403 during verify is an API error (exit 2), not a raw error (exit 1)",
+      );
+      assert.match(err.message, /me\/sandbox/);
+      return true;
+    },
+  );
+});
+
+test("non-404 verify failure on --primary also maps to DestinationApiError", async () => {
+  const h = makeHarness({
+    flags: { primary: true },
+    verify: () => {
+      throw httpError(500);
+    },
+  });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => err instanceof DestinationApiError,
+  );
+});
+
+// --- #7: --create-sandbox without --sandbox is a silent no-op ---
+test("--create-sandbox alone (no --sandbox, non-TTY, no default) → bad-args, never creates", async () => {
+  const h = makeHarness({
+    flags: { createSandbox: true },
+    isTTY: false,
+    create: (req) => ({ owner: req.owner, repo: req.name }),
+  });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => err instanceof DestinationArgsError,
+  );
+  assert.ok(
+    !h.calls.some((c) => c.fn === "create"),
+    "--create-sandbox is inert without --sandbox; the creator is never called",
+  );
+});
+
 // --- VAL-VERIFY-001 ---
 test("VAL-VERIFY-001: saved default 404 — non-interactive throws exit-2, interactive re-prompts", async () => {
   // Non-interactive branch.
@@ -315,22 +397,25 @@ test("VAL-VERIFY-003: primary not writable — §6.1 message before clone, non-i
 });
 
 // --- VAL-VERIFY-004 ---
-test("VAL-VERIFY-004: verify runs before any clone/push/create (call order)", async () => {
+// The resolver never clones/pushes (that is index.ts's job), so the earlier
+// version of this test could never fail: `firstWrite` was always -1. We make it
+// non-vacuous by driving the create-if-missing path — `create` IS a write the
+// resolver performs — and asserting a verify is recorded strictly before it.
+test("VAL-VERIFY-004: verify runs before the create write (non-vacuous call order)", async () => {
   const h = makeHarness({
-    flags: { sandbox: "me/sandbox" },
-    verify: () => ({ exists: true, canPush: true }),
+    flags: { sandbox: "me/new", createSandbox: true },
+    // Report missing so the resolver proceeds to create.
+    verify: () => ({ exists: false, canPush: false }),
+    create: (req) => ({ owner: req.owner, repo: req.name }),
   });
   await resolveDestination(SOURCE, h.resolvers);
-  // The resolver itself only ever calls verify (and possibly create); no clone/push.
-  // Assert the FIRST recorded call is a verify and no write precedes it.
-  const firstWrite = h.calls.findIndex(
-    (c) => c.fn === "clone" || c.fn === "push" || c.fn === "createPr",
-  );
   const firstVerify = h.calls.findIndex((c) => c.fn === "verify");
+  const firstCreate = h.calls.findIndex((c) => c.fn === "create");
   assert.ok(firstVerify >= 0, "a verify call was recorded");
+  assert.ok(firstCreate >= 0, "a create write was recorded (assertion is live)");
   assert.ok(
-    firstWrite === -1 || firstVerify < firstWrite,
-    "no clone/push/create appears before a successful verify",
+    firstVerify < firstCreate,
+    "verify must precede the create write (VAL-VERIFY-004)",
   );
 });
 

@@ -97,6 +97,16 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
+  // 1b. Validate conflicting destination flags BEFORE any network call. The
+  //     resolver also rejects this (defense in depth), but it runs after
+  //     resolveToken(), so without this fail-fast guard a both-flags invocation
+  //     with a bad/missing token would surface a token error and exit 2 instead
+  //     of the bad-args exit 1 this conflict warrants (VAL-DEST-003).
+  if (opts.primary === true && typeof opts.sandbox === "string") {
+    error("Pass either --primary or --sandbox, not both.");
+    process.exit(EXIT.BAD_ARGS);
+  }
+
   // 2. Resolve and validate a token, then build the Octokit instance. The token
   //    is resolved BEFORE the destination because the resolver needs the Octokit
   //    instance to verify (and possibly create) the destination repo.
