@@ -19,6 +19,8 @@ export interface PullRequest {
   headSha: string;
   baseSha: string;
   state: string;
+  /** The PR author's login (empty string if GitHub returns no user). */
+  user: string;
 }
 
 /** Build the single Octokit instance used for all API calls. */
@@ -51,6 +53,7 @@ export async function getPullRequest(
       headSha: data.head.sha,
       baseSha: data.base.sha,
       state: data.state,
+      user: data.user?.login ?? "",
     };
   } catch (err: unknown) {
     if (isStatus(err, 404)) {
