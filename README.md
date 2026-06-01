@@ -26,11 +26,17 @@ pr-backtest https://github.com/acme/api/pull/123 --commit a1b2c3d
 # Skip the confirmation prompt (for scripting)
 pr-backtest https://github.com/acme/api/pull/123 -y
 
-# Create the backtest branches + PR in a fork, not the PR's own repo
-pr-backtest https://github.com/acme/api/pull/123 --fork myuser/api
+# Land the backtest in the PR's own repo, no prompt
+pr-backtest https://github.com/acme/api/pull/123 --primary
+
+# Land the backtest in a separate sandbox repo you control
+pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox
+
+# Create that sandbox first if it doesn't exist yet (private)
+pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox --create-sandbox
 ```
 
-On first run it prompts for a GitHub token (and offers to reuse your `gh` CLI login if you have one). The new PR's URL is printed to stdout. Run `pr-backtest logout` to remove a saved token.
+On first run it prompts for a GitHub token (and offers to reuse your `gh` CLI login if you have one). The new PR's URL is printed to stdout. Run `pr-backtest logout` to remove a saved token (this also deletes the saved default destination — see [Destination](#destination)).
 
 ```
 $ pr-backtest https://github.com/acme/api/pull/123
@@ -51,9 +57,32 @@ Continue? [y/N] y
 https://github.com/acme/api/pull/451
 ```
 
+## Destination
+
+pr-backtest always **reads** the PR from its own repo (the source). The branches and the simulated PR are **written** to a *destination* you choose up front. There are two kinds:
+
+- **Primary** — the PR's own repo. The source and the destination are the same repo, so the backtest lands right next to the original PR.
+- **Sandbox** — a separate repo you control. The source repo is read but never written; all writes land in the sandbox. A sandbox keeps a repo you care about completely untouched, and lets you point a review bot at a throwaway repo.
+
+**Read-only guarantee:** the repository a PR is read from is **never written to** unless you explicitly choose it as the destination (Primary). A sandbox destination only ever reads the source.
+
+When you run without a destination flag in a terminal, pr-backtest asks once where the simulated PR should go (Primary, a saved sandbox, create a sandbox, or a different repo) and offers to remember a sandbox as your default. Non-interactively (or with a flag) it resolves without prompting.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--primary` | Land the simulated PR in the PR's own repo (no prompt). |
+| `--sandbox <owner/repo>` | Land the simulated PR in this repo (no prompt). |
+| `--create-sandbox` | With `--sandbox`, create the repo (private) if it is missing. No effect without `--sandbox`. |
+
+`--primary` and `--sandbox` are mutually exclusive. `--create-sandbox` on its own is a no-op.
+
+`pr-backtest logout` deletes the whole config file — including any saved default sandbox destination, not just the token.
+
 ## Recommendations
 
-**Use a fine-grained token scoped to one repo.** Create one at <https://github.com/settings/personal-access-tokens/new> with just these permissions, for just the repo you're backtesting:
+**Use a fine-grained token scoped to just the repo(s) you write to.** Create one at <https://github.com/settings/personal-access-tokens/new> with these permissions:
 
 | Permission    | Access       |
 |---------------|--------------|
@@ -61,15 +90,14 @@ https://github.com/acme/api/pull/451
 | Pull requests | Read & write |
 | Metadata      | Read         |
 
-A token like this can't reach your other repos, create repos, or touch org settings.
+A token like this can't reach your other repos or touch org settings. For `--create-sandbox`, the token also needs permission to create repositories for the destination owner.
 
-**For maximum isolation, use a fork.** Fork the repo, then pass `--fork <owner/repo>`:
+**A non-primary destination needs a token spanning two repos.** When the destination is a sandbox (not the PR's own repo), one token must cover **both**:
 
-```bash
-pr-backtest https://github.com/acme/api/pull/123 --fork myuser/api
-```
+- **READ** on the source repo (to read the PR and fetch its commits), and
+- **WRITE** on the destination repo (Contents + Pull requests).
 
-pr-backtest reads the PR from the original repo but creates the backtest branches and PR in your fork — the original repo is never written to. If the original repo is **public**, a token scoped to only the fork is enough. If it's **private**, the token also needs read access on the original repo (to read the PR and fetch its commits) — still narrower than granting write access there.
+A token scoped to only the sandbox can't read a private source PR; a token scoped to only the source can't write the sandbox. If the source repo is **public**, read access is implicit and a token with write on the sandbox is enough. For a **Primary** destination, one repo's worth of access (read + write on the source) is all you need.
 
 ## License
 

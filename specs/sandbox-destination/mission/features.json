@@ -1,0 +1,148 @@
+{
+  "spec_id": "sandbox-destination",
+  "features": [
+    {
+      "id": "config-destination",
+      "description": "Extend Config with an optional defaultDestination and make token optional. Add a merge writer (read-modify-write that preserves both token and destination, re-asserting mode 0600) and make readConfig tolerant of legacy files (no defaultDestination) and destination-only files (no token).",
+      "milestone": "sandbox-destination",
+      "preconditions": [
+        "src/config.ts exists with Config { token; username; source } and writeConfig that overwrites the whole object at mode 0600",
+        "test/config.test.ts exists and exercises readConfig/writeConfig"
+      ],
+      "expectedBehavior": [
+        "Config interface gains `defaultDestination?: { owner; repo }` and `token`/`username`/`source` become optional to support destination-only files",
+        "A merge writer persists a destination without dropping a saved token, and a token without dropping a saved destination",
+        "readConfig returns a usable Config for legacy files (no defaultDestination) and for destination-only files (no token), never null/throw for those shapes",
+        "Every write path (token save and destination save) re-asserts file mode 0600",
+        "Existing token-resolution guard on a present, non-empty token still holds (missing token = no saved token)"
+      ],
+      "verificationSteps": [
+        "node --import tsx --test test/config.test.ts",
+        "npm run build"
+      ],
+      "fulfills": ["VAL-CONFIG-001", "VAL-CONFIG-002", "VAL-CONFIG-003", "VAL-CONFIG-004"],
+      "status": "completed"
+    },
+    {
+      "id": "destination-resolve",
+      "description": "A pure-ish destination resolver mirroring auth.ts resolveTokenSource(resolvers): injected getters for parsed flags, config defaultDestination, an Octokit-backed verifyDestination (single repos.get reading permissions.push), and an interactive prompt. Returns a typed destination or throws typed bad-args (exit 1) / API-error (exit 2) outcomes. Owns precedence, verification, the §6.1 write-permission message, and the INV-READONLY guarantee. Adds the github.ts verifyDestination wrapper (takes an octokit, never a raw token).",
+      "milestone": "sandbox-destination",
+      "preconditions": [
+        "config-destination is complete (defaultDestination readable from config)",
+        "parseRepoSlug exists in src/parseUrl.ts",
+        "github.ts exposes makeOctokit and isHttpStatus"
+      ],
+      "expectedBehavior": [
+        "Precedence: flags (with --primary/--sandbox mutually exclusive, rejected before either is honored) → interactive(TTY) → saved-default(non-TTY) → bad-args error",
+        "--primary → destination = source, no prompt; --sandbox owner/repo (existing+writable) → that repo, no prompt; --sandbox == source → destination=source, sandbox flag false",
+        "Non-interactive with no flag: saved default used if present (after verify), else bad-args (exit 1) naming --primary/--sandbox",
+        "Verification is a single repos.get reading permissions.push, run after resolution and before any clone/push/create; 404 and not-writable handled with re-prompt (interactive) / exit 2 (non-interactive), never falling back to another repo",
+        "§6.1 write-permission message names the repo + missing capability, and names a known-writable saved sandbox when the failing destination is the primary",
+        "When destination != source, the source owner/repo is never an argument to any write/create call (recorded-call assertion)"
+      ],
+      "verificationSteps": [
+        "node --import tsx --test test/destination.test.ts",
+        "npm run build"
+      ],
+      "fulfills": [
+        "VAL-DEST-001", "VAL-DEST-002", "VAL-DEST-004", "VAL-DEST-005", "VAL-DEST-006", "VAL-DEST-007",
+        "VAL-VERIFY-001", "VAL-VERIFY-002", "VAL-VERIFY-003", "VAL-VERIFY-004", "VAL-VERIFY-005",
+        "VAL-INV-001"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "sandbox-create",
+      "description": "Octokit sandbox creation wrapper: private always, owner defaulting to the source PR owner, routing personal-account → repos.createForAuthenticatedUser and org → repos.createInOrg. Wires into the resolver's create path (interactive create choice and --sandbox X --create-sandbox for a missing X). 403 never falls through to a source write. Preserves token safety on the create path (wrapper takes an octokit, never a raw token).",
+      "milestone": "sandbox-destination",
+      "preconditions": [
+        "destination-resolve is complete (the resolver exposes an injected createSandbox getter and a create path)",
+        "github.ts pattern for Octokit wrappers exists"
+      ],
+      "expectedBehavior": [
+        "Creation sets the repo private (never more visible) and defaults owner to the source owner; chooses createForAuthenticatedUser vs createInOrg by owner type",
+        "Creation 403 never writes the source repo; interactive re-prompts (create/different/primary), non-interactive exits 2 with a message naming the owner + missing permission",
+        "--sandbox X --create-sandbox creates a missing X and uses it; --sandbox X alone with X missing exits 2 without creating or writing anything else",
+        "Token never appears in a URL, on a git command line, or in any log on the create/verify paths"
+      ],
+      "verificationSteps": [
+        "node --import tsx --test test/destination.test.ts",
+        "Manual: --sandbox <throwaway-private> --create-sandbox -y against a real repo, confirm the backtest PR opens (VAL-CREATE-003)",
+        "npm run build"
+      ],
+      "fulfills": ["VAL-CREATE-001", "VAL-CREATE-002", "VAL-CREATE-003", "VAL-CREATE-004", "VAL-INV-002"],
+      "status": "completed"
+    },
+    {
+      "id": "interactive-menu",
+      "description": "The prompts-based destination selection menu and its sub-flows: the saved-default menu {primary, saved-sandbox, different}, the no-default menu {primary, create, different}, the 'A different repo…' slug prompt + verify, and the single 'remember as default?' prompt that persists via the config merge writer.",
+      "milestone": "sandbox-destination",
+      "preconditions": [
+        "destination-resolve is complete and accepts an injected prompt getter",
+        "config-destination merge writer exists",
+        "sandbox-create create path exists (for the 'create a sandbox' choice)"
+      ],
+      "expectedBehavior": [
+        "Saved-default + TTY: choice set is {primary, saved-sandbox, different}; no create row",
+        "No-default + TTY: choice set is {primary, create, different}; no saved row",
+        "'A different repo…' prompts for owner/repo (parseRepoSlug), verifies it, and offers to save it",
+        "Resolving any non-primary, non-default destination triggers one remember-as-default prompt; yes persists via the merge writer"
+      ],
+      "verificationSteps": [
+        "node --import tsx --test test/destination.test.ts",
+        "Manual: run against a PR URL with and without a saved default, confirm menu rows (VAL-INT-001/002)",
+        "npm run build"
+      ],
+      "fulfills": ["VAL-INT-001", "VAL-INT-002", "VAL-INT-003"],
+      "status": "completed"
+    },
+    {
+      "id": "cli-and-index",
+      "description": "Replace --fork with --primary / --sandbox <owner/repo> / --create-sandbox in src/cli.ts; wire the destination resolver into runBacktest in src/index.ts (resolve destination before the clone, route findExistingPr/createPullRequest/pushBranchFromSha to the destination, keep source reads on the source); enforce exit-code mapping (--primary+--sandbox → exit 1; verification/creation failures → exit 2). Add test/cli.test.ts (subprocess harness for numeric exit codes and --help). No new dependency.",
+      "milestone": "sandbox-destination",
+      "preconditions": [
+        "destination-resolve, sandbox-create, interactive-menu are complete",
+        "RunBacktestOptions currently carries `fork?`"
+      ],
+      "expectedBehavior": [
+        "--fork is removed everywhere in src/; --primary/--sandbox/--create-sandbox are registered commander options visible in --help",
+        "--primary and --sandbox together exits 1 without any write; resolver is wired so verification runs before cloneRepo",
+        "--create-sandbox without --sandbox is a no-op (documented), resolution proceeds as if absent",
+        "findExistingPr (pre-flight) and the 422-recovery lookup are called with the destination owner/repo when destination != source",
+        "package.json dependencies are unchanged"
+      ],
+      "verificationSteps": [
+        "node --import tsx --test test/cli.test.ts",
+        "node --import tsx --test test/destination.test.ts",
+        "npm run build",
+        "grep -n 'fork' src/  # expect no --fork flag remaining"
+      ],
+      "fulfills": ["VAL-CLI-001", "VAL-CLI-002", "VAL-DEST-003", "VAL-INV-003", "VAL-INV-004"],
+      "status": "completed"
+    },
+    {
+      "id": "plan-and-docs",
+      "description": "Update src/plan.ts to the §8 read/write split: tag the source `(read-only)` and show the destination as the distinct write target only when destination != source; show one repo plainly when destination == source. Migrate/remove test/plan.fork.test.ts. Update README to document the destination model, the read-only guarantee, the new flags, and the §6.2 two-repo token requirement; update src/auth.ts interactive token guidance for the two-repo scope. Final tsc/lint gate.",
+      "milestone": "sandbox-destination",
+      "preconditions": [
+        "cli-and-index is complete (PlanInput carries the destination; --fork wording is being removed)",
+        "src/plan.ts currently renders `Into:`/`(fork — …)` wording"
+      ],
+      "expectedBehavior": [
+        "destination != source → plan tags source `(read-only)` and shows destination as the write target, distinctly",
+        "destination == source → plan does NOT tag `(read-only)`; one repo shown as both read and write site",
+        "test/plan.fork.test.ts is migrated into test/plan.test.ts or removed (its --fork wording is gone)",
+        "README documents primary-vs-sandbox, the read-only guarantee, --primary/--sandbox/--create-sandbox, and the two-repo token note; auth.ts guidance states the two-repo requirement",
+        "npm run build is clean (also satisfies lint-clean: no separate linter configured)"
+      ],
+      "verificationSteps": [
+        "node --import tsx --test test/plan.test.ts",
+        "npm run build",
+        "Manual: read README for the destination model + token note (VAL-GATE-003)",
+        "grep -n 'read-only\\|--primary\\|--sandbox\\|--create-sandbox' README.md"
+      ],
+      "fulfills": ["VAL-PLAN-001", "VAL-PLAN-002", "VAL-GATE-001", "VAL-GATE-002", "VAL-GATE-003"],
+      "status": "completed"
+    }
+  ]
+}

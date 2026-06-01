@@ -81,8 +81,11 @@ export async function resolveTokenSource(
 
   // 2. Config file.
   const cfg = resolvers.getConfig();
-  if (cfg && cfg.token.length > 0) {
-    return { token: cfg.token, source: cfg.source, fromPaste: false };
+  if (cfg && cfg.token && cfg.token.length > 0) {
+    // readConfig only sets `token` alongside a valid `source`, but `source` is
+    // now optionally typed; fall back to the paste heuristic to stay typed.
+    const source = cfg.source ?? inferPasteSource(cfg.token);
+    return { token: cfg.token, source, fromPaste: false };
   }
 
   // 3. gh CLI (offered for reuse, prompted before use).
@@ -151,12 +154,16 @@ async function defaultGetInteractiveToken(): Promise<string | null> {
   }
 
   info("");
-  info("pr-backtest needs a GitHub token with these permissions for one specific repo:");
+  info("pr-backtest needs a GitHub token with these permissions on the repo it writes to:");
   info("  • Contents:      Read & write   (push backtest branches)");
   info("  • Pull requests: Read & write   (read PR data, open the simulated PR)");
   info("  • Metadata:      Read           (required for all tokens)");
   info("");
-  info("Recommended: create a fine-grained token scoped to just this one repo:");
+  info("If you land the backtest in a sandbox (a different repo), the token must span");
+  info("two repos: READ on the source repo (to read the PR + fetch its commits) AND");
+  info("WRITE (Contents + Pull requests) on the sandbox destination.");
+  info("");
+  info("Recommended: create a fine-grained token scoped to just the repo(s) you need:");
   info("  https://github.com/settings/personal-access-tokens/new");
   info("");
   info(

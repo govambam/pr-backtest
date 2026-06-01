@@ -42,30 +42,47 @@ program
     "initial",
   )
   .option("-y, --yes", "Skip the confirmation prompt (for scripting)", false)
+  .option("--primary", "Land the backtest in the PR's own repo (no prompt)")
   .option(
-    "--fork <owner/repo>",
-    "Create the backtest branches and PR in this fork instead of the PR's own repo",
+    "--sandbox <owner/repo>",
+    "Land the backtest branches and PR in this repo (no prompt)",
+  )
+  .option(
+    "--create-sandbox",
+    "With --sandbox, create the repo if it does not exist (no effect without --sandbox)",
   )
   .action(
     async (
       prUrl: string,
-      options: { commit: string; yes: boolean; fork?: string },
+      options: {
+        commit: string;
+        yes: boolean;
+        primary?: boolean;
+        sandbox?: string;
+        createSandbox?: boolean;
+      },
     ) => {
       await runBacktest({
         prUrl,
         commit: options.commit,
         yes: options.yes,
-        fork: options.fork,
+        primary: options.primary,
+        sandbox: options.sandbox,
+        createSandbox: options.createSandbox,
       });
     },
   );
 
 program
   .command("logout")
-  .description("Delete the saved GitHub token from the config file.")
+  .description(
+    "Delete the saved config (GitHub token and any saved default destination).",
+  )
   .action(() => {
     deleteConfig();
-    success("Logged out: saved token removed.");
+    success(
+      "Logged out: saved token and any saved default destination removed.",
+    );
     process.exit(0);
   });
 

@@ -159,6 +159,99 @@ export async function createPullRequest(
   return data.html_url;
 }
 
+/**
+ * Create a PRIVATE repository for a backtest sandbox and return its
+ * `{ owner, repo }`. INV-PRIVATE: the repo is ALWAYS created private — never
+ * more visible than private.
+ *
+ * Owner routing (personal vs org): we resolve the authenticated login once via
+ * `users.getAuthenticated` and compare it to the requested `owner`. If they
+ * match (case-insensitively — GitHub logins are case-insensitive), the owner is
+ * the user's personal account and we call `repos.createForAuthenticatedUser`
+ * (which has no `owner` parameter — it always creates under the caller). Any
+ * other owner is treated as an org and routed to `repos.createInOrg`. We chose
+ * the explicit "compare to authenticated login" approach over "try org, fall
+ * back" because it is deterministic, makes exactly one extra read call, and is
+ * trivially unit-testable with a fake octokit recording the call it makes.
+ *
+ * Initialization: `auto_init: true` so the repo gets a default branch with a
+ * minimal commit. A backtest run pushes a base branch and opens a PR against
+ * it; an empty repo has no default branch, so `auto_init` is the safe default
+ * that makes VAL-CREATE-003 hold without extra plumbing.
+ *
+ * Failure handling (VAL-CREATE-002): a 403 / insufficient-permission from the
+ * create call (common when `owner` is an org the caller cannot create repos in)
+ * is re-thrown by the caller as a `DestinationApiError`. This wrapper surfaces
+ * the underlying error unchanged so the caller can recognise the status and
+ * compose a message naming the owner + the missing permission; it NEVER falls
+ * back to any other repo.
+ *
+ * Takes an Octokit instance, never a raw token (INV-TOKEN): the token reaches
+ * GitHub only through the injected Octokit, and is never placed in a URL, a git
+ * argument, or a log line on this path.
+ */
+export async function createPrivateRepo(
+  octokit: Octokit,
+  owner: string,
+  name: string,
+): Promise<{ owner: string; repo: string }> {
+  const { data: authed } = await octokit.users.getAuthenticated();
+  const isPersonalAccount =
+    authed.login.toLowerCase() === owner.toLowerCase();
+
+  if (isPersonalAccount) {
+    // Personal account: createForAuthenticatedUser has no `owner` arg; it
+    // always creates under the authenticated user (i.e. `owner`).
+    const { data } = await octokit.repos.createForAuthenticatedUser({
+      name,
+      private: true,
+      auto_init: true,
+    });
+    return { owner: data.owner?.login ?? owner, repo: data.name };
+  }
+
+  // Org owner: create inside the org.
+  const { data } = await octokit.repos.createInOrg({
+    org: owner,
+    name,
+    private: true,
+    auto_init: true,
+  });
+  return { owner: data.owner?.login ?? owner, repo: data.name };
+}
+
+/** The result of a destination pre-flight check. */
+export interface RepoVerification {
+  /** True when `repos.get` succeeds (the repo exists and is visible to the token). */
+  exists: boolean;
+  /** True only when `data.permissions.push === true` (the token can write). */
+  canPush: boolean;
+}
+
+/**
+ * Pre-flight verify a destination repo via `repos.get`. Reads existence and
+ * `permissions.push` in one call. A 404 maps to `{ exists: false, canPush: false }`;
+ * any other error is rethrown for the caller to map to exit 2.
+ *
+ * Takes an Octokit instance, never a raw token (INV-TOKEN): the token reaches
+ * GitHub only through the injected Octokit.
+ */
+export async function verifyRepo(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+): Promise<RepoVerification> {
+  try {
+    const { data } = await octokit.repos.get({ owner, repo });
+    return { exists: true, canPush: data.permissions?.push === true };
+  } catch (err: unknown) {
+    if (isStatus(err, 404)) {
+      return { exists: false, canPush: false };
+    }
+    throw err;
+  }
+}
+
 /** Narrow an unknown thrown value to an Octokit-style HTTP error of a status. */
 function isStatus(err: unknown, status: number): boolean {
   return (

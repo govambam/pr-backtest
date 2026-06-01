@@ -46,3 +46,32 @@ test("confirmPlan resolves true without prompting when yes is set", async () => 
   const result = await confirmPlan(input, { yes: true });
   assert.equal(result, true);
 });
+
+// --- Destination read/write split (§8) ---------------------------------------
+
+test("dest == source: source is NOT tagged read-only, one repo for read+write", () => {
+  // No targetRepo and an explicit equal targetRepo both mean destination == source.
+  for (const planInput of [input, { ...input, targetRepo: "acme/api" }]) {
+    const out = renderPlan(planInput);
+    assert.doesNotMatch(out, /read-only/);
+    assert.doesNotMatch(out, /Into:/);
+    assert.match(out, /from origin/);
+    assert.match(out, /Clone acme\/api/);
+    assert.match(out, /Open PR in acme\/api/);
+  }
+});
+
+test("dest != source: source tagged read-only, destination is the distinct write target", () => {
+  const out = renderPlan({ ...input, targetRepo: "myuser/sandbox" });
+  // Source repo line carries the read-only safety tag.
+  assert.match(out, /acme\/api#123 .* by @stevem\s+\(read-only/);
+  // Destination named as the place branches and the PR are created.
+  assert.match(out, /Into:\s+myuser\/sandbox \(sandbox/);
+  assert.match(out, /Clone myuser\/sandbox/);
+  assert.match(out, /from source \(acme\/api\)/);
+  assert.match(out, /Push f0e9d8c → myuser\/sandbox:backtest-pr123-base/);
+  assert.match(
+    out,
+    /Open PR in myuser\/sandbox: backtest-pr123-head → backtest-pr123-base/,
+  );
+});
