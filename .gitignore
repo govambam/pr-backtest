@@ -6,3 +6,7 @@ reference/
 *.log
 .DS_Store
 .gstack/
+
+# Local design docs / mission artifacts — kept local for development + review, not shipped
+SPEC.md
+specs/
