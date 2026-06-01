@@ -7,16 +7,23 @@
  *    `main` is never checked out, written to, or pushed to.
  *  - No commit rewriting and no cross-reference stripping: commits are pushed
  *    exactly as-is, straight from their SHA.
- *  - The auth token lives ONLY inside git's own remote URL. It is never logged,
- *    never printed, and never written anywhere we control (see VAL-CROSS-002).
- *  - The temp clone directory is always removed, on success AND failure, via a
- *    `finally`-driven `cleanup()` plus a `process.on('exit')` safety net.
+ *  - The auth token is NEVER embedded in the remote URL (which git would persist
+ *    to `.git/config` on disk). The remote is a plain, token-free HTTPS URL;
+ *    credentials are supplied per-invocation via an in-memory `-c
+ *    http.extraHeader` config that git never writes to disk (see VAL-CROSS-002).
+ *  - clone/fetch/push errors are caught here and rethrown as token-free domain
+ *    errors; raw git stderr (which can echo command args) never reaches a caller.
+ *    The derived credential is also registered with the logger as a scrubbed
+ *    secret, as belt-and-suspenders.
+ *  - The temp clone directory is always removed — on success, on failure, on
+ *    process exit, AND on SIGINT/SIGTERM (Ctrl-C).
  */
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { simpleGit, type SimpleGit } from "simple-git";
 import * as log from "./log.js";
+import { shortSha } from "./util.js";
 
 /**
  * Thrown when a specific commit SHA cannot be fetched from origin.
@@ -66,15 +73,24 @@ export function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pr-backtest-"));
 }
 
+/** Plain, token-free HTTPS URL for the repo (the persisted remote). */
+export function repoHttpsUrl(owner: string, repo: string): string {
+  return `https://github.com/${owner}/${repo}.git`;
+}
+
 /**
- * Build the authenticated HTTPS clone URL.
+ * Build the in-memory git config entries that authenticate HTTPS operations
+ * without persisting any credential to disk.
  *
- * The token is embedded in the URL because that is how git authenticates a push
- * over HTTPS. The returned string is a SECRET — never pass it to `log`,
- * `console`, or write it to disk. Use {@link redactedRepoRef} for any display.
+ * Returns a single `http.extraHeader=AUTHORIZATION: basic <base64>` entry,
+ * passed to git as `-c` on every invocation (never written to `.git/config`).
+ * The base64 credential is registered with the logger as a scrubbed secret so
+ * it can never leak through an error string either.
  */
-export function buildCloneUrl(owner: string, repo: string, token: string): string {
-  return `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+export function buildAuthConfig(token: string): string[] {
+  const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+  log.registerSecret(basic);
+  return [`http.extraHeader=AUTHORIZATION: basic ${basic}`];
 }
 
 /** A token-free, log-safe reference to the repo, e.g. `github.com/acme/api`. */
@@ -83,16 +99,34 @@ export function redactedRepoRef(owner: string, repo: string): string {
 }
 
 /**
- * Clone the upstream repo over HTTPS into `tmpDir`.
+ * Clone the upstream repo over HTTPS into `tmpDir`, authenticated.
  *
- * `cloneUrl` must be an authenticated HTTPS URL (see {@link buildCloneUrl}); it
- * contains the token and must never be logged. We clone with `--no-checkout`
+ * The persisted remote URL is token-free; the token is supplied only via an
+ * in-memory `-c http.extraHeader` credential (see {@link buildAuthConfig}), so
+ * nothing secret is written into `tmpDir/.git/config`. We clone `--no-checkout`
  * since we never need a working tree — we push commits straight from their SHAs.
+ * The returned `SimpleGit` carries the same credential so fetch/push authenticate.
+ *
+ * Errors are caught and rethrown token-free; raw git stderr never escapes.
  */
-export async function cloneRepo(cloneUrl: string, tmpDir: string): Promise<SimpleGit> {
-  // NOTE: cloneUrl carries the token — do NOT log it.
-  await simpleGit().clone(cloneUrl, tmpDir, ["--no-checkout"]);
-  return simpleGit(tmpDir);
+export async function cloneRepo(
+  owner: string,
+  repo: string,
+  token: string,
+  tmpDir: string,
+): Promise<SimpleGit> {
+  const authConfig = buildAuthConfig(token);
+  try {
+    await simpleGit({ config: authConfig }).clone(
+      repoHttpsUrl(owner, repo),
+      tmpDir,
+      ["--no-checkout"],
+    );
+  } catch {
+    // Never surface raw git stderr — it can echo the credential header.
+    throw new Error(`Failed to clone ${redactedRepoRef(owner, repo)}.`);
+  }
+  return simpleGit(tmpDir, { config: authConfig });
 }
 
 /**
@@ -103,7 +137,7 @@ export async function cloneRepo(cloneUrl: string, tmpDir: string): Promise<Simpl
  * message; the raw git stderr is swallowed (it is not user-actionable).
  */
 export async function fetchCommit(git: SimpleGit, sha: string, prNumber: number): Promise<void> {
-  log.step(`Fetching commit ${sha.substring(0, 7)} from origin`);
+  log.step(`Fetching commit ${shortSha(sha)} from origin`);
   try {
     await git.fetch("origin", sha);
   } catch {
@@ -118,6 +152,9 @@ export async function fetchCommit(git: SimpleGit, sha: string, prNumber: number)
  * Pushes `<sha>:refs/heads/<branch>`. The caller supplies the full branch name,
  * e.g. `backtest-pr<N>-base` / `refs/heads/backtest-pr<N>-head`. `main` is never
  * a valid target here — the SHA-to-refspec path needs no checkout.
+ *
+ * Errors are caught and rethrown token-free; raw git stderr (which can echo the
+ * credential header) never escapes.
  */
 export async function pushBranchFromSha(
   git: SimpleGit,
@@ -125,27 +162,45 @@ export async function pushBranchFromSha(
   branch: string,
 ): Promise<void> {
   const refspec = `${sha}:refs/heads/${branch}`;
-  log.step(`Pushing ${sha.substring(0, 7)} → ${branch}`);
-  await git.push("origin", refspec);
+  log.step(`Pushing ${shortSha(sha)} → ${branch}`);
+  try {
+    await git.push("origin", refspec);
+  } catch {
+    // Never surface raw git stderr — it can echo the credential header.
+    throw new Error(`Failed to push ${shortSha(sha)} → ${branch}.`);
+  }
+}
+
+/** Synchronously remove `tmpDir`, ignoring errors. */
+function rmDirSync(tmpDir: string): void {
+  try {
+    if (existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  } catch {
+    // Best-effort: nothing useful to do during teardown.
+  }
 }
 
 /**
- * Register a best-effort `process.on('exit')` cleanup handler for `tmpDir`.
+ * Register best-effort cleanup handlers for `tmpDir`.
  *
- * The handler runs synchronously (exit handlers cannot await) and ignores
- * errors. This is the safety net for the `finally`-driven {@link cleanup} —
- * together they guarantee the temp clone is removed on success AND failure.
+ * `process.on('exit')` covers normal and error exits. Node does NOT run `exit`
+ * handlers on signal termination, so SIGINT/SIGTERM (Ctrl-C during a clone or
+ * push) are handled explicitly: remove the temp dir, then re-exit with the
+ * conventional 128+signal code. Together with the `finally`-driven
+ * {@link cleanup} this guarantees the token-free temp clone never lingers.
  */
 export function registerCleanup(tmpDir: string): void {
-  process.on("exit", () => {
-    try {
-      if (existsSync(tmpDir)) {
-        rmSync(tmpDir, { recursive: true, force: true });
-      }
-    } catch {
-      // Best-effort: nothing useful to do during process exit.
-    }
-  });
+  process.on("exit", () => rmDirSync(tmpDir));
+  const onSignal = (signal: NodeJS.Signals, code: number): void => {
+    process.on(signal, () => {
+      rmDirSync(tmpDir);
+      process.exit(code);
+    });
+  };
+  onSignal("SIGINT", 130);
+  onSignal("SIGTERM", 143);
 }
 
 /**

@@ -13,9 +13,8 @@
  * config. The authenticated clone URL (which embeds the token) is never logged —
  * we log `redactedRepoRef(owner, repo)` instead.
  */
-import { resolveToken } from "./auth.js";
+import { NoTokenNonInteractiveError, resolveToken } from "./auth.js";
 import {
-  buildCloneUrl,
   cleanup,
   cloneRepo,
   fetchCommit,
@@ -30,13 +29,17 @@ import {
   findExistingPr,
   getCommitParentSha,
   getPullRequest,
+  isHttpStatus,
   listPullRequestCommits,
   makeOctokit,
 } from "./github.js";
-import { error, info, step, success } from "./log.js";
+import { error, info, registerSecret, step, success } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
 import { resolveBase, resolveTarget } from "./resolveCommit.js";
+
+/** The tool's own repository, linked from the generated PR body. */
+const PROJECT_URL = "https://github.com/govambam/pr-backtest";
 
 /** Exit-code constants — the canonical SPEC §3 mapping for this tool. */
 const EXIT = {
@@ -84,12 +87,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const auth = await resolveToken();
     token = auth.token;
   } catch (err) {
-    if (
-      err !== null &&
-      typeof err === "object" &&
-      "kind" in err &&
-      (err as { kind: unknown }).kind === "no-token-non-interactive"
-    ) {
+    if (err instanceof NoTokenNonInteractiveError) {
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
     }
@@ -97,6 +95,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
   }
+  // Belt-and-suspenders: scrub the token from any output for the rest of the run.
+  registerSecret(token);
   const octokit = makeOctokit(token);
 
   // 3. Fetch the PR and its commits. Any GitHub/API error maps to exit 2.
@@ -183,10 +183,9 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
 
   let prUrl: string | null = null;
   try {
-    // The clone URL embeds the token — log the redacted ref instead.
+    // The token authenticates via an in-memory credential — never logged.
     step(`Cloning ${redactedRepoRef(owner, repo)}`);
-    const cloneUrl = buildCloneUrl(owner, repo, token);
-    const git = await cloneRepo(cloneUrl, tmpDir);
+    const git = await cloneRepo(owner, repo, token, tmpDir);
 
     try {
       await fetchCommit(git, baseSha, number);
@@ -206,18 +205,47 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const body = [
       `Backtest of ${owner}/${repo}#${number} at \`${targetSha}\`.`,
       "",
-      `Recreated by [pr-backtest](https://github.com/) so a PR-review bot can ` +
+      `Recreated by [pr-backtest](${PROJECT_URL}) so a PR-review bot can ` +
         `review the code as it existed at the target commit.`,
     ].join("\n");
-    prUrl = await createPullRequest(
-      octokit,
-      owner,
-      repo,
-      headBranch,
-      baseBranch,
-      `[backtest] ${prTitle}`,
-      body,
-    );
+    try {
+      prUrl = await createPullRequest(
+        octokit,
+        owner,
+        repo,
+        headBranch,
+        baseBranch,
+        `[backtest] ${prTitle}`,
+        body,
+      );
+    } catch (err) {
+      // A 422 here means a backtest PR for these branches already exists (e.g.
+      // a closed/merged one the open-only pre-flight didn't catch). Surface its
+      // URL and the documented existing-PR exit code rather than a git failure.
+      if (isHttpStatus(err, 422)) {
+        const existingUrl = await findExistingPr(
+          octokit,
+          owner,
+          repo,
+          headBranch,
+          baseBranch,
+          "all",
+        ).catch(() => null);
+        await cleanup(tmpDir);
+        if (existingUrl) {
+          info("A backtest PR already exists for these branches:");
+          process.stdout.write(existingUrl + "\n");
+          process.exit(EXIT.EXISTING_PR);
+        }
+        // 422 without a matching PR (e.g. no diff between the two commits).
+        error(
+          "GitHub rejected the PR: there may be no difference between the " +
+            "target commit and its parent for these branches.",
+        );
+        process.exit(EXIT.API_ERROR);
+      }
+      throw err;
+    }
   } catch (err) {
     error(messageOf(err));
     await cleanup(tmpDir);

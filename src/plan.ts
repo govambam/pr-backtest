@@ -9,6 +9,7 @@
 import prompts from "prompts";
 
 import { info } from "./log.js";
+import { shortSha } from "./util.js";
 
 /** Everything the plan renderer needs to describe the upcoming work. */
 export interface PlanInput {
@@ -32,11 +33,6 @@ export interface PlanInput {
   headBranch: string;
   /** The base branch name, e.g. "backtest-pr123-base". */
   baseBranch: string;
-}
-
-/** First 7 chars of a SHA, for display. */
-function shortSha(sha: string): string {
-  return sha.slice(0, 7);
 }
 
 /**

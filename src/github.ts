@@ -105,8 +105,12 @@ export async function getCommitParentSha(
 }
 
 /**
- * Pre-flight: detect an already-open backtest PR for the planned head/base
- * pair via `pulls.list`. Returns the existing PR's `html_url`, or `null`.
+ * Pre-flight: detect an existing backtest PR for the planned head/base pair via
+ * `pulls.list`. Returns the existing PR's `html_url`, or `null`.
+ *
+ * Defaults to open PRs for the pre-flight check. Pass `state: "all"` to also
+ * surface a closed/merged PR — used to recover the URL when `pulls.create`
+ * reports a duplicate (422).
  */
 export async function findExistingPr(
   octokit: Octokit,
@@ -114,15 +118,21 @@ export async function findExistingPr(
   repo: string,
   headBranch: string,
   baseBranch: string,
+  state: "open" | "all" = "open",
 ): Promise<string | null> {
   const { data } = await octokit.pulls.list({
     owner,
     repo,
     head: `${owner}:${headBranch}`,
     base: baseBranch,
-    state: "open",
+    state,
   });
   return data.length > 0 ? data[0]!.html_url : null;
+}
+
+/** True when `err` is an Octokit-style HTTP error with the given status. */
+export function isHttpStatus(err: unknown, status: number): boolean {
+  return isStatus(err, status);
 }
 
 /**
