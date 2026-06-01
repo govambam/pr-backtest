@@ -1,0 +1,22 @@
+{
+  "spec_id": "live-activity-trace",
+  "assertions": {
+    "VAL-API-001": { "status": "pending" },
+    "VAL-API-002": { "status": "pending" },
+    "VAL-API-003": { "status": "pending" },
+    "VAL-API-004": { "status": "pending" },
+    "VAL-GIT-001": { "status": "pending" },
+    "VAL-GIT-002": { "status": "pending" },
+    "VAL-GIT-003": { "status": "pending" },
+    "VAL-CH-001": { "status": "pending" },
+    "VAL-CH-002": { "status": "pending" },
+    "VAL-CH-003": { "status": "pending" },
+    "VAL-SAFE-001": { "status": "pending" },
+    "VAL-SAFE-002": { "status": "pending" },
+    "VAL-SAFE-003": { "status": "pending" },
+    "VAL-GATE-001": { "status": "pending" },
+    "VAL-GATE-002": { "status": "pending" },
+    "VAL-GATE-003": { "status": "pending" },
+    "VAL-GATE-004": { "status": "pending" }
+  }
+}
