@@ -159,6 +159,38 @@ export async function createPullRequest(
   return data.html_url;
 }
 
+/** The result of a destination pre-flight check. */
+export interface RepoVerification {
+  /** True when `repos.get` succeeds (the repo exists and is visible to the token). */
+  exists: boolean;
+  /** True only when `data.permissions.push === true` (the token can write). */
+  canPush: boolean;
+}
+
+/**
+ * Pre-flight verify a destination repo via `repos.get`. Reads existence and
+ * `permissions.push` in one call. A 404 maps to `{ exists: false, canPush: false }`;
+ * any other error is rethrown for the caller to map to exit 2.
+ *
+ * Takes an Octokit instance, never a raw token (INV-TOKEN): the token reaches
+ * GitHub only through the injected Octokit.
+ */
+export async function verifyRepo(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+): Promise<RepoVerification> {
+  try {
+    const { data } = await octokit.repos.get({ owner, repo });
+    return { exists: true, canPush: data.permissions?.push === true };
+  } catch (err: unknown) {
+    if (isStatus(err, 404)) {
+      return { exists: false, canPush: false };
+    }
+    throw err;
+  }
+}
+
 /** Narrow an unknown thrown value to an Octokit-style HTTP error of a status. */
 function isStatus(err: unknown, status: number): boolean {
   return (
