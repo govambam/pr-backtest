@@ -16,6 +16,7 @@ import {
   type Config,
   type TokenSource,
 } from "./config.js";
+import { makeOctokit } from "./github.js";
 import { info, step, success } from "./log.js";
 
 const execFileAsync = promisify(execFile);
@@ -221,10 +222,13 @@ export async function resolveToken(
 
   const resolved = await resolveTokenSource(resolvers);
 
-  // Validate the token by calling the authenticated-user endpoint.
+  // Validate the token by calling the authenticated-user endpoint. The default
+  // path routes through the shared `makeOctokit` factory so the `GET /user`
+  // validation call is traced and carries the `pr-backtest` userAgent
+  // (VAL-API-002). `options.makeOctokit` is the test-injection seam, preserved.
   const octokit = options.makeOctokit
     ? options.makeOctokit(resolved.token)
-    : new Octokit({ auth: resolved.token });
+    : makeOctokit(resolved.token);
 
   step("Validating token...");
   let login: string;

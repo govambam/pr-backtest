@@ -8,6 +8,7 @@
 
 import { Octokit } from "@octokit/rest";
 import type { PrCommit } from "./resolveCommit.js";
+import { formatElapsed, isVerbose, verboseLine } from "./log.js";
 
 /** The PR fields the rest of the tool consumes. */
 export interface PullRequest {
@@ -23,9 +24,91 @@ export interface PullRequest {
   user: string;
 }
 
-/** Build the single Octokit instance used for all API calls. */
+/**
+ * The only host the tool ever talks to. The hook below asserts every resolved
+ * request host equals this; any other host is a hard error (INV-HOST). The tool
+ * issues no uploads/codeload requests, so `api.github.com` is the only
+ * legitimate host.
+ */
+const GITHUB_API_HOST = "api.github.com";
+
+/**
+ * Format a single traced request as the spec §4.2 dim line, e.g.
+ * `→ GET   /repos/acme/api/pulls/123    200  142ms`. Only method, path+query,
+ * status and elapsed ms are recorded — never the request body. `redact()` (in
+ * log.ts) is the final scrub when this is written.
+ */
+function formatRequestLine(
+  method: string,
+  pathAndQuery: string,
+  status: number,
+  elapsedMs: number,
+): string {
+  const m = method.toUpperCase().padEnd(5);
+  return `→ ${m} ${pathAndQuery}  ${status}  ${formatElapsed(elapsedMs)}`;
+}
+
+/**
+ * Build the single Octokit instance used for all API calls.
+ *
+ * This is the SOLE Octokit factory for the tool: it installs a `request` hook
+ * exactly once so every API request is traced automatically, with no
+ * per-call-site annotation and no call silently omitted (VAL-API-001). The hook
+ * times each request, asserts its host (INV-HOST / VAL-API-004), and — only when
+ * verbose is active, read dynamically via {@link isVerbose} — prints one dim
+ * line per request via {@link verboseLine} (VAL-API-003). Default mode still runs
+ * and times the hook but prints nothing.
+ *
+ * The hook records HTTP method, URL path + query, response status, and elapsed
+ * ms — NEVER the request body (which can carry large diffs) and never the token;
+ * `redact()` remains the final net.
+ */
 export function makeOctokit(token: string): Octokit {
-  return new Octokit({ auth: token, userAgent: "pr-backtest" });
+  const octokit = new Octokit({ auth: token, userAgent: "pr-backtest" });
+
+  octokit.hook.wrap("request", async (request, options) => {
+    // Resolve the templated endpoint (e.g. `/repos/{owner}/{repo}/...`) into the
+    // final absolute URL so we can read the real path + query and check the
+    // host. `parse` substitutes path params and appends the query string.
+    const resolved = octokit.request.endpoint.parse(options);
+    const url = new URL(resolved.url);
+
+    // INV-HOST: any host other than api.github.com is a hard error, not a silent
+    // skip. This is runtime enforcement of SPEC §5.5.
+    if (url.host !== GITHUB_API_HOST) {
+      throw new Error(
+        `pr-backtest refuses to call ${url.host}: only ${GITHUB_API_HOST} is allowed.`,
+      );
+    }
+
+    const method = resolved.method ?? options.method;
+    const pathAndQuery = url.pathname + url.search;
+    const start = Date.now();
+    try {
+      const response = await request(options);
+      if (isVerbose()) {
+        verboseLine(
+          formatRequestLine(method, pathAndQuery, response.status, Date.now() - start),
+        );
+      }
+      return response;
+    } catch (err: unknown) {
+      // Still trace the failed request (status if the error carries one), then
+      // rethrow unchanged so callers' error handling is unaffected.
+      if (isVerbose()) {
+        const status =
+          typeof err === "object" && err !== null && "status" in err
+            ? Number((err as { status: unknown }).status) || 0
+            : 0;
+        verboseLine(
+          formatRequestLine(method, pathAndQuery, status, Date.now() - start),
+        );
+      }
+      throw err;
+    }
+  });
+
+  return octokit;
 }
 
 /**

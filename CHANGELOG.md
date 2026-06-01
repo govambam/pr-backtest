@@ -4,15 +4,42 @@ All notable changes to `pr-backtest` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Live activity trace: every operation now shows a friendly `✓` completion
+  marker as it finishes (on a terminal, a slow clone/fetch/push shows an
+  in-progress line that is replaced in place by its completion line). All trace
+  output is on stderr; stdout stays exactly the final PR URL.
+- `--verbose`: also print one dim line per **GitHub API request** (method,
+  path+query, status, elapsed) and per **git command** (the real argv, elapsed),
+  in real time. Off by default; no short alias (`-v` is `--version`).
+
+### Security
+- Every GitHub API request is traced through a single hook that asserts the host
+  is `api.github.com` — any other host is a hard error, enforcing the
+  "only GitHub" guarantee at runtime.
+- The displayed git commands are the real ones and carry no token: the token is
+  supplied via `GIT_ASKPASS`, never in the URL or argv, so the clone URL shows
+  only the non-secret `x-access-token@` username. Every trace line (API or git,
+  default or verbose) is passed through the redaction filter as a final net.
+
 ## [0.2.0] - 2026-06-01
 
 ### Added
-- `--fork <owner/repo>`: create the backtest branches and PR in a fork instead
-  of the PR's own repo. The PR is still read from its original repo; only the
-  writes (branch pushes, PR creation) are redirected to the fork, so the
-  original repo is never written to. Commits are fetched from a `source` remote
-  pointing at the original repo. A token scoped to only the fork suffices when
-  the original repo is public; a private original additionally needs read there.
+- Sandbox destinations: choose where the backtest branches and PR are created.
+  - `--primary`: land them in the PR's own repo (no prompt).
+  - `--sandbox <owner/repo>`: land them in a separate repo you control. The PR is
+    still **read** from its original repo; only the writes are redirected to the
+    sandbox, and the original repo is never written to. Commits are fetched from
+    a `source` remote pointing at the original repo. A token scoped to only the
+    sandbox suffices when the original repo is public; a private original
+    additionally needs read there.
+  - `--create-sandbox`: with `--sandbox`, create the destination repo (always
+    **private**) if it does not already exist. No effect without `--sandbox`.
+  - Interactively (a TTY with neither flag), pr-backtest prompts for the
+    destination and can remember it as the default. `--primary` and `--sandbox`
+    are mutually exclusive.
 
 ## [0.1.0] - 2026-06-01
 
