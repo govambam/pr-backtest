@@ -7,6 +7,7 @@ reference/
 .DS_Store
 .gstack/
 
-# Local design docs / mission artifacts — kept local for development + review, not shipped
+# Local dev/design docs — kept local for development + review, not shipped
+CLAUDE.md
 SPEC.md
 specs/
