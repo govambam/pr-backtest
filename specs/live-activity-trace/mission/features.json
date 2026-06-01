@@ -22,7 +22,7 @@
         "The renderer behaviors are exercised by tests added in later features (test/trace.test.ts)."
       ],
       "fulfills": [],
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "api-hook",
@@ -45,8 +45,13 @@
         "Update/extend test/auth.test.ts for the shared-factory routing + injection seam.",
         "npm test passes; npm run build clean."
       ],
-      "fulfills": ["VAL-API-001", "VAL-API-002", "VAL-API-003", "VAL-API-004"],
-      "status": "pending"
+      "fulfills": [
+        "VAL-API-001",
+        "VAL-API-002",
+        "VAL-API-003",
+        "VAL-API-004"
+      ],
+      "status": "completed"
     },
     {
       "id": "git-trace",
@@ -68,8 +73,13 @@
         "Add TTY/non-TTY rewrite coverage to test/trace.test.ts (driving the log.ts renderer).",
         "npm test passes; npm run build clean."
       ],
-      "fulfills": ["VAL-GIT-001", "VAL-GIT-002", "VAL-GIT-003", "VAL-SAFE-002"],
-      "status": "pending"
+      "fulfills": [
+        "VAL-GIT-001",
+        "VAL-GIT-002",
+        "VAL-GIT-003",
+        "VAL-SAFE-002"
+      ],
+      "status": "completed"
     },
     {
       "id": "wire-and-docs",
@@ -105,7 +115,7 @@
         "VAL-GATE-003",
         "VAL-GATE-004"
       ],
-      "status": "pending"
+      "status": "completed"
     }
   ]
 }
