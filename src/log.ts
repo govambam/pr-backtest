@@ -98,8 +98,13 @@ function isStderrTty(): boolean {
   return Boolean(process.stderr.isTTY);
 }
 
-/** Format an elapsed millisecond count as the spec's `<N>ms` figure (e.g. `142ms`). */
-function formatElapsed(ms: number): string {
+/**
+ * Format an elapsed millisecond count as the spec's `<N>ms` figure (e.g.
+ * `142ms`). The single canonical formatter for every trace line — the api-hook
+ * (`github.ts`) and git-trace (`git.ts`) layers import this so the `<N>ms`
+ * representation (rounded to whole milliseconds) is defined exactly once.
+ */
+export function formatElapsed(ms: number): string {
   return `${Math.round(ms)}ms`;
 }
 

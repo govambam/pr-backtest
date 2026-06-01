@@ -8,7 +8,7 @@
 
 import { Octokit } from "@octokit/rest";
 import type { PrCommit } from "./resolveCommit.js";
-import { isVerbose, verboseLine } from "./log.js";
+import { formatElapsed, isVerbose, verboseLine } from "./log.js";
 
 /** The PR fields the rest of the tool consumes. */
 export interface PullRequest {
@@ -45,7 +45,7 @@ function formatRequestLine(
   elapsedMs: number,
 ): string {
   const m = method.toUpperCase().padEnd(5);
-  return `→ ${m} ${pathAndQuery}  ${status}  ${Math.round(elapsedMs)}ms`;
+  return `→ ${m} ${pathAndQuery}  ${status}  ${formatElapsed(elapsedMs)}`;
 }
 
 /**

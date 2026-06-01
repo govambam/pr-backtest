@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import {
@@ -16,6 +16,19 @@ const CFG: Config = {
   username: "configuser",
   source: "fine-grained",
 };
+
+// The trace surface in log.ts is a module-level singleton. These tests flip
+// setVerbose/setTtyOverride; reset them unconditionally around every test so a
+// throw before a test's own `finally` can't leak verbose/TTY state into later
+// tests (mirrors the hooks already in git/trace/index test files).
+beforeEach(() => {
+  setVerbose(false);
+  setTtyOverride(null);
+});
+afterEach(() => {
+  setVerbose(false);
+  setTtyOverride(null);
+});
 
 // A resolver set where every step would succeed, so precedence is observable.
 function makeResolvers(overrides: Partial<TokenResolvers> = {}): TokenResolvers {

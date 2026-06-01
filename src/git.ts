@@ -201,7 +201,7 @@ export async function cloneRepo(
   }
   trace.done();
   log.verboseLine(
-    `$ ${cloneDisplayCommand(owner, repo, cloneTarget)}  ${Date.now() - start}ms`,
+    `$ ${cloneDisplayCommand(owner, repo, cloneTarget)}  ${log.formatElapsed(Date.now() - start)}`,
   );
   return simpleGit(cloneTarget).env(env);
 }
@@ -231,7 +231,7 @@ export async function addSourceRemote(
   }
   trace.done();
   log.verboseLine(
-    `$ ${addRemoteDisplayCommand(owner, repo)}  ${Date.now() - start}ms`,
+    `$ ${addRemoteDisplayCommand(owner, repo)}  ${log.formatElapsed(Date.now() - start)}`,
   );
 }
 
@@ -258,7 +258,7 @@ export async function fetchCommit(
     throw new UnfetchableCommitError(sha, prNumber, remote);
   }
   trace.done();
-  log.verboseLine(`$ ${fetchDisplayCommand(remote, sha)}  ${Date.now() - start}ms`);
+  log.verboseLine(`$ ${fetchDisplayCommand(remote, sha)}  ${log.formatElapsed(Date.now() - start)}`);
 }
 
 /**
@@ -287,7 +287,7 @@ export async function pushBranchFromSha(
     throw new Error(`Failed to push ${shortSha(sha)} → ${branch}.`);
   }
   trace.done();
-  log.verboseLine(`$ ${pushDisplayCommand(sha, branch)}  ${Date.now() - start}ms`);
+  log.verboseLine(`$ ${pushDisplayCommand(sha, branch)}  ${log.formatElapsed(Date.now() - start)}`);
 }
 
 /** Synchronously remove `tmpDir`, ignoring errors. */
