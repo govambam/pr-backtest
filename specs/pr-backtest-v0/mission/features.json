@@ -1,0 +1,176 @@
+{
+  "spec_id": "pr-backtest-v0",
+  "spec_path": "SPEC.md",
+  "features": [
+    {
+      "id": "scaffold",
+      "description": "Project skeleton: package.json (exactly the 5 allowed runtime deps + dev deps for TS and a test runner), tsconfig.json (strict), bin/pr-backtest shebang wrapper -> dist/cli.js, MIT LICENSE, src/log.ts (stderr logger), and empty/stub module files so the tree matches SPEC §6. Establish npm scripts: build (tsc), test.",
+      "milestone": "v0",
+      "preconditions": [
+        "Empty repo (no package.json, no src/) on a fresh mission branch off main"
+      ],
+      "expectedBehavior": [
+        "package.json dependencies are exactly: commander, @octokit/rest, simple-git, prompts, chalk",
+        "tsconfig.json has \"strict\": true and emits to dist/",
+        "bin/pr-backtest is a node shebang wrapper that requires ../dist/cli.js; package.json bin maps pr-backtest to it",
+        "LICENSE contains the MIT body",
+        "src/log.ts writes progress to stderr",
+        "npm install succeeds; npm run build runs tsc (may have nothing to compile yet but must not error on config)"
+      ],
+      "verificationSteps": [
+        "node -e \"const p=require('./package.json'); console.log(Object.keys(p.dependencies))\" shows the five deps",
+        "grep -q '\"strict\": true' tsconfig.json",
+        "grep -q 'dist/cli.js' bin/pr-backtest",
+        "grep -q 'Permission is hereby granted' LICENSE",
+        "npm install && npm run build"
+      ],
+      "fulfills": ["VAL-PKG-001", "VAL-PKG-003", "VAL-PKG-004", "VAL-PKG-005"],
+      "status": "pending"
+    },
+    {
+      "id": "parse-url",
+      "description": "Implement src/parseUrl.ts: GitHub PR URL -> {owner, repo, number:int}; tolerate trailing slash/segment/query; throw a clear Error on invalid/non-PR URLs. Write test/parseUrl.test.ts.",
+      "milestone": "v0",
+      "preconditions": ["scaffold complete (package.json, tsconfig, test runner)"],
+      "expectedBehavior": [
+        "Valid URL -> {owner, repo, number} with number an integer",
+        "Trailing slash, /files segment, and ?query suffix all parse identically",
+        "Invalid/non-PR URLs throw an Error with a readable message"
+      ],
+      "verificationSteps": ["npm test -- parseUrl (or run the test runner on test/parseUrl.test.ts)"],
+      "fulfills": ["VAL-URL-001", "VAL-URL-002", "VAL-URL-003", "VAL-TEST-001"],
+      "status": "pending"
+    },
+    {
+      "id": "resolve-commit",
+      "description": "Implement src/resolveCommit.ts: resolve --commit (initial | full/abbrev SHA) to a target SHA against the PR commit list, compute base = target.parents[0], reject invalid input. getCommit lookup is injectable for testing. Write test/resolveCommit.test.ts.",
+      "milestone": "v0",
+      "preconditions": ["scaffold complete"],
+      "expectedBehavior": [
+        "initial -> earliest-listed single-parent (non-merge) commit",
+        "explicit full or >=7-char SHA matched against PR commits and used; non-member SHA rejected",
+        "base SHA = target's parents[0]",
+        "input that is neither initial nor a valid hex SHA throws a clear error before any I/O"
+      ],
+      "verificationSteps": ["npm test -- resolveCommit"],
+      "fulfills": ["VAL-CMT-001", "VAL-CMT-002", "VAL-CMT-003", "VAL-CMT-004", "VAL-TEST-002"],
+      "status": "pending"
+    },
+    {
+      "id": "config-and-auth",
+      "description": "Implement src/config.ts (XDG/%APPDATA% path, read/write JSON {token,username,source}, mode 0600 on write, 0o077 loosened-perms warning on read, logout via unlink tolerating absence) and src/auth.ts (token resolution order env->config->gh->interactive, gh reuse prompt, fine-grained PAT guidance, masked paste prompt, validate via users.getAuthenticated printing the username, non-TTY+no-token -> exit-1 guidance). Write test/auth.test.ts asserting resolution precedence.",
+      "milestone": "v0",
+      "preconditions": ["scaffold complete"],
+      "expectedBehavior": [
+        "Resolution order env -> config -> gh auth token (after prompt) -> interactive paste, first match wins",
+        "users.getAuthenticated validates token and the username is surfaced",
+        "config written mode 0600; loosened perms (0o077 bits) warn on read",
+        "logout removes the config file, tolerating already-absent",
+        "interactive prompt is masked (password/invisible)",
+        "config schema is {token, username, source in {fine-grained,classic,gh-cli}}",
+        "config path honors XDG_CONFIG_HOME / %APPDATA%",
+        "gh path runs `gh auth token` only after a reuse prompt; declining falls through",
+        "when gh absent, prints fine-grained PAT permissions + personal-access-tokens URL",
+        "no token + non-TTY stdin -> exit 1 with setup guidance"
+      ],
+      "verificationSteps": [
+        "npm test -- auth",
+        "grep checks per the contract AUTH evidence lines"
+      ],
+      "fulfills": [
+        "VAL-AUTH-001", "VAL-AUTH-002", "VAL-AUTH-003", "VAL-AUTH-004",
+        "VAL-AUTH-005", "VAL-AUTH-006", "VAL-AUTH-007", "VAL-AUTH-008",
+        "VAL-AUTH-009", "VAL-AUTH-010", "VAL-AUTH-011"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "github-api",
+      "description": "Implement src/github.ts: Octokit wrappers to fetch the PR (pulls.get) and commits (pulls.listCommits), getCommit for parent resolution, an existing-PR pre-flight check (pulls.list for the head/base pair) returning html_url, and pulls.create (head->base). Post NO comment back to the original PR.",
+      "milestone": "v0",
+      "preconditions": ["scaffold complete", "auth provides an Octokit instance/token"],
+      "expectedBehavior": [
+        "Fetches PR + commit list via Octokit",
+        "Existing-PR check lists PRs for the planned head/base and returns the existing html_url",
+        "Creates the simulated PR head->base via pulls.create",
+        "Never calls createComment/issues.create"
+      ],
+      "verificationSteps": ["npm run build", "grep checks per contract GH evidence"],
+      "fulfills": ["VAL-GH-001", "VAL-GH-002", "VAL-GH-003", "VAL-GH-004"],
+      "status": "pending"
+    },
+    {
+      "id": "git-ops",
+      "description": "Implement src/git.ts with simple-git: clone repo (HTTPS, token auth) into a /tmp/pr-backtest-* dir, fetch the target and base SHAs from origin, push both as <sha>:refs/heads/backtest-pr<N>-base|head (no checkout), surface the SPEC §6.5 actionable error (both fallback lines) on fetch failure, and always clean up the temp dir via finally + process.on('exit'). No commit --amend / rebase. main never checked out.",
+      "milestone": "v0",
+      "preconditions": ["scaffold complete"],
+      "expectedBehavior": [
+        "Clones into a pr-backtest- temp directory over HTTPS",
+        "Fetches specific target+base SHAs from origin",
+        "Pushes SHAs to backtest-pr<N>-base/-head via refspec, no local checkout",
+        "No simple-git checkout call; main is never a push target",
+        "Unfetchable commit -> the §6.5 error with both manual git push fallback lines",
+        "Temp dir removed on success and failure (finally + process.on('exit'))",
+        "No amend/rebase commit rewriting"
+      ],
+      "verificationSteps": ["npm run build", "grep checks per contract GIT evidence"],
+      "fulfills": ["VAL-GIT-001", "VAL-GIT-002", "VAL-GIT-003", "VAL-GIT-004", "VAL-GIT-005", "VAL-GIT-006", "VAL-GIT-007"],
+      "status": "pending"
+    },
+    {
+      "id": "plan-confirm",
+      "description": "Implement src/plan.ts: build + render the plan (PR identity, target short SHA + label, base, numbered clone/fetch/push/open steps) to stderr, and a [y/N] Continue prompt that returns a declined outcome on no/empty; a yes/skip flag bypasses the prompt while still printing the plan.",
+      "milestone": "v0",
+      "preconditions": ["scaffold complete"],
+      "expectedBehavior": [
+        "Plan shows PR, target (short SHA+label), base, numbered steps",
+        "[y/N] Continue prompt; decline returns a 'declined' result (no side effects)",
+        "yes/skip flag prints plan but skips the prompt"
+      ],
+      "verificationSteps": ["npm run build", "grep checks per contract PLAN evidence"],
+      "fulfills": ["VAL-PLAN-001", "VAL-PLAN-002", "VAL-PLAN-003"],
+      "status": "pending"
+    },
+    {
+      "id": "cli-and-orchestration",
+      "description": "Implement src/cli.ts (commander entrypoint: <pr-url> command with --commit <ref> default 'initial' and -y/--yes; logout subcommand) and src/index.ts (runBacktest wiring parseUrl->auth->github->resolveCommit->plan->git->create, exit-code mapping 0/1/2/3/4, PR URL to stdout as final line, token never logged). Whole project typechecks; no any / bare @ts-ignore; no direct network outside Octokit/simple-git.",
+      "milestone": "v0",
+      "preconditions": [
+        "parse-url, resolve-commit, config-and-auth, github-api, git-ops, plan-confirm all complete"
+      ],
+      "expectedBehavior": [
+        "commander exposes the command, --commit (default initial), -y/--yes, and logout",
+        "unparseable URL -> exit 1",
+        "exit codes 0/1/2/3/4 mapped per SPEC §3 (sole owner of the numeric mapping)",
+        "created PR URL written to stdout as final line; progress to stderr",
+        "npm run build is clean; no : any / bare @ts-ignore in src/",
+        "no node-fetch/axios/https.request/fetch( in src/",
+        "token never passed to a log/console call or written to temp dir"
+      ],
+      "verificationSteps": ["npm run build", "npm test", "grep checks per contract CLI/PKG evidence"],
+      "fulfills": [
+        "VAL-CLI-001", "VAL-CLI-002", "VAL-CLI-003", "VAL-CLI-004", "VAL-CLI-005",
+        "VAL-PKG-002", "VAL-PKG-007", "VAL-PKG-008", "VAL-CROSS-002"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "readme-and-integration-test",
+      "description": "Write README.md covering all SPEC §9 sections (What this does, Problem, Install, Setup, Usage, How it works, Safety, Privacy & security, Limitations, Contributing, License) mirroring §5.5 privacy claims; and test/integration.test.ts gated on GITHUB_TOKEN with a TEST_FIXTURE_REPO override, skipped when no token.",
+      "milestone": "v0",
+      "preconditions": ["cli-and-orchestration complete (the tool runs end-to-end)"],
+      "expectedBehavior": [
+        "README has all §9 sections; Privacy section states no telemetry + only api.github.com/github.com egress",
+        "integration test exists, skips without GITHUB_TOKEN, honors TEST_FIXTURE_REPO",
+        "npm install -g . yields a working pr-backtest --help (verified manually)"
+      ],
+      "verificationSteps": [
+        "grep section headings in README.md",
+        "npm test (integration skips without token)",
+        "Manual: npm install -g . && pr-backtest --help"
+      ],
+      "fulfills": ["VAL-PKG-006", "VAL-PKG-010", "VAL-TEST-003", "VAL-CROSS-001"],
+      "status": "pending"
+    }
+  ]
+}
