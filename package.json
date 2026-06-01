@@ -1,0 +1,38 @@
+{
+  "name": "pr-backtest",
+  "version": "0.0.0",
+  "description": "Recreate a GitHub PR at a chosen commit so PR-review bots can review it as it existed at that moment.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "pr-backtest": "bin/pr-backtest"
+  },
+  "files": [
+    "dist/",
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "prepare": "tsc",
+    "prepublishOnly": "tsc"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.1.1",
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "prompts": "^2.4.2",
+    "simple-git": "^3.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/prompts": "^2.4.9",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
