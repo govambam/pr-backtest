@@ -80,6 +80,43 @@ When you run without a destination flag in a terminal, pr-backtest asks once whe
 
 `pr-backtest logout` deletes the whole config file — including any saved default sandbox destination, not just the token.
 
+## Live activity trace
+
+pr-backtest shows you what it is doing as it does it. The whole point is trust: you can watch that it only ever **reads** the source PR, only **writes** the destination you chose, and only ever talks to `api.github.com`.
+
+**Default view.** Each operation prints a friendly `✓` completion marker as it finishes:
+
+```
+✓ Authenticated as @octocat
+✓ Read PR acme/api#123  "Add retry to fetch"
+✓ Verified destination octocat/pr-backtest-sandbox  github.com/octocat/pr-backtest-sandbox
+✓ Cloning github.com/octocat/pr-backtest-sandbox
+✓ Fetching 9f3c1a2 from source
+✓ Pushing 9f3c1a2 → backtest-pr123-base
+✓ Pushing a1b2c3d → backtest-pr123-head
+✓ Opened backtest PR
+```
+
+On a terminal, a slow step (clone/fetch/push) first shows an in-progress line that is replaced in place by its completion line; piped to a file, only the completion line is written. All of this goes to **stderr** — stdout stays exactly the final PR URL, so `pr-backtest … | pbcopy` still works.
+
+**`--verbose`.** Add `--verbose` to also see, in real time, one dim line per **GitHub API request** and per **git command**, each with method/path (or argv) and an elapsed time:
+
+```bash
+pr-backtest https://github.com/acme/api/pull/123 --verbose
+```
+
+```
+  → GET   /repos/acme/api/pulls/123                          200  142ms
+  $ git clone --no-checkout https://x-access-token@github.com/octocat/pr-backtest-sandbox.git <tmp>/repo   1.1s
+  $ git fetch source 9f3c1a2                                 312ms
+  $ git push origin 9f3c1a2:refs/heads/backtest-pr123-base   640ms
+  → POST  /repos/octocat/pr-backtest-sandbox/pulls           201  301ms
+```
+
+`--verbose` is off by default and has no short alias (`-v` is `--version`).
+
+**The displayed git commands are the real ones, and they carry no token.** pr-backtest hands your token to git through `GIT_ASKPASS` (an environment-based credential helper) — never in the remote URL and never on the command line. So the command shown is exactly the command run, and it is safe to share: the clone URL contains only the non-secret `x-access-token@` username, with no token in it. As a final safety net every trace line — API or git, default or verbose — is passed through a redaction filter that scrubs your token even if some upstream string ever carried it.
+
 ## Recommendations
 
 **Use a fine-grained token scoped to just the repo(s) you write to.** Create one at <https://github.com/settings/personal-access-tokens/new> with these permissions:

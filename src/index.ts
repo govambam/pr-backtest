@@ -13,7 +13,13 @@
  * config. The authenticated clone URL (which embeds the token) is never logged —
  * we log `redactedRepoRef(owner, repo)` instead.
  */
-import { NoTokenNonInteractiveError, resolveToken } from "./auth.js";
+import type { Octokit } from "@octokit/rest";
+
+import {
+  NoTokenNonInteractiveError,
+  resolveToken,
+  type AuthResult,
+} from "./auth.js";
 import {
   addSourceRemote,
   cleanup,
@@ -42,8 +48,18 @@ import {
   makeInteractivePrompt,
   makeSandboxCreator,
   resolveDestination,
+  type DestinationResolvers,
+  type DestinationSelection,
+  type RepoRef,
 } from "./destination.js";
-import { error, info, registerSecret, step, success } from "./log.js";
+import {
+  error,
+  info,
+  registerSecret,
+  setVerbose,
+  success,
+  traceOp,
+} from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
 import { resolveBase, resolveTarget } from "./resolveCommit.js";
@@ -60,6 +76,69 @@ const EXIT = {
   EXISTING_PR: 4,
 } as const;
 
+/**
+ * Injectable collaborators for {@link runBacktest}.
+ *
+ * This is a TEST SEAM only (VAL-CH-001 / VAL-CH-003 / VAL-SAFE-003 drive the
+ * real orchestration through fakes that capture stdout vs stderr and the
+ * operation order). Every field defaults to the production implementation, so
+ * the live behavior — the set, order, write targets, and exit codes of
+ * operations — is byte-for-byte identical whether or not `deps` is supplied
+ * (INV-NO-BEHAVIOR-CHANGE). Nothing here changes WHAT runs; it only lets a test
+ * substitute the network/git boundary.
+ */
+export interface RunBacktestDeps {
+  resolveToken: typeof resolveToken;
+  makeOctokit: typeof makeOctokit;
+  resolveDestination: (
+    source: RepoRef,
+    resolvers: DestinationResolvers,
+  ) => Promise<{ owner: string; repo: string; isSandbox: boolean }>;
+  verifyRepo: typeof verifyRepo;
+  makeSandboxCreator: typeof makeSandboxCreator;
+  makeInteractivePrompt: () => (
+    choices: Parameters<ReturnType<typeof makeInteractivePrompt>>[0],
+  ) => Promise<DestinationSelection>;
+  readConfig: typeof readConfig;
+  getPullRequest: typeof getPullRequest;
+  listPullRequestCommits: typeof listPullRequestCommits;
+  getCommitParentSha: typeof getCommitParentSha;
+  findExistingPr: typeof findExistingPr;
+  createPullRequest: typeof createPullRequest;
+  confirmPlan: typeof confirmPlan;
+  makeTempDir: typeof makeTempDir;
+  registerCleanup: typeof registerCleanup;
+  cleanup: typeof cleanup;
+  cloneRepo: typeof cloneRepo;
+  addSourceRemote: typeof addSourceRemote;
+  fetchCommit: typeof fetchCommit;
+  pushBranchFromSha: typeof pushBranchFromSha;
+}
+
+/** Production wiring for {@link RunBacktestDeps} — the live, non-test path. */
+const defaultDeps: RunBacktestDeps = {
+  resolveToken,
+  makeOctokit,
+  resolveDestination,
+  verifyRepo,
+  makeSandboxCreator,
+  makeInteractivePrompt,
+  readConfig,
+  getPullRequest,
+  listPullRequestCommits,
+  getCommitParentSha,
+  findExistingPr,
+  createPullRequest,
+  confirmPlan,
+  makeTempDir,
+  registerCleanup,
+  cleanup,
+  cloneRepo,
+  addSourceRemote,
+  fetchCommit,
+  pushBranchFromSha,
+};
+
 /** Options for a single backtest run, as parsed by the CLI. */
 export interface RunBacktestOptions {
   prUrl: string;
@@ -71,6 +150,10 @@ export interface RunBacktestOptions {
   sandbox?: string;
   /** `--create-sandbox`: with `--sandbox`, create the repo if missing. */
   createSandbox?: boolean;
+  /** `--verbose`: show the live activity trace (every API request + git command). */
+  verbose?: boolean;
+  /** Injectable collaborators — TEST SEAM only; defaults to production wiring. */
+  deps?: Partial<RunBacktestDeps>;
 }
 
 /** Extract a human-readable message from an unknown thrown value. */
@@ -83,6 +166,14 @@ function messageOf(err: unknown): string {
  * then clone/fetch/push and open the simulated PR. Owns all exit codes.
  */
 export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
+  // 0. Wire the live activity trace. `setVerbose` flips the shared switch the
+  //    API hook (github.ts) and git ops (git.ts) read dynamically, so a verbose
+  //    run shows every API request and git command. Observation only — it does
+  //    not change which operations run (INV-NO-BEHAVIOR-CHANGE). Defaults are the
+  //    production collaborators; `opts.deps` is a test-only seam.
+  setVerbose(opts.verbose === true);
+  const deps: RunBacktestDeps = { ...defaultDeps, ...opts.deps };
+
   // 1. Parse the PR URL. A bad URL is a bad-args failure.
   let owner: string;
   let repo: string;
@@ -112,7 +203,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //    instance to verify (and possibly create) the destination repo.
   let token: string;
   try {
-    const auth = await resolveToken();
+    const auth: AuthResult = await deps.resolveToken();
     token = auth.token;
   } catch (err) {
     if (err instanceof NoTokenNonInteractiveError) {
@@ -125,7 +216,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   // Belt-and-suspenders: scrub the token from any output for the rest of the run.
   registerSecret(token);
-  const octokit = makeOctokit(token);
+  const octokit: Octokit = deps.makeOctokit(token);
 
   // 2b. Resolve where writes go. The source PR is always READ from `owner/repo`;
   //     the destination is where the branches and simulated PR are CREATED. The
@@ -139,8 +230,9 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   let destOwner: string;
   let destRepo: string;
   let isSandbox: boolean;
+  const destTrace = traceOp("Verified destination");
   try {
-    const resolved = await resolveDestination(
+    const resolved = await deps.resolveDestination(
       { owner, repo },
       {
         getFlags: () => ({
@@ -148,18 +240,19 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
           sandbox: opts.sandbox,
           createSandbox: opts.createSandbox,
         }),
-        getDefaultDestination: () => readConfig()?.defaultDestination,
+        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
         getIsTTY: () => process.stdin.isTTY === true,
         verifyDestination: (vOwner, vRepo) =>
-          verifyRepo(octokit, vOwner, vRepo),
-        createSandbox: makeSandboxCreator(octokit),
-        prompt: makeInteractivePrompt(),
+          deps.verifyRepo(octokit, vOwner, vRepo),
+        createSandbox: deps.makeSandboxCreator(octokit),
+        prompt: deps.makeInteractivePrompt(),
       },
     );
     destOwner = resolved.owner;
     destRepo = resolved.repo;
     isSandbox = resolved.isSandbox;
   } catch (err) {
+    destTrace.fail();
     if (err instanceof DestinationArgsError) {
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
@@ -170,21 +263,24 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     }
     throw err;
   }
+  destTrace.done(redactedRepoRef(destOwner, destRepo));
 
   // 3. Fetch the PR and its commits. Any GitHub/API error maps to exit 2.
   let prTitle: string;
   let prAuthor: string;
   let prCommits: Awaited<ReturnType<typeof listPullRequestCommits>>;
+  const readTrace = traceOp(`Read PR ${redactedRepoRef(owner, repo)}#${number}`);
   try {
-    step(`Reading PR ${redactedRepoRef(owner, repo)}#${number}`);
-    const pr = await getPullRequest(octokit, owner, repo, number);
+    const pr = await deps.getPullRequest(octokit, owner, repo, number);
     prTitle = pr.title;
     prAuthor = pr.user;
-    prCommits = await listPullRequestCommits(octokit, owner, repo, number);
+    prCommits = await deps.listPullRequestCommits(octokit, owner, repo, number);
   } catch (err) {
+    readTrace.fail();
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
   }
+  readTrace.done(`"${prTitle}"`);
 
   // 4. Resolve the target commit and its base (first parent). An invalid
   //    --commit value is a bad-args failure (exit 1). Pre-fetch the parent via
@@ -196,7 +292,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const target = resolveTarget(opts.commit, prCommits);
     let prefetchedParent: string | null = null;
     if (!target.parents[0]) {
-      prefetchedParent = await getCommitParentSha(octokit, owner, repo, target.sha);
+      prefetchedParent = await deps.getCommitParentSha(octokit, owner, repo, target.sha);
     }
     baseSha = resolveBase(target, () => prefetchedParent ?? "");
     targetSha = target.sha;
@@ -211,7 +307,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
 
   // 6. Pre-flight: bail out if a backtest PR already exists for these branches.
   try {
-    const existingUrl = await findExistingPr(
+    const existingUrl = await deps.findExistingPr(
       octokit,
       destOwner,
       destRepo,
@@ -242,7 +338,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     baseBranch,
     targetRepo: `${destOwner}/${destRepo}`,
   };
-  const proceed = await confirmPlan(planInput, { yes: opts.yes });
+  const proceed = await deps.confirmPlan(planInput, { yes: opts.yes });
   if (!proceed) {
     info("Aborted: no changes were made.");
     process.exit(EXIT.SUCCESS);
@@ -251,25 +347,27 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // 8. Clone, fetch the two commits, push them as branches, open the PR.
   //    The temp clone is always removed via the `finally` block (plus the
   //    process-exit safety net registered below).
-  const tmpDir = makeTempDir();
-  registerCleanup(tmpDir);
+  const tmpDir = deps.makeTempDir();
+  deps.registerCleanup(tmpDir);
 
   let prUrl: string | null = null;
   try {
     // The token authenticates via an in-memory credential — never logged.
-    step(`Cloning ${redactedRepoRef(destOwner, destRepo)}`);
-    const git = await cloneRepo(destOwner, destRepo, token, tmpDir);
+    // clone/fetch/push each narrate their own ✓ completion line from git.ts
+    // (via `traceOp`), so index.ts does NOT add a `step("Cloning …")` line here
+    // — that would double-narrate the same operation (VAL-CH-003).
+    const git = await deps.cloneRepo(destOwner, destRepo, token, tmpDir);
 
     // In sandbox mode the commits live in the PR's repo, not the sandbox —
     // fetch them from a `source` remote. Otherwise origin (the clone) has them.
     const commitRemote = isSandbox ? "source" : "origin";
     if (isSandbox) {
-      await addSourceRemote(git, owner, repo);
+      await deps.addSourceRemote(git, owner, repo);
     }
 
     try {
-      await fetchCommit(git, baseSha, number, commitRemote);
-      await fetchCommit(git, targetSha, number, commitRemote);
+      await deps.fetchCommit(git, baseSha, number, commitRemote);
+      await deps.fetchCommit(git, targetSha, number, commitRemote);
     } catch (err) {
       if (err instanceof UnfetchableCommitError) {
         error(err.message);
@@ -278,10 +376,11 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       throw err;
     }
 
-    await pushBranchFromSha(git, baseSha, baseBranch);
-    await pushBranchFromSha(git, targetSha, headBranch);
+    await deps.pushBranchFromSha(git, baseSha, baseBranch);
+    await deps.pushBranchFromSha(git, targetSha, headBranch);
 
-    step("Opening backtest PR");
+    // Open-PR has no git-layer trace, so narrate its ✓ completion here.
+    const openTrace = traceOp("Opened backtest PR");
     const body = [
       `Backtest of ${owner}/${repo}#${number} at \`${targetSha}\`.`,
       "",
@@ -289,7 +388,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         `review the code as it existed at the target commit.`,
     ].join("\n");
     try {
-      prUrl = await createPullRequest(
+      prUrl = await deps.createPullRequest(
         octokit,
         destOwner,
         destRepo,
@@ -299,19 +398,22 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         body,
       );
     } catch (err) {
+      openTrace.fail();
       // A 422 here means a backtest PR for these branches already exists (e.g.
       // a closed/merged one the open-only pre-flight didn't catch). Surface its
       // URL and the documented existing-PR exit code rather than a git failure.
       if (isHttpStatus(err, 422)) {
-        const existingUrl = await findExistingPr(
-          octokit,
-          destOwner,
-          destRepo,
-          headBranch,
-          baseBranch,
-          "all",
-        ).catch(() => null);
-        await cleanup(tmpDir);
+        const existingUrl = await deps
+          .findExistingPr(
+            octokit,
+            destOwner,
+            destRepo,
+            headBranch,
+            baseBranch,
+            "all",
+          )
+          .catch(() => null);
+        await deps.cleanup(tmpDir);
         if (existingUrl) {
           info("A backtest PR already exists for these branches:");
           process.stdout.write(existingUrl + "\n");
@@ -326,12 +428,13 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       }
       throw err;
     }
+    openTrace.done();
   } catch (err) {
     error(messageOf(err));
-    await cleanup(tmpDir);
+    await deps.cleanup(tmpDir);
     process.exit(EXIT.GIT_FAILURE);
   } finally {
-    await cleanup(tmpDir);
+    await deps.cleanup(tmpDir);
   }
 
   // 9. Success: the PR URL is the final line on stdout (pipe-friendly).

@@ -70,6 +70,39 @@ test("VAL-CLI-001: --help no longer mentions the removed --fork flag", () => {
   assert.doesNotMatch(stdout, /--fork/);
 });
 
+// --- VAL-CH-002: --verbose flag surface (live-activity-trace) ---
+
+test("VAL-CH-002: --help lists --verbose and does not reassign -v", () => {
+  const { status, stdout } = runCli(["--help"]);
+  assert.equal(status, 0, "--help exits 0");
+  assert.match(stdout, /--verbose/, "--verbose appears in help");
+  // -v stays bound to --version, NOT --verbose (no collision).
+  assert.match(stdout, /-v, --version/, "-v is still the --version alias");
+});
+
+test("VAL-CH-002: -v / --version still prints the version (no collision with --verbose)", () => {
+  const pkgVersion = JSON.parse(
+    fs.readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+  ).version as string;
+
+  const short = runCli(["-v"]);
+  assert.equal(short.status, 0, "-v exits 0");
+  assert.equal(short.stdout.trim(), pkgVersion, "-v prints the version");
+
+  const long = runCli(["--version"]);
+  assert.equal(long.status, 0, "--version exits 0");
+  assert.equal(long.stdout.trim(), pkgVersion, "--version prints the version");
+});
+
+test("VAL-CH-002: omitting --verbose yields verbose off (no per-request trace lines on a failed offline run)", () => {
+  // A hermetic run with no token exits before any work; the point here is that
+  // WITHOUT --verbose the run never emits the dim `→ GET …` per-request trace
+  // lines that only verbose mode prints. (Channel/printing is unit-tested in
+  // trace.test.ts; this is the CLI-level default-off assertion.)
+  const { stderr } = runCli(["https://github.com/acme/api/pull/123"]);
+  assert.doesNotMatch(stderr, /→ (GET|POST)\s+\//, "no per-request trace line by default");
+});
+
 // --- VAL-DEST-003 (CLI level): both flags do not succeed, exit 1 ---
 
 test("VAL-DEST-003: --primary --sandbox x/y <url> exits 1 with a conflict message, no token error", () => {

@@ -21,7 +21,12 @@ import type { SimpleGit } from "simple-git";
 
 import { makeOctokit } from "../src/github.js";
 import { fetchCommit } from "../src/git.js";
-import { setVerbose, setTtyOverride } from "../src/log.js";
+import {
+  registerSecret,
+  setVerbose,
+  setTtyOverride,
+  verboseLine,
+} from "../src/log.js";
 
 /** A fake `SimpleGit` whose `fetch` resolves — enough to drive `traceOp`. */
 function fakeGitOk(): SimpleGit {
@@ -199,6 +204,53 @@ test("VAL-GIT-003: with no TTY a git op prints only the completion line, no carr
   });
   assert.ok(!out.includes("\r"), `expected no carriage return off-TTY, got: ${JSON.stringify(out)}`);
   assert.match(out, /✓/);
+});
+
+test("VAL-SAFE-001: a sentinel token never appears across a full traced flow (API + git, verbose)", async () => {
+  // A long, distinctive sentinel — registerSecret ignores values < 8 chars.
+  const SENTINEL = "ghp_SENTINEL_token_value_should_never_leak_0001";
+  registerSecret(SENTINEL);
+  setVerbose(true);
+
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const out = await captureStderr(async () => {
+    // The token is the SENTINEL: it travels via Octokit auth (never into a
+    // traced line) and via GIT_ASKPASS in the real flow — here the fake git
+    // never sees it, but we still register + verbose-trace both layers.
+    const octokit = makeOctokit(SENTINEL);
+    await octokit.request("GET /repos/{owner}/{repo}/pulls/{n}", {
+      owner: "acme",
+      repo: "api",
+      n: 123,
+      request: { fetch: fakeFetch(200, { number: 123 }, calls) },
+    });
+    // A git op trace line (constructed argv) in the same captured stderr.
+    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
+  });
+
+  // Across BOTH the API hook line and the git op line, the token never appears.
+  assert.ok(
+    !out.includes(SENTINEL),
+    `the registered token must never appear in any traced line, got: ${out}`,
+  );
+  // Sanity: the trace actually ran (so the absence is meaningful, not vacuous).
+  assert.match(out, /GET/);
+  assert.match(out, /git fetch source/);
+});
+
+test("VAL-SAFE-001: redact() is the proven net — a sentinel passed INTO a trace line is scrubbed to ***", async () => {
+  const SENTINEL = "ghp_SENTINEL_redact_net_proof_value_0002";
+  registerSecret(SENTINEL);
+  setVerbose(true);
+
+  const out = await captureStderr(async () => {
+    // Deliberately construct a line that CONTAINS the secret. If redact() were
+    // not the net, this would leak; instead the secret must become `***`.
+    verboseLine("token=" + SENTINEL);
+  });
+
+  assert.ok(!out.includes(SENTINEL), "the secret must be scrubbed from the line");
+  assert.match(out, /token=\*\*\*/, "the secret is replaced with ***");
 });
 
 test("VAL-API-004: a request to a non-api.github.com host is a hard error (throws)", async () => {

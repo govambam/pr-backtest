@@ -51,6 +51,11 @@ program
     "--create-sandbox",
     "With --sandbox, create the repo if it does not exist (no effect without --sandbox)",
   )
+  .option(
+    "--verbose",
+    "Show the live activity trace: every GitHub API request and every git command, as they run",
+    false,
+  )
   .action(
     async (
       prUrl: string,
@@ -60,6 +65,7 @@ program
         primary?: boolean;
         sandbox?: string;
         createSandbox?: boolean;
+        verbose?: boolean;
       },
     ) => {
       await runBacktest({
@@ -69,6 +75,7 @@ program
         primary: options.primary,
         sandbox: options.sandbox,
         createSandbox: options.createSandbox,
+        verbose: options.verbose,
       });
     },
   );
