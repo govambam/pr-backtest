@@ -4,6 +4,16 @@ All notable changes to `pr-backtest` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-01
+
+### Added
+- `--fork <owner/repo>`: create the backtest branches and PR in a fork instead
+  of the PR's own repo. The PR is still read from its original repo; only the
+  writes (branch pushes, PR creation) are redirected to the fork, so the
+  original repo is never written to. Commits are fetched from a `source` remote
+  pointing at the original repo. A token scoped to only the fork suffices when
+  the original repo is public; a private original additionally needs read there.
+
 ## [0.1.0] - 2026-06-01
 
 Initial release.

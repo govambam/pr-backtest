@@ -33,6 +33,11 @@ export interface PlanInput {
   headBranch: string;
   /** The base branch name, e.g. "backtest-pr123-base". */
   baseBranch: string;
+  /**
+   * Where the backtest branches and PR are created. Defaults to `ownerRepo`;
+   * differs only in `--fork` mode, where it is the fork's `owner/repo`.
+   */
+  targetRepo?: string;
 }
 
 /**
@@ -43,18 +48,30 @@ export function renderPlan(input: PlanInput): string {
   const target = shortSha(input.targetSha);
   const base = shortSha(input.baseSha);
   const cloneDest = input.tmpDirNote ?? "a temp directory";
+  const dest = input.targetRepo ?? input.ownerRepo;
+  const isFork = dest !== input.ownerRepo;
+  // In fork mode the commits live in the PR's repo, fetched via the `source`
+  // remote; otherwise they come straight from the clone's origin.
+  const fetchFrom = isFork ? `source (${input.ownerRepo})` : "origin";
 
-  const lines = [
+  const header = [
     `PR:      ${input.ownerRepo}#${input.prNumber} "${input.prTitle}" by @${input.prAuthor}`,
     `Target:  ${target} (${input.targetLabel})`,
     `Base:    ${base} (parent of target)`,
+  ];
+  if (isFork) {
+    header.push(`Into:    ${dest} (fork — your ${input.ownerRepo} is never touched)`);
+  }
+
+  const lines = [
+    ...header,
     "",
     "Plan:",
-    `  1. Clone ${input.ownerRepo} into ${cloneDest}`,
-    `  2. Fetch commits ${target} and ${base} from origin`,
-    `  3. Push ${base} → ${input.ownerRepo}:${input.baseBranch}`,
-    `  4. Push ${target} → ${input.ownerRepo}:${input.headBranch}`,
-    `  5. Open PR: ${input.headBranch} → ${input.baseBranch}`,
+    `  1. Clone ${dest} into ${cloneDest}`,
+    `  2. Fetch commits ${target} and ${base} from ${fetchFrom}`,
+    `  3. Push ${base} → ${dest}:${input.baseBranch}`,
+    `  4. Push ${target} → ${dest}:${input.headBranch}`,
+    `  5. Open PR in ${dest}: ${input.headBranch} → ${input.baseBranch}`,
   ];
 
   return lines.join("\n");

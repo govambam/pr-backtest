@@ -15,6 +15,7 @@
  */
 import { NoTokenNonInteractiveError, resolveToken } from "./auth.js";
 import {
+  addSourceRemote,
   cleanup,
   cloneRepo,
   fetchCommit,
@@ -34,7 +35,7 @@ import {
   makeOctokit,
 } from "./github.js";
 import { error, info, registerSecret, step, success } from "./log.js";
-import { parseUrl } from "./parseUrl.js";
+import { parseRepoSlug, parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
 import { resolveBase, resolveTarget } from "./resolveCommit.js";
 
@@ -55,6 +56,8 @@ export interface RunBacktestOptions {
   prUrl: string;
   commit: string;
   yes: boolean;
+  /** Optional `owner/repo` fork to create the backtest branches and PR in. */
+  fork?: string;
 }
 
 /** Extract a human-readable message from an unknown thrown value. */
@@ -80,6 +83,23 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     error(messageOf(err));
     process.exit(EXIT.BAD_ARGS);
   }
+
+  // 1b. Resolve where writes go. Without --fork this is the PR's own repo;
+  //     with --fork the PR is still READ from its repo, but the branches and
+  //     simulated PR are CREATED in the fork (the real repo is never written).
+  let destOwner = owner;
+  let destRepo = repo;
+  if (opts.fork) {
+    try {
+      const slug = parseRepoSlug(opts.fork);
+      destOwner = slug.owner;
+      destRepo = slug.repo;
+    } catch (err) {
+      error(messageOf(err));
+      process.exit(EXIT.BAD_ARGS);
+    }
+  }
+  const isFork = destOwner !== owner || destRepo !== repo;
 
   // 2. Resolve and validate a token, then build the Octokit instance.
   let token: string;
@@ -141,8 +161,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   try {
     const existingUrl = await findExistingPr(
       octokit,
-      owner,
-      repo,
+      destOwner,
+      destRepo,
       headBranch,
       baseBranch,
     );
@@ -168,6 +188,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     baseSha,
     headBranch,
     baseBranch,
+    targetRepo: `${destOwner}/${destRepo}`,
   };
   const proceed = await confirmPlan(planInput, { yes: opts.yes });
   if (!proceed) {
@@ -184,12 +205,19 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   let prUrl: string | null = null;
   try {
     // The token authenticates via an in-memory credential — never logged.
-    step(`Cloning ${redactedRepoRef(owner, repo)}`);
-    const git = await cloneRepo(owner, repo, token, tmpDir);
+    step(`Cloning ${redactedRepoRef(destOwner, destRepo)}`);
+    const git = await cloneRepo(destOwner, destRepo, token, tmpDir);
+
+    // In fork mode the commits live in the PR's repo, not the fork — fetch
+    // them from a `source` remote. Otherwise origin (the clone) has them.
+    const commitRemote = isFork ? "source" : "origin";
+    if (isFork) {
+      await addSourceRemote(git, owner, repo);
+    }
 
     try {
-      await fetchCommit(git, baseSha, number);
-      await fetchCommit(git, targetSha, number);
+      await fetchCommit(git, baseSha, number, commitRemote);
+      await fetchCommit(git, targetSha, number, commitRemote);
     } catch (err) {
       if (err instanceof UnfetchableCommitError) {
         error(err.message);
@@ -211,8 +239,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     try {
       prUrl = await createPullRequest(
         octokit,
-        owner,
-        repo,
+        destOwner,
+        destRepo,
         headBranch,
         baseBranch,
         `[backtest] ${prTitle}`,
@@ -225,8 +253,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       if (isHttpStatus(err, 422)) {
         const existingUrl = await findExistingPr(
           octokit,
-          owner,
-          repo,
+          destOwner,
+          destRepo,
           headBranch,
           baseBranch,
           "all",

@@ -22,6 +22,18 @@ test("UnfetchableCommitError.message equals buildUnfetchableMessage and carries 
   assert.equal(err.prNumber, 7);
 });
 
+test("the unfetchable message names origin by default and the source repo in fork mode", () => {
+  assert.match(buildUnfetchableMessage("abc1234", 1), /from origin\./);
+  assert.match(
+    buildUnfetchableMessage("abc1234", 1, "source"),
+    /from the source repository\./,
+  );
+  assert.equal(
+    new UnfetchableCommitError("abc1234", 1, "source").message,
+    buildUnfetchableMessage("abc1234", 1, "source"),
+  );
+});
+
 test("repoHttpsUrl carries only the x-access-token username, never a secret", () => {
   const url = repoHttpsUrl("acme", "api");
   assert.equal(url, "https://x-access-token@github.com/acme/api.git");

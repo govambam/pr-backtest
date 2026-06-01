@@ -17,6 +17,41 @@ export interface ParsedPrUrl {
   number: number;
 }
 
+/** An `owner/repo` pair, e.g. the `--fork` target. */
+export interface RepoSlug {
+  owner: string;
+  repo: string;
+}
+
+// `owner/repo` — same character class as the URL segments, exactly two parts.
+const REPO_SLUG_RE = /^([\w.-]+)\/([\w.-]+)$/;
+
+/**
+ * Parse an `owner/repo` slug (used by `--fork`). Tolerates a leading
+ * `https://github.com/` prefix and a trailing `.git` / slash. Throws a clear
+ * `Error` on anything that is not a single `owner/repo` pair.
+ */
+export function parseRepoSlug(slug: string): RepoSlug {
+  if (typeof slug !== "string" || slug.trim() === "") {
+    throw new Error("Invalid --fork value: expected a non-empty owner/repo.");
+  }
+  const cleaned = slug
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/\.git$/i, "")
+    .replace(/\/$/, "");
+  const match = cleaned.match(REPO_SLUG_RE);
+  // Reject dot-only segments (".", "..") — they pass the char class but are not
+  // valid repo names, and would otherwise fail later with a muddier git error.
+  const isDots = (s: string): boolean => /^\.+$/.test(s);
+  if (!match || !match[1] || !match[2] || isDots(match[1]) || isDots(match[2])) {
+    throw new Error(
+      `Invalid --fork value: "${slug}". Expected an owner/repo slug, e.g. myuser/myfork.`,
+    );
+  }
+  return { owner: match[1], repo: match[2] };
+}
+
 // owner / repo segments: GitHub allows letters, digits, dots, hyphens, underscores.
 // The PR number is one-or-more digits, optionally followed by a trailing path
 // segment, a query string, or a fragment.

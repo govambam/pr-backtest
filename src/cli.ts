@@ -42,9 +42,23 @@ program
     "initial",
   )
   .option("-y, --yes", "Skip the confirmation prompt (for scripting)", false)
-  .action(async (prUrl: string, options: { commit: string; yes: boolean }) => {
-    await runBacktest({ prUrl, commit: options.commit, yes: options.yes });
-  });
+  .option(
+    "--fork <owner/repo>",
+    "Create the backtest branches and PR in this fork instead of the PR's own repo",
+  )
+  .action(
+    async (
+      prUrl: string,
+      options: { commit: string; yes: boolean; fork?: string },
+    ) => {
+      await runBacktest({
+        prUrl,
+        commit: options.commit,
+        yes: options.yes,
+        fork: options.fork,
+      });
+    },
+  );
 
 program
   .command("logout")
