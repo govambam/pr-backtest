@@ -2,11 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  resolveToken,
   resolveTokenSource,
   NoTokenNonInteractiveError,
   type TokenResolvers,
 } from "../src/auth.js";
 import type { Config } from "../src/config.js";
+import { makeOctokit } from "../src/github.js";
+import { setVerbose, setTtyOverride, isVerbose } from "../src/log.js";
 
 const CFG: Config = {
   token: "github_pat_config",
@@ -81,4 +84,85 @@ test("no token anywhere + no interactive throws NoTokenNonInteractiveError", asy
       }),
     (err: unknown) => err instanceof NoTokenNonInteractiveError,
   );
+});
+
+// --- VAL-API-002: validation Octokit routes through the shared factory --------
+
+/** Silence stderr (step/success lines) while a token resolution runs. */
+async function quiet<T>(run: () => Promise<T>): Promise<T> {
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    return await run();
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+test("options.makeOctokit injection seam is honored on the default validation path", async () => {
+  let seamUsed = false;
+  let seenToken = "";
+
+  const result = await quiet(() =>
+    resolveToken({
+      resolvers: {
+        getEnvToken: () => "ghp_injected_token_value",
+        getConfig: () => null,
+        getGhToken: async () => null,
+        getInteractiveToken: async () => null,
+      },
+      makeOctokit: (token) => {
+        seamUsed = true;
+        seenToken = token;
+        // Minimal `Pick<Octokit, "users">` shape returning a login.
+        return {
+          users: {
+            getAuthenticated: async () => ({ data: { login: "injected-user" } }),
+          },
+        } as unknown as ReturnType<NonNullable<Parameters<typeof resolveToken>[0]["makeOctokit"]>>;
+      },
+    }),
+  );
+
+  assert.equal(seamUsed, true, "the injected factory must be used");
+  assert.equal(seenToken, "ghp_injected_token_value");
+  assert.equal(result.username, "injected-user");
+});
+
+test("the shared makeOctokit factory traces GET /user (so the default validation call is traced)", async () => {
+  // The default validation path builds its Octokit via this same shared factory,
+  // so proving the factory traces `GET /user` proves the default path is traced.
+  setTtyOverride(false);
+  setVerbose(true);
+  const original = process.stderr.write.bind(process.stderr);
+  let buffer = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    buffer += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    return true;
+  }) as typeof process.stderr.write;
+
+  try {
+    const octokit = makeOctokit("ghp_token");
+    await octokit.request("GET /user", {
+      request: {
+        fetch: (async () =>
+          new Response(JSON.stringify({ login: "octocat" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })) as unknown as typeof fetch,
+      },
+    });
+  } finally {
+    process.stderr.write = original;
+    setVerbose(false);
+    setTtyOverride(null);
+  }
+
+  const lines = buffer.split("\n").filter((l) => l.includes("→"));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /GET/);
+  assert.match(lines[0]!, /\/user/);
+  assert.match(lines[0]!, /200/);
+  assert.match(lines[0]!, /\d+ms/);
+  assert.equal(isVerbose(), false, "verbose restored after the run");
 });
