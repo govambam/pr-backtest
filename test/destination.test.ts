@@ -837,6 +837,45 @@ test("interactive: create-sandbox lets the user edit owner and name", async () =
   assert.deepEqual(sel.repo, { owner: "myorg", repo: "custom-name" });
 });
 
+// --- create-sandbox: aborting the owner prompt cancels (Macroscope finding) ---
+test("interactive: aborting the create-sandbox owner prompt throws bad-args", async () => {
+  // select create-sandbox, then Ctrl-C (undefined) at the owner prompt.
+  prompts.inject(["create-sandbox", undefined]);
+  const prompt = makeTestPrompt();
+  await assert.rejects(
+    () => prompt(NO_SAVED_CHOICES),
+    (err: unknown) => err instanceof DestinationArgsError,
+  );
+});
+
+// --- create-sandbox: aborting the name prompt cancels ---
+test("interactive: aborting the create-sandbox name prompt throws bad-args", async () => {
+  // select create-sandbox, accept owner default (""), then Ctrl-C at the name prompt.
+  prompts.inject(["create-sandbox", "", undefined]);
+  const prompt = makeTestPrompt();
+  await assert.rejects(
+    () => prompt(NO_SAVED_CHOICES),
+    (err: unknown) => err instanceof DestinationArgsError,
+  );
+});
+
+// --- create-sandbox: no owner entered AND no default owner → bad-args ---
+test("interactive: create-sandbox with empty owner and no default owner throws", async () => {
+  // A choice set whose primary has no repo → primaryOwner() is undefined.
+  const choices: DestinationChoice[] = [
+    { kind: "primary" },
+    { kind: "create-sandbox" },
+    { kind: "different-repo" },
+  ];
+  // create-sandbox, empty owner (Enter), name default (Enter).
+  prompts.inject(["create-sandbox", "", ""]);
+  const prompt = makeTestPrompt();
+  await assert.rejects(
+    () => prompt(choices),
+    (err: unknown) => err instanceof DestinationArgsError,
+  );
+});
+
 // --- non-TTY guard ---
 test("interactive: throws a clear bad-args error when stdin is not a TTY", async () => {
   const prompt = makeInteractivePrompt({ isTTY: () => false });

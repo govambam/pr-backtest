@@ -409,26 +409,40 @@ async function promptForSlug(): Promise<RepoRef> {
 async function promptForCreateTarget(
   defaultOwner: string | undefined,
 ): Promise<RepoRef> {
+  // No `initial` on these prompts: with an initial, `prompts` returns that value
+  // on Ctrl-C, making an abort indistinguishable from accepting the default. We
+  // instead surface the default in the message, so a blank Enter falls back to
+  // it (below) while a true abort yields `undefined` and is honored — matching
+  // promptForSlug. The default owner is the source owner (spec §5).
+  const ownerMessage = defaultOwner
+    ? `Owner for the new sandbox (blank for ${defaultOwner}):`
+    : "Owner for the new sandbox:";
   const { owner } = await prompts({
     type: "text",
     name: "owner",
-    message: "Owner for the new sandbox:",
-    initial: defaultOwner ?? "",
+    message: ownerMessage,
   });
+  if (typeof owner !== "string") {
+    throw new DestinationArgsError("No owner entered.");
+  }
   const { name } = await prompts({
     type: "text",
     name: "name",
-    message: "Name for the new sandbox:",
-    initial: DEFAULT_SANDBOX_NAME,
+    message: `Name for the new sandbox (blank for ${DEFAULT_SANDBOX_NAME}):`,
   });
+  if (typeof name !== "string") {
+    throw new DestinationArgsError("No sandbox name entered.");
+  }
+  // A blank submission accepts the default; a non-blank one overrides it.
   const resolvedOwner =
-    typeof owner === "string" && owner.trim().length > 0
-      ? owner.trim()
-      : defaultOwner ?? "";
+    owner.trim().length > 0 ? owner.trim() : defaultOwner ?? "";
+  // Guard the latent empty-owner case: never create a repo under an empty owner
+  // (reachable only when there is no default owner and the user submits blank).
+  if (resolvedOwner.length === 0) {
+    throw new DestinationArgsError("No owner for the new sandbox.");
+  }
   const resolvedName =
-    typeof name === "string" && name.trim().length > 0
-      ? name.trim()
-      : DEFAULT_SANDBOX_NAME;
+    name.trim().length > 0 ? name.trim() : DEFAULT_SANDBOX_NAME;
   return { owner: resolvedOwner, repo: resolvedName };
 }
 
