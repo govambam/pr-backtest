@@ -2,18 +2,17 @@
  * Full-flow tests for `runBacktest` (`src/index.ts`), driving the real
  * orchestration through an injected `deps` fake so no network or git runs.
  *
- * Coverage (live-activity-trace mission):
- *  - VAL-CH-001: on a successful run stdout is EXACTLY the PR URL + "\n", and
- *    every trace line the run emits is on stderr (stdout carries nothing else).
- *  - VAL-CH-003: the captured stderr shows `✓` completion markers for the
- *    user-facing operations (authenticated, read PR, verified destination,
- *    cloned, fetched, pushed base, pushed head, opened PR).
- *  - VAL-SAFE-003: the recorded operation order matches the base sequence
- *    (read PR → verify destination → clone → fetch base → fetch head →
- *    push base → push head → open PR), AND a failure path keeps its exit code
- *    (an unfetchable commit → exit 3). Because `deps` defaults to production and
- *    is only substituted here, this exercises the REAL ordering in `runBacktest`
- *    — not a hardcoded copy.
+ * Coverage:
+ *  - On a successful run stdout is EXACTLY the PR URL + "\n", and every trace
+ *    line the run emits is on stderr (stdout carries nothing else).
+ *  - The captured stderr shows `✓` completion markers for the user-facing
+ *    operations (authenticated, read PR, verified destination, cloned, fetched,
+ *    pushed base, pushed head, opened PR).
+ *  - The recorded operation order matches the base sequence (read PR → verify
+ *    destination → clone → fetch base → fetch head → push base → push head →
+ *    open PR), AND a failure path keeps its exit code (an unfetchable commit →
+ *    exit 3). Because `deps` defaults to production and is only substituted here,
+ *    this exercises the real ordering in `runBacktest` — not a hardcoded copy.
  *
  * `process.exit` is stubbed to throw a tagged error so the test can assert the
  * code without killing the test process (mirrors the cli.test.ts intent of
@@ -194,7 +193,7 @@ afterEach(() => {
   setTtyOverride(null);
 });
 
-test("VAL-CH-001: on success stdout is exactly the PR URL + newline; trace is on stderr", async () => {
+test("on success stdout is exactly the PR URL + newline; trace is on stderr", async () => {
   const { deps } = makeDeps();
   const { stdout, stderr, exit } = await run({ deps });
 
@@ -208,7 +207,7 @@ test("VAL-CH-001: on success stdout is exactly the PR URL + newline; trace is on
   assert.match(stderr, /✓/);
 });
 
-test("VAL-CH-003: a default run's stderr shows ✓ completion markers for each operation", async () => {
+test("a default run's stderr shows ✓ completion markers for each operation", async () => {
   const { deps } = makeDeps();
   const { stderr } = await run({ deps });
 
@@ -220,7 +219,7 @@ test("VAL-CH-003: a default run's stderr shows ✓ completion markers for each o
   assert.match(stderr, /✓ Backtest PR created/);
 });
 
-test("VAL-CH-003: git-layer ops (clone/fetch/push) narrate their own ✓ — no duplicate index-level line", async () => {
+test("git-layer ops (clone/fetch/push) narrate their own ✓ — no duplicate index-level line", async () => {
   // Drive through the REAL git ops (not the deps stubs) by injecting a fake
   // SimpleGit so clone/fetch/push render their `traceOp` ✓ lines. Here we let
   // the default deps git stubs stand and instead assert the index layer does
@@ -237,7 +236,7 @@ test("VAL-CH-003: git-layer ops (clone/fetch/push) narrate their own ✓ — no 
   assert.equal(indexClonedLines.length, 0, "index.ts emits no `→ Cloning` line");
 });
 
-test("VAL-SAFE-003: the success operation order matches the base sequence", async () => {
+test("the success operation order matches the base sequence", async () => {
   const { deps, order } = makeDeps();
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
@@ -253,7 +252,7 @@ test("VAL-SAFE-003: the success operation order matches the base sequence", asyn
   ]);
 });
 
-test("VAL-SAFE-003: an unfetchable commit maps to exit 3 (git failure), unchanged", async () => {
+test("an unfetchable commit maps to exit 3 (git failure), unchanged", async () => {
   const { deps } = makeDeps({
     fetchCommit: async (_git, sha, prNumber, remote) => {
       throw new UnfetchableCommitError(sha, prNumber, remote);
@@ -265,7 +264,7 @@ test("VAL-SAFE-003: an unfetchable commit maps to exit 3 (git failure), unchange
   assert.match(stderr, /Could not fetch commit/);
 });
 
-test("VAL-SAFE-003: a verbose run is observation-only — same order, same exit", async () => {
+test("a verbose run is observation-only — same order, same exit", async () => {
   const { deps, order } = makeDeps();
   const { exit } = await run({ deps, verbose: true });
   assert.equal(exit, 0, "verbose does not change the exit code");

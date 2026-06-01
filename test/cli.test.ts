@@ -11,15 +11,14 @@
  * or default destination can leak in from the host machine.
  *
  * Coverage:
- *  - VAL-CLI-001: `--help` advertises the new flags and no longer mentions
- *    `--fork`.
- *  - VAL-DEST-003 (CLI level): `--primary --sandbox x/y <url>` does NOT succeed
- *    and exits with the bad-args code (1). The PRECISE both-flags rejection
- *    (DestinationArgsError "not both") is unit-tested in `destination.test.ts`
- *    (VAL-DEST-003). Because token resolution precedes destination resolution in
- *    `runBacktest`, a hermetic subprocess with no token reaches the bad-args exit
- *    (1) at the auth-or-resolver stage without any network; we assert exit 1
- *    rather than parsing which guard fired, keeping the harness fully offline.
+ *  - `--help` advertises the new flags and no longer mentions `--fork`.
+ *  - `--primary --sandbox x/y <url>` does NOT succeed and exits with the bad-args
+ *    code (1). The precise both-flags rejection (DestinationArgsError "not both")
+ *    is unit-tested in `destination.test.ts`. Because token resolution precedes
+ *    destination resolution in `runBacktest`, a hermetic subprocess with no token
+ *    reaches the bad-args exit (1) at the auth-or-resolver stage without any
+ *    network; we assert exit 1 rather than parsing which guard fired, keeping the
+ *    harness fully offline.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -55,9 +54,9 @@ function runCli(args: string[]): { status: number | null; stdout: string; stderr
   }
 }
 
-// --- VAL-CLI-001: --help flag surface ---
+// --- --help flag surface ---
 
-test("VAL-CLI-001: --help advertises --primary, --sandbox, and --create-sandbox", () => {
+test("--help advertises --primary, --sandbox, and --create-sandbox", () => {
   const { status, stdout } = runCli(["--help"]);
   assert.equal(status, 0, "--help exits 0");
   assert.match(stdout, /--primary/);
@@ -65,14 +64,14 @@ test("VAL-CLI-001: --help advertises --primary, --sandbox, and --create-sandbox"
   assert.match(stdout, /--create-sandbox/);
 });
 
-test("VAL-CLI-001: --help no longer mentions the removed --fork flag", () => {
+test("--help no longer mentions the removed --fork flag", () => {
   const { stdout } = runCli(["--help"]);
   assert.doesNotMatch(stdout, /--fork/);
 });
 
-// --- VAL-CH-002: --verbose flag surface (live-activity-trace) ---
+// --- --verbose flag surface ---
 
-test("VAL-CH-002: --help lists --verbose and does not reassign -v", () => {
+test("--help lists --verbose and does not reassign -v", () => {
   const { status, stdout } = runCli(["--help"]);
   assert.equal(status, 0, "--help exits 0");
   assert.match(stdout, /--verbose/, "--verbose appears in help");
@@ -80,7 +79,7 @@ test("VAL-CH-002: --help lists --verbose and does not reassign -v", () => {
   assert.match(stdout, /-v, --version/, "-v is still the --version alias");
 });
 
-test("VAL-CH-002: -v / --version still prints the version (no collision with --verbose)", () => {
+test("-v / --version still prints the version (no collision with --verbose)", () => {
   const pkgVersion = JSON.parse(
     fs.readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
   ).version as string;
@@ -94,7 +93,7 @@ test("VAL-CH-002: -v / --version still prints the version (no collision with --v
   assert.equal(long.stdout.trim(), pkgVersion, "--version prints the version");
 });
 
-test("VAL-CH-002: omitting --verbose yields verbose off (no per-request trace lines on a failed offline run)", () => {
+test("omitting --verbose yields verbose off (no per-request trace lines on a failed offline run)", () => {
   // A hermetic run with no token exits before any work; the point here is that
   // WITHOUT --verbose the run never emits the dim `→ GET …` per-request trace
   // lines that only verbose mode prints. (Channel/printing is unit-tested in
@@ -103,9 +102,9 @@ test("VAL-CH-002: omitting --verbose yields verbose off (no per-request trace li
   assert.doesNotMatch(stderr, /→ (GET|POST)\s+\//, "no per-request trace line by default");
 });
 
-// --- VAL-DEST-003 (CLI level): both flags do not succeed, exit 1 ---
+// --- both flags do not succeed, exit 1 ---
 
-test("VAL-DEST-003: --primary --sandbox x/y <url> exits 1 with a conflict message, no token error", () => {
+test("--primary and --sandbox together exits 1 with a conflict message, no token error", () => {
   const { status, stdout, stderr } = runCli([
     "--primary",
     "--sandbox",

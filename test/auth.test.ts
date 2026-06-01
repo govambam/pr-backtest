@@ -99,7 +99,7 @@ test("no token anywhere + no interactive throws NoTokenNonInteractiveError", asy
   );
 });
 
-// --- VAL-API-002: validation Octokit routes through the shared factory --------
+// --- validation Octokit routes through the shared factory ---
 
 /** Silence stderr (step/success lines) while a token resolution runs. */
 async function quiet<T>(run: () => Promise<T>): Promise<T> {

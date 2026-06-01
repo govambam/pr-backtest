@@ -85,9 +85,9 @@ test("redactedRepoRef is a token-free, log-safe reference", () => {
   assert.equal(redactedRepoRef("acme", "api"), "github.com/acme/api");
 });
 
-// --- VAL-GIT-001: constructed display commands match the real argv ---------
+// --- constructed display commands match the real argv ---------
 
-test("VAL-GIT-001: each op's display command equals the expected argv for known inputs", () => {
+test("each op's display command equals the expected argv for known inputs", () => {
   assert.equal(
     cloneDisplayCommand("octocat", "repo", "/tmp/x/repo"),
     "git clone --no-checkout https://x-access-token@github.com/octocat/repo.git /tmp/x/repo",
@@ -106,7 +106,7 @@ test("VAL-GIT-001: each op's display command equals the expected argv for known 
   );
 });
 
-// --- VAL-GIT-002: verbose git lines carry the real, token-free command -----
+// --- verbose git lines carry the real, token-free command -----
 
 /**
  * A minimal fake `SimpleGit` whose four methods used by the trace path resolve
@@ -127,7 +127,7 @@ function fakeGit(
   } as unknown as SimpleGit;
 }
 
-test("VAL-GIT-002: verbose fetch line is the real `$ git fetch …` command", async () => {
+test("verbose fetch line is the real `$ git fetch …` command", async () => {
   setVerbose(true);
   const git = fakeGit({});
   const out = await captureStderr(async () => {
@@ -137,7 +137,7 @@ test("VAL-GIT-002: verbose fetch line is the real `$ git fetch …` command", as
   assert.match(out, /\d+ms/);
 });
 
-test("VAL-GIT-002: verbose push line is the real `$ git push …` command", async () => {
+test("verbose push line is the real `$ git push …` command", async () => {
   setVerbose(true);
   const git = fakeGit({});
   const out = await captureStderr(async () => {
@@ -146,7 +146,7 @@ test("VAL-GIT-002: verbose push line is the real `$ git push …` command", asyn
   assert.match(out, /\$ git push origin a1b2c3d:refs\/heads\/backtest-pr123-head/);
 });
 
-test("VAL-GIT-002: verbose addRemote line shows the x-access-token URL with no token", async () => {
+test("verbose addRemote line shows the x-access-token URL with no token", async () => {
   setVerbose(true);
   const git = fakeGit({});
   const out = await captureStderr(async () => {
@@ -161,7 +161,7 @@ test("VAL-GIT-002: verbose addRemote line shows the x-access-token URL with no t
   assert.doesNotMatch(out, /x-access-token:[^@]+@/);
 });
 
-test("VAL-GIT-002: the clone display URL carries the x-access-token username only", () => {
+test("the clone display URL carries the x-access-token username only", () => {
   // cloneDisplayCommand reuses repoHttpsUrl, so the displayed URL never carries
   // a `:password@` form.
   const line = cloneDisplayCommand("octocat", "pr-backtest-sandbox", "/tmp/x/repo");
@@ -169,11 +169,11 @@ test("VAL-GIT-002: the clone display URL carries the x-access-token username onl
   assert.doesNotMatch(line, /x-access-token:[^@]+@/);
 });
 
-// --- VAL-SAFE-002: raw git stderr never reaches the user, incl. failures ----
+// --- raw git stderr never reaches the user, incl. failures ----
 
 const STDERR_SENTINEL = "RAW_GIT_STDERR_SENTINEL_must_never_leak";
 
-test("VAL-SAFE-002: a fetch failure surfaces only the domain error; the stderr sentinel never leaks", async () => {
+test("a fetch failure surfaces only the domain error; the stderr sentinel never leaks", async () => {
   setVerbose(true);
   const git = fakeGit({
     fetch: (async () => {
@@ -202,7 +202,7 @@ test("VAL-SAFE-002: a fetch failure surfaces only the domain error; the stderr s
   assert.ok(!out.includes(STDERR_SENTINEL), "raw git stderr must never reach stderr output");
 });
 
-test("VAL-SAFE-002: a push failure surfaces only the generic error; the stderr sentinel never leaks", async () => {
+test("a push failure surfaces only the generic error; the stderr sentinel never leaks", async () => {
   setVerbose(true);
   const git = fakeGit({
     push: (async () => {

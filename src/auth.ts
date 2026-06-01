@@ -224,8 +224,8 @@ export async function resolveToken(
 
   // Validate the token by calling the authenticated-user endpoint. The default
   // path routes through the shared `makeOctokit` factory so the `GET /user`
-  // validation call is traced and carries the `pr-backtest` userAgent
-  // (VAL-API-002). `options.makeOctokit` is the test-injection seam, preserved.
+  // validation call is traced and carries the `pr-backtest` userAgent.
+  // `options.makeOctokit` is the test-injection seam, preserved.
   const octokit = options.makeOctokit
     ? options.makeOctokit(resolved.token)
     : makeOctokit(resolved.token);

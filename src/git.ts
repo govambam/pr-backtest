@@ -1,7 +1,7 @@
 /**
  * simple-git wrappers: clone over HTTPS, fetch-by-SHA, push-by-refspec, cleanup.
  *
- * Design notes (see SPEC.md §4 steps 7-9, §5, §6.5, §5.5):
+ * Design notes:
  *  - No local checkout of any branch or commit. We push commits straight from
  *    their SHA to a new ref: `git push origin <sha>:refs/heads/backtest-pr<N>-head`.
  *    `main` is never checked out, written to, or pushed to.
@@ -12,8 +12,8 @@
  *    is world-readable via `ps`/`/proc/<pid>/cmdline`). Instead the token is
  *    handed to git through `GIT_ASKPASS`: a tiny helper script (holding no
  *    secret) reads it from the git child's environment, which is owner-readable
- *    only (see VAL-CROSS-002). The remote URL carries only the `x-access-token`
- *    username, which is not secret.
+ *    only. The remote URL carries only the `x-access-token` username, which is
+ *    not secret.
  *  - clone/fetch/push errors are caught here and rethrown as token-free domain
  *    errors; raw git stderr never reaches a caller.
  *  - The temp clone directory is always removed — on success, on failure, on
@@ -32,8 +32,8 @@ const TOKEN_ENV = "PR_BACKTEST_GIT_TOKEN";
 /**
  * Thrown when a specific commit SHA cannot be fetched from origin.
  *
- * Carries the exact, actionable SPEC §6.5 message (including both manual
- * fallback `git push` lines). The raw git stderr is never surfaced to the user.
+ * Carries an actionable message including both manual fallback `git push`
+ * lines. The raw git stderr is never surfaced to the user.
  */
 export class UnfetchableCommitError extends Error {
   readonly sha: string;
@@ -48,7 +48,7 @@ export class UnfetchableCommitError extends Error {
 }
 
 /**
- * Build the SPEC §6.5 unfetchable-commit message for a given SHA + PR number.
+ * Build the unfetchable-commit message for a given SHA + PR number.
  *
  * `remote` names where the fetch was attempted: `origin` (same-repo runs) or
  * `source` (sandbox mode, where commits come from the PR's original repo).
@@ -81,7 +81,7 @@ export function buildUnfetchableMessage(
  * Create a temp directory for the clone.
  *
  * The directory name always contains `pr-backtest-` so leaked temp dirs are
- * identifiable and the cleanup contract is greppable (VAL-GIT-001).
+ * identifiable.
  */
 export function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pr-backtest-"));
@@ -100,18 +100,13 @@ export function redactedRepoRef(owner: string, repo: string): string {
   return `github.com/${owner}/${repo}`;
 }
 
-// ---------------------------------------------------------------------------
-// Constructed git display commands (VAL-GIT-001 / VAL-GIT-002).
-//
-// Each helper builds the `git …` argv string that MIRRORS the real command
-// simple-git runs, assembled purely from the tool's own inputs (the
-// `repoHttpsUrl`, the SHA, the refspec, the remote name) — NEVER captured from
-// simple-git's internal argv and NEVER from the git child's stdout/stderr.
-// Because the token travels via GIT_ASKPASS (never in the URL or on the command
-// line), the displayed command equals the real one and is secret-free; the URL
-// carries only the `x-access-token` username. `redact()` is still the final net
-// when these strings are written.
-// ---------------------------------------------------------------------------
+// Constructed git display commands. Each helper builds the `git …` argv string
+// that mirrors the real command simple-git runs, assembled purely from the
+// tool's own inputs — never captured from simple-git's internal argv or the git
+// child's stdout/stderr. Because the token travels via GIT_ASKPASS (never in the
+// URL or on the command line), the displayed command equals the real one and is
+// secret-free; the URL carries only the `x-access-token` username. `redact()` is
+// still the final net when these strings are written.
 
 /** `git clone --no-checkout <repoHttpsUrl> <cloneTarget>` — mirrors {@link cloneRepo}. */
 export function cloneDisplayCommand(
@@ -225,8 +220,7 @@ export async function addSourceRemote(
     await git.addRemote("source", repoHttpsUrl(owner, repo));
   } catch (err: unknown) {
     trace.fail();
-    // Preserve the existing error type/behavior (INV-NO-BEHAVIOR-CHANGE): this
-    // op did not previously swallow git stderr, so rethrow unchanged.
+    // This op does not swallow git stderr, so rethrow unchanged.
     throw err;
   }
   trace.done();
@@ -239,8 +233,8 @@ export async function addSourceRemote(
  * Fetch a single, specific commit SHA from a remote (default `origin`).
  *
  * This is a targeted `git fetch <remote> <sha>` — never a full-branch checkout.
- * On any failure we throw {@link UnfetchableCommitError} carrying the SPEC §6.5
- * message; the raw git stderr is swallowed (it is not user-actionable).
+ * On any failure we throw {@link UnfetchableCommitError}; the raw git stderr is
+ * swallowed (it is not user-actionable).
  */
 export async function fetchCommit(
   git: SimpleGit,
@@ -290,10 +284,16 @@ export async function pushBranchFromSha(
   log.verboseLine(`$ ${pushDisplayCommand(sha, branch)}  ${log.formatElapsed(Date.now() - start)}`);
 }
 
-/** Synchronously remove `tmpDir`, ignoring errors. */
-function rmDirSync(tmpDir: string): void {
+/**
+ * Synchronously remove the temp clone directory, ignoring errors.
+ *
+ * Used both from the caller's `finally` block (so cleanup runs whether the
+ * backtest succeeded or threw) and from the process-exit / signal handlers
+ * registered by {@link registerCleanup}.
+ */
+export function cleanup(tmpDir: string): void {
   try {
-    if (existsSync(tmpDir)) {
+    if (tmpDir && existsSync(tmpDir)) {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   } catch {
@@ -311,29 +311,13 @@ function rmDirSync(tmpDir: string): void {
  * {@link cleanup} this guarantees the token-free temp clone never lingers.
  */
 export function registerCleanup(tmpDir: string): void {
-  process.on("exit", () => rmDirSync(tmpDir));
+  process.on("exit", () => cleanup(tmpDir));
   const onSignal = (signal: NodeJS.Signals, code: number): void => {
     process.on(signal, () => {
-      rmDirSync(tmpDir);
+      cleanup(tmpDir);
       process.exit(code);
     });
   };
   onSignal("SIGINT", 130);
   onSignal("SIGTERM", 143);
-}
-
-/**
- * Remove the temp clone directory. Errors are ignored.
- *
- * Intended for a `finally` block in the caller so cleanup runs whether the
- * backtest succeeded or threw.
- */
-export async function cleanup(tmpDir: string): Promise<void> {
-  try {
-    if (tmpDir && existsSync(tmpDir)) {
-      rmSync(tmpDir, { recursive: true, force: true });
-    }
-  } catch {
-    // Silently ignore cleanup errors.
-  }
 }

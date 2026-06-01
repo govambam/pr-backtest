@@ -137,7 +137,7 @@ test("deleteConfig removes the file and tolerates a second call (ENOENT)", () =>
   assert.doesNotThrow(() => deleteConfig());
 });
 
-// VAL-CONFIG-001: saving a default destination preserves a saved token.
+// Saving a default destination preserves a saved token.
 test("mergeConfig saving a destination preserves a saved token (merge, not overwrite)", () => {
   useTempConfigHome();
   writeConfig(VALID);
@@ -151,7 +151,7 @@ test("mergeConfig saving a destination preserves a saved token (merge, not overw
   });
 });
 
-// VAL-CONFIG-002: saving a token preserves a saved default destination.
+// Saving a token preserves a saved default destination.
 test("mergeConfig saving a token preserves a saved default destination", () => {
   useTempConfigHome();
   // Start with a destination-only config (no token).
@@ -166,8 +166,8 @@ test("mergeConfig saving a token preserves a saved default destination", () => {
   });
 });
 
-// VAL-CONFIG-003 (a): a legacy file (token triple, no defaultDestination) reads
-// back with the three fields present and defaultDestination undefined.
+// A legacy file (token triple, no defaultDestination) reads back with the three
+// fields present and defaultDestination undefined.
 test("readConfig tolerates a legacy file with no defaultDestination", () => {
   useTempConfigHome();
   const p = configPath();
@@ -185,8 +185,8 @@ test("readConfig tolerates a legacy file with no defaultDestination", () => {
   assert.equal(result?.defaultDestination, undefined);
 });
 
-// VAL-CONFIG-003 (b): a destination-only file (no token) reads back exposing
-// the destination with no token.
+// A destination-only file (no token) reads back exposing the destination with
+// no token.
 test("readConfig tolerates a destination-only file (no token)", () => {
   useTempConfigHome();
   const p = configPath();
@@ -202,8 +202,8 @@ test("readConfig tolerates a destination-only file (no token)", () => {
   assert.deepEqual(result?.defaultDestination, { owner: "octocat", repo: "sandbox" });
 });
 
-// VAL-CONFIG-003: a file that is neither a token-config nor a destination-config
-// is still rejected (warn + null).
+// A file that is neither a token-config nor a destination-config is still
+// rejected (warn + null).
 test("readConfig rejects a file that is neither a token nor a destination config", () => {
   useTempConfigHome();
   const p = configPath();
@@ -215,7 +215,7 @@ test("readConfig rejects a file that is neither a token nor a destination config
   assert.match(err, /malformed/);
 });
 
-// VAL-CONFIG-003: a malformed defaultDestination (missing repo) is rejected.
+// A malformed defaultDestination (missing repo) is rejected.
 test("readConfig rejects a malformed defaultDestination", () => {
   useTempConfigHome();
   const p = configPath();
@@ -231,7 +231,7 @@ test("readConfig rejects a malformed defaultDestination", () => {
   assert.match(err, /malformed/);
 });
 
-// VAL-CONFIG-004: the config file stays mode 0600 after a destination-only save.
+// The config file stays mode 0600 after a destination-only save.
 test("mergeConfig keeps mode 0600 after a destination-only save", { skip: process.platform === "win32" }, () => {
   useTempConfigHome();
   mergeConfig({ defaultDestination: { owner: "octocat", repo: "sandbox" } });

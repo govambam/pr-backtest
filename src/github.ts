@@ -3,8 +3,7 @@
 //
 // All GitHub network egress for the tool flows through these functions (and the
 // Octokit instance they wrap). No direct fetch/https — only api.github.com via
-// Octokit, per SPEC §5.5. This module never posts a comment or review back to
-// the original PR (VAL-GH-004).
+// Octokit. This module never posts a comment or review back to the original PR.
 
 import { Octokit } from "@octokit/rest";
 import type { PrCommit } from "./resolveCommit.js";
@@ -26,14 +25,13 @@ export interface PullRequest {
 
 /**
  * The only host the tool ever talks to. The hook below asserts every resolved
- * request host equals this; any other host is a hard error (INV-HOST). The tool
- * issues no uploads/codeload requests, so `api.github.com` is the only
- * legitimate host.
+ * request host equals this; any other host is a hard error. The tool issues no
+ * uploads/codeload requests, so `api.github.com` is the only legitimate host.
  */
 const GITHUB_API_HOST = "api.github.com";
 
 /**
- * Format a single traced request as the spec §4.2 dim line, e.g.
+ * Format a single traced request as a dim line, e.g.
  * `→ GET   /repos/acme/api/pulls/123    200  142ms`. Only method, path+query,
  * status and elapsed ms are recorded — never the request body. `redact()` (in
  * log.ts) is the final scrub when this is written.
@@ -51,13 +49,13 @@ function formatRequestLine(
 /**
  * Build the single Octokit instance used for all API calls.
  *
- * This is the SOLE Octokit factory for the tool: it installs a `request` hook
+ * This is the one Octokit factory for the tool: it installs a `request` hook
  * exactly once so every API request is traced automatically, with no
- * per-call-site annotation and no call silently omitted (VAL-API-001). The hook
- * times each request, asserts its host (INV-HOST / VAL-API-004), and — only when
- * verbose is active, read dynamically via {@link isVerbose} — prints one dim
- * line per request via {@link verboseLine} (VAL-API-003). Default mode still runs
- * and times the hook but prints nothing.
+ * per-call-site annotation and no call silently omitted. The hook times each
+ * request, asserts its host, and — only when verbose is active, read dynamically
+ * via {@link isVerbose} — prints one dim line per request via
+ * {@link verboseLine}. Default mode still runs and times the hook but prints
+ * nothing.
  *
  * The hook records HTTP method, URL path + query, response status, and elapsed
  * ms — NEVER the request body (which can carry large diffs) and never the token;
@@ -73,8 +71,7 @@ export function makeOctokit(token: string): Octokit {
     const resolved = octokit.request.endpoint.parse(options);
     const url = new URL(resolved.url);
 
-    // INV-HOST: any host other than api.github.com is a hard error, not a silent
-    // skip. This is runtime enforcement of SPEC §5.5.
+    // Any host other than api.github.com is a hard error, not a silent skip.
     if (url.host !== GITHUB_API_HOST) {
       throw new Error(
         `pr-backtest refuses to call ${url.host}: only ${GITHUB_API_HOST} is allowed.`,
@@ -244,8 +241,8 @@ export async function createPullRequest(
 
 /**
  * Create a PRIVATE repository for a backtest sandbox and return its
- * `{ owner, repo }`. INV-PRIVATE: the repo is ALWAYS created private — never
- * more visible than private.
+ * `{ owner, repo }`. The repo is ALWAYS created private — never more visible
+ * than private.
  *
  * Owner routing (personal vs org): we resolve the authenticated login once via
  * `users.getAuthenticated` and compare it to the requested `owner`. If they
@@ -259,19 +256,18 @@ export async function createPullRequest(
  *
  * Initialization: `auto_init: true` so the repo gets a default branch with a
  * minimal commit. A backtest run pushes a base branch and opens a PR against
- * it; an empty repo has no default branch, so `auto_init` is the safe default
- * that makes VAL-CREATE-003 hold without extra plumbing.
+ * it; an empty repo has no default branch, so `auto_init` is the safe default.
  *
- * Failure handling (VAL-CREATE-002): a 403 / insufficient-permission from the
- * create call (common when `owner` is an org the caller cannot create repos in)
- * is re-thrown by the caller as a `DestinationApiError`. This wrapper surfaces
- * the underlying error unchanged so the caller can recognise the status and
- * compose a message naming the owner + the missing permission; it NEVER falls
- * back to any other repo.
+ * Failure handling: a 403 / insufficient-permission from the create call
+ * (common when `owner` is an org the caller cannot create repos in) is re-thrown
+ * by the caller as a `DestinationApiError`. This wrapper surfaces the underlying
+ * error unchanged so the caller can recognise the status and compose a message
+ * naming the owner + the missing permission; it NEVER falls back to any other
+ * repo.
  *
- * Takes an Octokit instance, never a raw token (INV-TOKEN): the token reaches
- * GitHub only through the injected Octokit, and is never placed in a URL, a git
- * argument, or a log line on this path.
+ * Takes an Octokit instance, never a raw token: the token reaches GitHub only
+ * through the injected Octokit, and is never placed in a URL, a git argument, or
+ * a log line on this path.
  */
 export async function createPrivateRepo(
   octokit: Octokit,
@@ -316,8 +312,8 @@ export interface RepoVerification {
  * `permissions.push` in one call. A 404 maps to `{ exists: false, canPush: false }`;
  * any other error is rethrown for the caller to map to exit 2.
  *
- * Takes an Octokit instance, never a raw token (INV-TOKEN): the token reaches
- * GitHub only through the injected Octokit.
+ * Takes an Octokit instance, never a raw token: the token reaches GitHub only
+ * through the injected Octokit.
  */
 export async function verifyRepo(
   octokit: Octokit,
