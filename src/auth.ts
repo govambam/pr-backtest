@@ -154,12 +154,16 @@ async function defaultGetInteractiveToken(): Promise<string | null> {
   }
 
   info("");
-  info("pr-backtest needs a GitHub token with these permissions for one specific repo:");
+  info("pr-backtest needs a GitHub token with these permissions on the repo it writes to:");
   info("  • Contents:      Read & write   (push backtest branches)");
   info("  • Pull requests: Read & write   (read PR data, open the simulated PR)");
   info("  • Metadata:      Read           (required for all tokens)");
   info("");
-  info("Recommended: create a fine-grained token scoped to just this one repo:");
+  info("If you land the backtest in a sandbox (a different repo), the token must span");
+  info("two repos: READ on the source repo (to read the PR + fetch its commits) AND");
+  info("WRITE (Contents + Pull requests) on the sandbox destination.");
+  info("");
+  info("Recommended: create a fine-grained token scoped to just the repo(s) you need:");
   info("  https://github.com/settings/personal-access-tokens/new");
   info("");
   info(

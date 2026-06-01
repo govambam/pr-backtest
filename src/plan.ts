@@ -2,9 +2,10 @@
  * Build + render the plan and run the confirmation prompt.
  *
  * The rendered plan goes to stderr (via `log.info`) so that stdout stays
- * reserved for the final PR URL. The plan mirrors the SPEC §3 sample layout:
- * a PR/Target/Base header, a numbered `Plan:` step list, then a `[y/N]`
- * confirmation prompt that defaults to "No".
+ * reserved for the final PR URL. The plan shows a PR/Target/Base header, a
+ * numbered `Plan:` step list, then a `[y/N]` confirmation prompt that defaults
+ * to "No". When the destination differs from the source (a sandbox), the source
+ * is tagged `(read-only)` and the destination is named as the write target.
  */
 import prompts from "prompts";
 
@@ -34,8 +35,9 @@ export interface PlanInput {
   /** The base branch name, e.g. "backtest-pr123-base". */
   baseBranch: string;
   /**
-   * Where the backtest branches and PR are created. Defaults to `ownerRepo`;
-   * differs only in `--fork` mode, where it is the fork's `owner/repo`.
+   * Where the backtest branches and PR are created (the destination). Defaults
+   * to `ownerRepo` (the primary repo). When it differs from `ownerRepo`, the
+   * destination is a sandbox: the source is read-only and the writes land here.
    */
   targetRepo?: string;
 }
@@ -49,18 +51,26 @@ export function renderPlan(input: PlanInput): string {
   const base = shortSha(input.baseSha);
   const cloneDest = input.tmpDirNote ?? "a temp directory";
   const dest = input.targetRepo ?? input.ownerRepo;
-  const isFork = dest !== input.ownerRepo;
-  // In fork mode the commits live in the PR's repo, fetched via the `source`
+  // When the destination differs from the source, the source is only ever read
+  // (a sandbox destination); the writes land in `dest`. When they match, the one
+  // repo is both read from and written to, so it is NOT tagged read-only.
+  const destDiffers = dest !== input.ownerRepo;
+  // In sandbox mode the commits live in the PR's repo, fetched via the `source`
   // remote; otherwise they come straight from the clone's origin.
-  const fetchFrom = isFork ? `source (${input.ownerRepo})` : "origin";
+  const fetchFrom = destDiffers ? `source (${input.ownerRepo})` : "origin";
 
+  // The PR identity line carries a `(read-only)` tag ONLY when the destination
+  // differs from the source — that is the visible safety guarantee.
+  const prLine =
+    `PR:      ${input.ownerRepo}#${input.prNumber} "${input.prTitle}" by @${input.prAuthor}` +
+    (destDiffers ? "   (read-only — source is never written)" : "");
   const header = [
-    `PR:      ${input.ownerRepo}#${input.prNumber} "${input.prTitle}" by @${input.prAuthor}`,
+    prLine,
     `Target:  ${target} (${input.targetLabel})`,
     `Base:    ${base} (parent of target)`,
   ];
-  if (isFork) {
-    header.push(`Into:    ${dest} (fork — your ${input.ownerRepo} is never touched)`);
+  if (destDiffers) {
+    header.push(`Into:    ${dest} (sandbox — branches and PR are created here)`);
   }
 
   const lines = [
