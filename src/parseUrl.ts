@@ -41,7 +41,10 @@ export function parseRepoSlug(slug: string): RepoSlug {
     .replace(/\.git$/i, "")
     .replace(/\/$/, "");
   const match = cleaned.match(REPO_SLUG_RE);
-  if (!match || !match[1] || !match[2]) {
+  // Reject dot-only segments (".", "..") — they pass the char class but are not
+  // valid repo names, and would otherwise fail later with a muddier git error.
+  const isDots = (s: string): boolean => /^\.+$/.test(s);
+  if (!match || !match[1] || !match[2] || isDots(match[1]) || isDots(match[2])) {
     throw new Error(
       `Invalid --fork value: "${slug}". Expected an owner/repo slug, e.g. myuser/myfork.`,
     );

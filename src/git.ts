@@ -39,18 +39,28 @@ export class UnfetchableCommitError extends Error {
   readonly sha: string;
   readonly prNumber: number;
 
-  constructor(sha: string, prNumber: number) {
-    super(buildUnfetchableMessage(sha, prNumber));
+  constructor(sha: string, prNumber: number, remote = "origin") {
+    super(buildUnfetchableMessage(sha, prNumber, remote));
     this.name = "UnfetchableCommitError";
     this.sha = sha;
     this.prNumber = prNumber;
   }
 }
 
-/** Build the SPEC §6.5 unfetchable-commit message for a given SHA + PR number. */
-export function buildUnfetchableMessage(sha: string, prNumber: number): string {
+/**
+ * Build the SPEC §6.5 unfetchable-commit message for a given SHA + PR number.
+ *
+ * `remote` names where the fetch was attempted: `origin` (same-repo runs) or
+ * `source` (`--fork` mode, where commits come from the PR's original repo).
+ */
+export function buildUnfetchableMessage(
+  sha: string,
+  prNumber: number,
+  remote = "origin",
+): string {
+  const from = remote === "source" ? "the source repository" : "origin";
   return [
-    `Could not fetch commit ${sha} from origin.`,
+    `Could not fetch commit ${sha} from ${from}.`,
     "",
     "This usually means one of:",
     "  • The commit was deleted from GitHub (very old force-push, repo transfer/delete)",
@@ -186,7 +196,7 @@ export async function fetchCommit(
     await git.fetch(remote, sha);
   } catch {
     // Deliberately do not surface raw git stderr — it leaks little and confuses.
-    throw new UnfetchableCommitError(sha, prNumber);
+    throw new UnfetchableCommitError(sha, prNumber, remote);
   }
 }
 
