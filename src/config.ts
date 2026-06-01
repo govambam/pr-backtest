@@ -13,11 +13,24 @@ import { warn } from "./log.js";
 /** The source a token was obtained from. */
 export type TokenSource = "fine-grained" | "classic" | "gh-cli";
 
-/** Persisted config shape. */
+/** A saved write destination (the repo branches/PRs are pushed to). */
+export interface SavedDestination {
+  owner: string;
+  repo: string;
+}
+
+/**
+ * Persisted config shape.
+ *
+ * `token`/`username`/`source` are optional: a config may hold only a
+ * `defaultDestination` when the token came from the environment or `gh` and was
+ * never persisted. Token resolution treats an absent token as "no saved token".
+ */
 export interface Config {
-  token: string;
-  username: string;
-  source: TokenSource;
+  token?: string;
+  username?: string;
+  source?: TokenSource;
+  defaultDestination?: SavedDestination;
 }
 
 /**
@@ -42,6 +55,25 @@ export function configPath(): string {
 
 function isTokenSource(value: unknown): value is TokenSource {
   return value === "fine-grained" || value === "classic" || value === "gh-cli";
+}
+
+/** A complete token triple: `token` + `username` + a valid `source`. */
+function hasValidTokenFields(obj: Record<string, unknown>): boolean {
+  return (
+    typeof obj.token === "string" &&
+    typeof obj.username === "string" &&
+    isTokenSource(obj.source)
+  );
+}
+
+/** A `defaultDestination` shaped as `{ owner: string, repo: string }`. */
+function isSavedDestination(value: unknown): value is SavedDestination {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Record<string, unknown>).owner === "string" &&
+    typeof (value as Record<string, unknown>).repo === "string"
+  );
 }
 
 /**
@@ -80,23 +112,40 @@ export function readConfig(): Config | null {
     return null;
   }
 
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    typeof (parsed as Record<string, unknown>).token !== "string" ||
-    typeof (parsed as Record<string, unknown>).username !== "string" ||
-    !isTokenSource((parsed as Record<string, unknown>).source)
-  ) {
+  if (typeof parsed !== "object" || parsed === null) {
     warn(`Config file ${filePath} is malformed; ignoring it.`);
     return null;
   }
 
   const obj = parsed as Record<string, unknown>;
-  return {
-    token: obj.token as string,
-    username: obj.username as string,
-    source: obj.source as TokenSource,
-  };
+  const hasTokenFields = hasValidTokenFields(obj);
+  const hasDestination =
+    obj.defaultDestination !== undefined &&
+    isSavedDestination(obj.defaultDestination);
+  const destinationMalformed =
+    obj.defaultDestination !== undefined && !hasDestination;
+
+  // Accept a valid token-config OR a valid destination-config (or both).
+  // A file that is neither — or that carries a malformed defaultDestination —
+  // is rejected (warn, return null).
+  if (destinationMalformed || (!hasTokenFields && !hasDestination)) {
+    warn(`Config file ${filePath} is malformed; ignoring it.`);
+    return null;
+  }
+
+  const cfg: Config = {};
+  if (hasTokenFields) {
+    cfg.token = obj.token as string;
+    cfg.username = obj.username as string;
+    cfg.source = obj.source as TokenSource;
+  }
+  if (hasDestination) {
+    cfg.defaultDestination = {
+      owner: (obj.defaultDestination as SavedDestination).owner,
+      repo: (obj.defaultDestination as SavedDestination).repo,
+    };
+  }
+  return cfg;
 }
 
 /**
@@ -112,6 +161,20 @@ export function writeConfig(cfg: Config): void {
   // writeFileSync only applies `mode` when creating the file; enforce it
   // explicitly so an existing, looser file gets tightened on rewrite.
   fs.chmodSync(filePath, 0o600);
+}
+
+/**
+ * Merge a partial update into the existing config (read-modify-write).
+ *
+ * Unlike {@link writeConfig}, which replaces the whole object, this preserves
+ * fields not present in `update`: saving a `defaultDestination` keeps a saved
+ * token, and saving a token keeps a saved destination. Re-asserts mode 0600
+ * on every write, exactly as {@link writeConfig} does.
+ */
+export function mergeConfig(update: Partial<Config>): void {
+  const existing = readConfig() ?? {};
+  const merged: Config = { ...existing, ...update };
+  writeConfig(merged);
 }
 
 /**

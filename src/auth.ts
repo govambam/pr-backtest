@@ -81,8 +81,11 @@ export async function resolveTokenSource(
 
   // 2. Config file.
   const cfg = resolvers.getConfig();
-  if (cfg && cfg.token.length > 0) {
-    return { token: cfg.token, source: cfg.source, fromPaste: false };
+  if (cfg && cfg.token && cfg.token.length > 0) {
+    // readConfig only sets `token` alongside a valid `source`, but `source` is
+    // now optionally typed; fall back to the paste heuristic to stay typed.
+    const source = cfg.source ?? inferPasteSource(cfg.token);
+    return { token: cfg.token, source, fromPaste: false };
   }
 
   // 3. gh CLI (offered for reuse, prompted before use).

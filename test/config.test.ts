@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   configPath,
   deleteConfig,
+  mergeConfig,
   readConfig,
   writeConfig,
   type Config,
@@ -134,4 +135,105 @@ test("deleteConfig removes the file and tolerates a second call (ENOENT)", () =>
   deleteConfig();
   assert.equal(fs.existsSync(configPath()), false);
   assert.doesNotThrow(() => deleteConfig());
+});
+
+// VAL-CONFIG-001: saving a default destination preserves a saved token.
+test("mergeConfig saving a destination preserves a saved token (merge, not overwrite)", () => {
+  useTempConfigHome();
+  writeConfig(VALID);
+  mergeConfig({ defaultDestination: { owner: "octocat", repo: "sandbox" } });
+  const result = readConfig();
+  assert.deepEqual(result, {
+    token: "t0kenvalue",
+    username: "stevem",
+    source: "classic",
+    defaultDestination: { owner: "octocat", repo: "sandbox" },
+  });
+});
+
+// VAL-CONFIG-002: saving a token preserves a saved default destination.
+test("mergeConfig saving a token preserves a saved default destination", () => {
+  useTempConfigHome();
+  // Start with a destination-only config (no token).
+  writeConfig({ defaultDestination: { owner: "octocat", repo: "sandbox" } });
+  mergeConfig({ token: "t0kenvalue", username: "stevem", source: "classic" });
+  const result = readConfig();
+  assert.deepEqual(result, {
+    token: "t0kenvalue",
+    username: "stevem",
+    source: "classic",
+    defaultDestination: { owner: "octocat", repo: "sandbox" },
+  });
+});
+
+// VAL-CONFIG-003 (a): a legacy file (token triple, no defaultDestination) reads
+// back with the three fields present and defaultDestination undefined.
+test("readConfig tolerates a legacy file with no defaultDestination", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(
+    p,
+    JSON.stringify({ token: "t0kenvalue", username: "stevem", source: "classic" }),
+    { mode: 0o600 },
+  );
+  const result = readConfig();
+  assert.notEqual(result, null);
+  assert.equal(result?.token, "t0kenvalue");
+  assert.equal(result?.username, "stevem");
+  assert.equal(result?.source, "classic");
+  assert.equal(result?.defaultDestination, undefined);
+});
+
+// VAL-CONFIG-003 (b): a destination-only file (no token) reads back exposing
+// the destination with no token.
+test("readConfig tolerates a destination-only file (no token)", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(
+    p,
+    JSON.stringify({ defaultDestination: { owner: "octocat", repo: "sandbox" } }),
+    { mode: 0o600 },
+  );
+  const result = readConfig();
+  assert.notEqual(result, null);
+  assert.equal(result?.token, undefined);
+  assert.deepEqual(result?.defaultDestination, { owner: "octocat", repo: "sandbox" });
+});
+
+// VAL-CONFIG-003: a file that is neither a token-config nor a destination-config
+// is still rejected (warn + null).
+test("readConfig rejects a file that is neither a token nor a destination config", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({ unrelated: "value" }), { mode: 0o600 });
+  const err = captureStderr(() => {
+    assert.equal(readConfig(), null);
+  });
+  assert.match(err, /malformed/);
+});
+
+// VAL-CONFIG-003: a malformed defaultDestination (missing repo) is rejected.
+test("readConfig rejects a malformed defaultDestination", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(
+    p,
+    JSON.stringify({ defaultDestination: { owner: "octocat" } }),
+    { mode: 0o600 },
+  );
+  const err = captureStderr(() => {
+    assert.equal(readConfig(), null);
+  });
+  assert.match(err, /malformed/);
+});
+
+// VAL-CONFIG-004: the config file stays mode 0600 after a destination-only save.
+test("mergeConfig keeps mode 0600 after a destination-only save", { skip: process.platform === "win32" }, () => {
+  useTempConfigHome();
+  mergeConfig({ defaultDestination: { owner: "octocat", repo: "sandbox" } });
+  assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
 });
