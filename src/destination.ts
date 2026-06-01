@@ -17,11 +17,12 @@
  * (INV-TOKEN). No message in this module ever echoes a token.
  */
 import type { Octokit } from "@octokit/rest";
+import prompts from "prompts";
 import type { RepoVerification } from "./github.js";
 import { createPrivateRepo, isHttpStatus } from "./github.js";
-import type { SavedDestination } from "./config.js";
+import { mergeConfig, type SavedDestination } from "./config.js";
 import { parseRepoSlug } from "./parseUrl.js";
-import { warn } from "./log.js";
+import { info, warn } from "./log.js";
 
 /** An `owner/repo` pair. */
 export interface RepoRef {
@@ -249,6 +250,214 @@ export const unimplementedPrompt: DestinationPrompt = async () => {
     "Interactive destination selection is not available in this build.",
   );
 };
+
+/** The default name a fresh sandbox is created under (matches the resolver). */
+const DEFAULT_SANDBOX_NAME = "pr-backtest-sandbox";
+
+/** A human-readable label for a single menu choice (sample wording, §4.1). */
+function choiceTitle(choice: DestinationChoice): string {
+  switch (choice.kind) {
+    case "primary":
+      return choice.repo
+        ? `Primary repo — ${choice.repo.owner}/${choice.repo.repo}`
+        : "Primary repo";
+    case "saved-sandbox":
+      return choice.repo
+        ? `Sandbox — ${choice.repo.owner}/${choice.repo.repo}   (saved default)`
+        : "Sandbox (saved default)";
+    case "create-sandbox":
+      return "Create a sandbox repo";
+    case "different-repo":
+      return "A different repo…";
+  }
+}
+
+/** Options for {@link makeInteractivePrompt} (primarily for testing/injection). */
+export interface InteractivePromptOptions {
+  /** Whether stdin is a TTY (guards against prompting with no terminal). */
+  isTTY?: () => boolean;
+  /** Persist a chosen default destination. Defaults to {@link mergeConfig}. */
+  saveDefault?: (dest: SavedDestination) => void;
+}
+
+/**
+ * Build the REAL interactive destination prompt — the implementation feature 5
+ * injects as `resolvers.prompt`.
+ *
+ * Renders the choice set the resolver passes (VAL-INT-001/002) as a `prompts`
+ * select, then runs the per-choice sub-flows:
+ *
+ * - `primary` / `saved-sandbox` → return the choice's repo unchanged.
+ * - `different-repo` (VAL-INT-003) → prompt for an `owner/repo` slug, parse it
+ *   with {@link parseRepoSlug}, re-prompting on a parse error; return it in
+ *   `repo`. Verification stays in the resolver.
+ * - `create-sandbox` → let the user edit the owner (default = source owner) and
+ *   name (default `pr-backtest-sandbox`). NOTE (seam limitation): the resolver's
+ *   `create-sandbox` branch creates `{ owner: source.owner, name: DEFAULT }` and
+ *   ignores the selection's `repo`, so an EDITED owner/name cannot reach the
+ *   creator without a resolver-logic change (out of scope for this feature). The
+ *   edited values are still collected and returned in `repo` so a future resolver
+ *   tweak can consume them; today they are advisory only.
+ *
+ * Remember-as-default (VAL-INT-003 / §4.1 step 5): because the resolver never
+ * reads `selection.remember`, persistence lives HERE. After the user selects a
+ * concrete non-primary destination (`different-repo`) that is not already the
+ * saved default, we ask once and, on yes, persist via the injected
+ * `saveDefault` (defaulting to {@link mergeConfig}). `saved-sandbox` is already
+ * the default, so it is never re-offered; `create-sandbox`'s final name is only
+ * known after creation in the resolver, so its remember-prompt is out of this
+ * seam's reach (documented limitation).
+ *
+ * Mirrors `auth.ts`'s `prompts` usage and its non-TTY guards: with no TTY there
+ * is nothing to prompt, so it throws a {@link DestinationArgsError} rather than
+ * hanging. No token is ever on this path; nothing here is logged that could leak.
+ */
+export function makeInteractivePrompt(
+  options: InteractivePromptOptions = {},
+): DestinationPrompt {
+  const isTTY = options.isTTY ?? (() => process.stdin.isTTY === true);
+  const saveDefault =
+    options.saveDefault ?? ((dest: SavedDestination) => mergeConfig({ defaultDestination: dest }));
+
+  return async (choices: DestinationChoice[]): Promise<DestinationSelection> => {
+    if (!isTTY()) {
+      // Defensive: the resolver only enters the interactive path on a TTY, but
+      // never hang waiting on stdin if that guarantee is broken.
+      throw new DestinationArgsError(
+        "Cannot prompt for a destination: stdin is not a TTY. " +
+          "Pass --primary or --sandbox <owner/repo>.",
+      );
+    }
+
+    const { kind } = await prompts({
+      type: "select",
+      name: "kind",
+      message: "Where should the simulated PR be created?",
+      choices: choices.map((choice) => ({
+        title: choiceTitle(choice),
+        value: choice.kind,
+      })),
+      initial: 0,
+    });
+
+    // Ctrl-C / abort → no selection. Treat as a bad-args style abort.
+    // The select returns one of the choice `value`s (a DestinationChoiceKind);
+    // resolve it back to the originating choice so `kind` is typed, not loose.
+    const chosen =
+      typeof kind === "string"
+        ? choices.find((c) => c.kind === kind)
+        : undefined;
+    if (!chosen) {
+      throw new DestinationArgsError("No destination selected.");
+    }
+
+    if (chosen.kind === "primary" || chosen.kind === "saved-sandbox") {
+      return { kind: chosen.kind, repo: chosen.repo };
+    }
+
+    if (chosen.kind === "different-repo") {
+      const repo = await promptForSlug();
+      // Offer to remember it unless it is already the saved default.
+      const remember = await maybeRememberAndPersist(repo, choices, saveDefault);
+      return { kind: chosen.kind, repo, remember };
+    }
+
+    // create-sandbox: collect an editable owner/name (advisory — see the doc
+    // comment; the resolver currently ignores these and uses its own defaults).
+    const sourceOwner = primaryOwner(choices);
+    const edited = await promptForCreateTarget(sourceOwner);
+    return { kind: chosen.kind, repo: edited };
+  };
+}
+
+/** The owner of the `primary` choice, used as the create-owner default. */
+function primaryOwner(choices: DestinationChoice[]): string | undefined {
+  return choices.find((c) => c.kind === "primary")?.repo?.owner;
+}
+
+/**
+ * Prompt for an `owner/repo` slug, re-prompting on a parse error (mirroring how
+ * the resolver/auth prefer a clear retry over a muddy downstream failure).
+ * Throws {@link DestinationArgsError} only when the user aborts the entry.
+ */
+async function promptForSlug(): Promise<RepoRef> {
+  for (;;) {
+    const { slug } = await prompts({
+      type: "text",
+      name: "slug",
+      message: "Repository (owner/repo):",
+    });
+    if (typeof slug !== "string") {
+      throw new DestinationArgsError("No repository entered.");
+    }
+    try {
+      const parsed = parseRepoSlug(slug);
+      return { owner: parsed.owner, repo: parsed.repo };
+    } catch (err: unknown) {
+      warn(err instanceof Error ? err.message : "Invalid owner/repo.");
+      // Loop to re-prompt.
+    }
+  }
+}
+
+/**
+ * Prompt for the create target's owner (default = source owner) and name
+ * (default `pr-backtest-sandbox`). Returns the edited {@link RepoRef}.
+ */
+async function promptForCreateTarget(
+  defaultOwner: string | undefined,
+): Promise<RepoRef> {
+  const { owner } = await prompts({
+    type: "text",
+    name: "owner",
+    message: "Owner for the new sandbox:",
+    initial: defaultOwner ?? "",
+  });
+  const { name } = await prompts({
+    type: "text",
+    name: "name",
+    message: "Name for the new sandbox:",
+    initial: DEFAULT_SANDBOX_NAME,
+  });
+  const resolvedOwner =
+    typeof owner === "string" && owner.trim().length > 0
+      ? owner.trim()
+      : defaultOwner ?? "";
+  const resolvedName =
+    typeof name === "string" && name.trim().length > 0
+      ? name.trim()
+      : DEFAULT_SANDBOX_NAME;
+  return { owner: resolvedOwner, repo: resolvedName };
+}
+
+/**
+ * After a non-primary destination is chosen, ask once whether to remember it as
+ * the default sandbox — but only when it differs from the already-saved default.
+ * On yes, persist via `saveDefault`. Returns whether it was remembered.
+ */
+async function maybeRememberAndPersist(
+  dest: RepoRef,
+  choices: DestinationChoice[],
+  saveDefault: (dest: SavedDestination) => void,
+): Promise<boolean> {
+  const saved = choices.find((c) => c.kind === "saved-sandbox")?.repo;
+  if (saved && saved.owner === dest.owner && saved.repo === dest.repo) {
+    // Already the saved default; do not re-offer (§4.1 step 5).
+    return false;
+  }
+  const { remember } = await prompts({
+    type: "confirm",
+    name: "remember",
+    message: `Remember ${dest.owner}/${dest.repo} as your default sandbox?`,
+    initial: true,
+  });
+  if (remember === true) {
+    saveDefault({ owner: dest.owner, repo: dest.repo });
+    info(`Saved ${dest.owner}/${dest.repo} as your default sandbox.`);
+    return true;
+  }
+  return false;
+}
 
 /** True when two repo refs name the same `owner/repo`. */
 function sameRepo(a: RepoRef, b: RepoRef): boolean {

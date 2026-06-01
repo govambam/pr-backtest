@@ -1,9 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import prompts from "prompts";
 
 import {
   resolveDestination,
   makeSandboxCreator,
+  makeInteractivePrompt,
   DestinationArgsError,
   DestinationApiError,
   writePermissionMessage,
@@ -15,6 +20,7 @@ import {
   type DestinationSelection,
   type RepoRef,
 } from "../src/destination.js";
+import { readConfig } from "../src/config.js";
 import type { Octokit } from "@octokit/rest";
 import type { RepoVerification } from "../src/github.js";
 import type { SavedDestination } from "../src/config.js";
@@ -622,6 +628,146 @@ test("default seams throw clearly (create + prompt)", async () => {
   );
   await assert.rejects(
     () => unimplementedPrompt([]),
+    (err: unknown) => err instanceof DestinationArgsError,
+  );
+});
+
+// =====================================================================
+// Interactive prompt (feature: interactive-menu) — the REAL prompts impl.
+// `prompts.inject([...])` feeds scripted answers, so these run with no TTY.
+// =====================================================================
+
+/** Point config at a fresh temp dir via XDG_CONFIG_HOME and return it. */
+function useTempConfigHome(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prbt-dest-"));
+  process.env.XDG_CONFIG_HOME = dir;
+  return dir;
+}
+
+/** Choice set the resolver builds when a default IS saved. */
+const SAVED_CHOICES: DestinationChoice[] = [
+  { kind: "primary", repo: { owner: "acme", repo: "api" } },
+  { kind: "saved-sandbox", repo: { owner: "me", repo: "sandbox" } },
+  { kind: "different-repo" },
+];
+
+/** Choice set the resolver builds when NO default is saved. */
+const NO_SAVED_CHOICES: DestinationChoice[] = [
+  { kind: "primary", repo: { owner: "acme", repo: "api" } },
+  { kind: "create-sandbox" },
+  { kind: "different-repo" },
+];
+
+/** A prompt that never touches real config or a real TTY. */
+function makeTestPrompt(saved?: { saved: SavedDestination[] }) {
+  return makeInteractivePrompt({
+    isTTY: () => true,
+    saveDefault: (dest) => saved?.saved.push(dest),
+  });
+}
+
+// --- VAL-INT-001 ---
+test("VAL-INT-001: saved-default menu — picking saved-sandbox returns that kind + repo", async () => {
+  prompts.inject(["saved-sandbox"]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(SAVED_CHOICES);
+  assert.equal(sel.kind, "saved-sandbox");
+  assert.deepEqual(sel.repo, { owner: "me", repo: "sandbox" });
+  // saved-sandbox is already the default: no remember prompt fired (no extra inject consumed).
+});
+
+// --- VAL-INT-002 ---
+test("VAL-INT-002: no-default menu — picking create returns create-sandbox kind", async () => {
+  // select create-sandbox; then owner + name sub-prompts (accept defaults via "").
+  prompts.inject(["create-sandbox", "", ""]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.kind, "create-sandbox");
+  // Owner defaults to the source/primary owner; name to the default sandbox name.
+  assert.deepEqual(sel.repo, { owner: "acme", repo: "pr-backtest-sandbox" });
+});
+
+// --- VAL-INT-002 (primary row still selectable) ---
+test("interactive: picking primary returns primary kind + the source repo", async () => {
+  prompts.inject(["primary"]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.deepEqual(sel, { kind: "primary", repo: { owner: "acme", repo: "api" } });
+});
+
+// --- VAL-INT-003: different-repo collects + parses a slug ---
+test("VAL-INT-003: different-repo prompts for a slug, parses it, returns it in repo", async () => {
+  // select different-repo; enter slug; decline remember.
+  prompts.inject(["different-repo", "you/other", false]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.kind, "different-repo");
+  assert.deepEqual(sel.repo, { owner: "you", repo: "other" });
+  assert.equal(sel.remember, false);
+});
+
+// --- VAL-INT-003: bad slug re-prompts ---
+test("VAL-INT-003: different-repo re-prompts on an unparseable slug", async () => {
+  // first slug is invalid (no slash), second is valid; decline remember.
+  prompts.inject(["different-repo", "not-a-slug", "you/other", false]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.kind, "different-repo");
+  assert.deepEqual(sel.repo, { owner: "you", repo: "other" });
+});
+
+// --- VAL-INT-003: remember=yes persists via the merge writer ---
+test("VAL-INT-003: remember-yes triggers persistence via mergeConfig", async () => {
+  useTempConfigHome();
+  // Use the REAL saveDefault (mergeConfig) by not injecting one.
+  prompts.inject(["different-repo", "you/other", true]);
+  const prompt = makeInteractivePrompt({ isTTY: () => true });
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.remember, true);
+  // mergeConfig wrote the default destination; read it back.
+  const cfg = readConfig();
+  assert.deepEqual(cfg?.defaultDestination, { owner: "you", repo: "other" });
+});
+
+// --- VAL-INT-003: choosing the already-saved default does NOT re-offer remember ---
+test("VAL-INT-003: different-repo equal to the saved default skips the remember prompt", async () => {
+  const saved = { saved: [] as SavedDestination[] };
+  // Only the select + slug are injected; if a remember prompt fired it would
+  // consume a non-existent injection and abort.
+  prompts.inject(["different-repo", "me/sandbox"]);
+  const prompt = makeTestPrompt(saved);
+  const sel = await prompt(SAVED_CHOICES);
+  assert.equal(sel.kind, "different-repo");
+  assert.deepEqual(sel.repo, { owner: "me", repo: "sandbox" });
+  assert.equal(sel.remember, false);
+  assert.equal(saved.saved.length, 0, "no persistence for an already-default repo");
+});
+
+// --- create-sandbox owner/name editing (seam limitation noted in handoff) ---
+test("interactive: create-sandbox lets the user edit owner and name", async () => {
+  prompts.inject(["create-sandbox", "myorg", "custom-name"]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.kind, "create-sandbox");
+  assert.deepEqual(sel.repo, { owner: "myorg", repo: "custom-name" });
+});
+
+// --- non-TTY guard ---
+test("interactive: throws a clear bad-args error when stdin is not a TTY", async () => {
+  const prompt = makeInteractivePrompt({ isTTY: () => false });
+  await assert.rejects(
+    () => prompt(NO_SAVED_CHOICES),
+    (err: unknown) => err instanceof DestinationArgsError,
+  );
+});
+
+// --- abort (Ctrl-C at the select) ---
+test("interactive: aborting the menu throws a bad-args error", async () => {
+  // Injecting `undefined` simulates an aborted prompt.
+  prompts.inject([undefined]);
+  const prompt = makeInteractivePrompt({ isTTY: () => true });
+  await assert.rejects(
+    () => prompt(NO_SAVED_CHOICES),
     (err: unknown) => err instanceof DestinationArgsError,
   );
 });
