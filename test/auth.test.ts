@@ -198,7 +198,9 @@ test("resolveWriteToken: env GITHUB_TOKEN wins over saved destinationToken when 
   );
   assert.equal(result.token, "write-env");
   assert.equal(result.fromPaste, false);
-  assert.equal(result.login, "u-write-env");
+  // An env/saved token already validated via the accept probe; no extra
+  // users.getAuthenticated round-trip runs, so no @login is captured.
+  assert.equal(result.login, "");
   assert.deepEqual(seen, ["write-env"], "saved slot is not tried once env is accepted");
 });
 
@@ -229,8 +231,99 @@ test("resolveWriteToken: accept on the CREATE path accepts a token canWrite woul
     }),
   );
   assert.equal(result.token, "creator-token");
-  assert.equal(result.login, "creator");
+  // Env token: validated via the accept (create) path, not getAuthenticated.
+  assert.equal(result.login, "");
   assert.equal(createAttempted, true);
+});
+
+test("resolveWriteToken: an env/saved write token makes NO users.getAuthenticated call", async () => {
+  // VAL-CORR-003: captureLogin runs only on the fresh-paste path. A recording
+  // factory proves an accepted env (and then saved) token never probes
+  // getAuthenticated — that token already validated via the accept predicate.
+  const authCalls: string[] = [];
+  const recording = (token: string): ResolverOctokit =>
+    ({
+      repos: { get: async () => { throw httpError(404); } },
+      users: {
+        getAuthenticated: async () => {
+          authCalls.push(token);
+          return { data: { login: `u-${token}` } };
+        },
+      },
+    }) as unknown as ResolverOctokit;
+
+  const envResult = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "env-write",
+      makeOctokit: recording,
+      accept: async (_o, token) => token === "env-write",
+    }),
+  );
+  assert.equal(envResult.token, "env-write");
+  assert.equal(envResult.login, "");
+
+  const savedResult = await resolveWriteToken(
+    writeOptions({
+      getConfig: () => ({
+        destinationToken: { token: "saved-write", username: "u", source: "classic" },
+      }),
+      makeOctokit: recording,
+      accept: async (_o, token) => token === "saved-write",
+    }),
+  );
+  assert.equal(savedResult.token, "saved-write");
+  assert.equal(savedResult.login, "");
+
+  assert.deepEqual(authCalls, [], "no getAuthenticated for env/saved write tokens");
+});
+
+test("resolveReadToken: an env/saved read token makes NO users.getAuthenticated call", async () => {
+  // VAL-CORR-003 on the read path: an accepted env/saved source token validated
+  // via canRead never issues users.getAuthenticated.
+  const authCalls: string[] = [];
+  const recording = (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: (async (args: { owner: string; repo: string }) => {
+          const isSource =
+            args.owner === SOURCE.owner && args.repo === SOURCE.repo;
+          if (isSource && (token === "env-read" || token === "saved-read")) {
+            return { data: { permissions: { push: false }, private: true } };
+          }
+          throw httpError(404);
+        }) as unknown as ResolverOctokit["repos"]["get"],
+      } as unknown as ResolverOctokit["repos"],
+      users: {
+        getAuthenticated: (async () => {
+          authCalls.push(token);
+          return { data: { login: `u-${token}` } };
+        }) as unknown as ResolverOctokit["users"]["getAuthenticated"],
+      } as unknown as ResolverOctokit["users"],
+    }) as unknown as ResolverOctokit;
+
+  const envResult = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only",
+      getEnvToken: () => "env-read",
+      makeOctokit: recording,
+    }),
+  );
+  assert.equal(envResult.token, "env-read");
+  assert.equal(envResult.login, "");
+
+  const savedResult = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only",
+      getConfig: () => ({
+        sourceToken: { token: "saved-read", username: "u", source: "fine-grained" },
+      }),
+      makeOctokit: recording,
+    }),
+  );
+  assert.equal(savedResult.token, "saved-read");
+  assert.equal(savedResult.login, "");
+
+  assert.deepEqual(authCalls, [], "no getAuthenticated for env/saved read tokens");
 });
 
 test("resolveWriteToken: a caller's wrapped accept (false on rejection) falls through to the next candidate", async () => {
@@ -385,7 +478,8 @@ test("resolveReadToken: reuses the write token iff it reads the source (single-P
   );
   assert.equal(result.token, "one-pat");
   assert.equal(result.fromPaste, false);
-  assert.equal(result.login, "owner");
+  // Reused write token is non-paste: no getAuthenticated, so no @login captured.
+  assert.equal(result.login, "");
 });
 
 test("resolveReadToken: a fresh accepted paste persists to sourceToken with @login", async () => {

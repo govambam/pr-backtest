@@ -28,8 +28,6 @@ export interface PlanInput {
   targetLabel: string;
   /** Full base SHA (rendered short). */
   baseSha: string;
-  /** Optional note about the temp directory used for the clone. */
-  tmpDirNote?: string;
   /** The head branch name, e.g. "backtest-pr123-head". */
   headBranch: string;
   /** The base branch name, e.g. "backtest-pr123-base". */
@@ -59,7 +57,7 @@ export interface PlanInput {
 export function renderPlan(input: PlanInput): string {
   const target = shortSha(input.targetSha);
   const base = shortSha(input.baseSha);
-  const cloneDest = input.tmpDirNote ?? "a temp directory";
+  const cloneDest = "a temp directory";
   const dest = input.targetRepo ?? input.ownerRepo;
   // When the destination differs from the source, the source is only ever read
   // (a sandbox destination); the writes land in `dest`. When they match, the one

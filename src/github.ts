@@ -197,11 +197,6 @@ export async function findExistingPr(
   return data.length > 0 ? data[0]!.html_url : null;
 }
 
-/** True when `err` is an Octokit-style HTTP error with the given status. */
-export function isHttpStatus(err: unknown, status: number): boolean {
-  return isStatus(err, status);
-}
-
 /**
  * Open the backtest PR from `headBranch` to `baseBranch` via `pulls.create`.
  * Returns the new PR's `html_url`.
@@ -322,7 +317,7 @@ export async function verifyRepo(
 }
 
 /** Narrow an unknown thrown value to an Octokit-style HTTP error of a status. */
-function isStatus(err: unknown, status: number): boolean {
+export function isStatus(err: unknown, status: number): boolean {
   return (
     typeof err === "object" &&
     err !== null &&

@@ -45,12 +45,12 @@ import {
   findExistingPr,
   getCommitParentSha,
   getPullRequest,
-  isHttpStatus,
+  isStatus,
   listPullRequestCommits,
   makeOctokit,
   verifyRepo,
 } from "./github.js";
-import { readConfig } from "./config.js";
+import { readConfig, type RepoRef } from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
@@ -62,7 +62,6 @@ import {
   resolveDestinationChoice,
   verifyOrCreateDestination,
   type ChoiceResolvers,
-  type RepoRef,
 } from "./destination.js";
 import { error, info, setVerbose, success, traceOp } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
@@ -530,7 +529,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     // A 422 here means a backtest PR for these branches already exists (a race
     // the open-only pre-flight didn't catch). Re-query the SAME branches: a
     // matching OPEN PR surfaces its URL + exit 4; otherwise exit 2 (no-diff).
-    if (isHttpStatus(err, 422)) {
+    if (isStatus(err, 422)) {
       const racedUrl = await deps
         .findExistingPr(writeOctokit, destOwner, destRepo, headBranch, baseBranch, "open")
         .catch(() => null);

@@ -28,15 +28,20 @@ import {
   mergeConfig,
   readConfig,
   type Config,
+  type RepoRef,
   type TokenSlot,
   type TokenSource,
 } from "./config.js";
-import { isHttpStatus, makeOctokit } from "./github.js";
+import { isStatus, makeOctokit } from "./github.js";
 import { info, registerSecret, success } from "./log.js";
 
 /** The pre-fillable fine-grained-PAT creation URL, shown in every guided paste. */
 export const PAT_CREATE_URL =
   "https://github.com/settings/personal-access-tokens/new";
+
+// Re-export the shared repo coordinate so callers of the resolver options can
+// reference it from here without reaching into config.ts.
+export type { RepoRef };
 
 /**
  * How many times a guided interactive paste is re-prompted when the pasted token
@@ -91,15 +96,6 @@ function inferPasteSource(token: string): TokenSource {
 }
 
 /**
- * A repo coordinate (`owner`/`repo`). Carries no token value — only the location
- * a capability acts on.
- */
-export interface RepoRef {
-  owner: string;
-  repo: string;
-}
-
-/**
  * The minimal Octokit surface the capability checks + paste validation need:
  * read a repo (read/write checks) and the authenticated user (paste @login
  * capture). This is the seam `makeOctokit` satisfies; tests inject a fake of this
@@ -124,7 +120,7 @@ export async function canRead(
     await octokit.repos.get({ owner: source.owner, repo: source.repo });
     return true;
   } catch (err: unknown) {
-    if (isHttpStatus(err, 403) || isHttpStatus(err, 404)) {
+    if (isStatus(err, 403) || isStatus(err, 404)) {
       return false;
     }
     throw err;
@@ -149,7 +145,7 @@ export async function canWrite(
     const { data } = await octokit.repos.get({ owner: dest.owner, repo: dest.repo });
     return data.permissions?.push === true;
   } catch (err: unknown) {
-    if (isHttpStatus(err, 403) || isHttpStatus(err, 404)) {
+    if (isStatus(err, 403) || isStatus(err, 404)) {
       return false;
     }
     throw err;
@@ -180,69 +176,95 @@ async function maskedPaste(message: string): Promise<string | null> {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-/** Primary prompt: a single token with READ + WRITE on the source (spec §4.2). */
-async function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
+/**
+ * One guided interactive paste flow. Renders, in order: a blank line, the `intro`
+ * line, the scope `bullets`, a blank line, an optional `note` line, the
+ * "Create a fine-grained token scoped to {repoLabel}" line + the create URL, a
+ * blank line, then the masked `promptLabel`. Off-TTY it returns null immediately.
+ * The three call sites (Primary / Sandbox-read / Sandbox-write) differ only by the
+ * passed-in copy.
+ */
+interface GuidedPaste {
+  /** `owner/repo` the create-link is scoped to. */
+  repoLabel: string;
+  /** The leading "pr-backtest needs …" line. */
+  intro: string;
+  /** The three indented scope bullets. */
+  bullets: [string, string, string];
+  /** An optional extra line shown between the bullets and the create link. */
+  note?: string;
+  /** The masked paste prompt label. */
+  promptLabel: string;
+}
+
+async function guidedPaste(copy: GuidedPaste): Promise<string | null> {
   if (!process.stdin.isTTY) {
     return null;
   }
   info("");
-  info(
-    `pr-backtest needs a token with read + write on the source ` +
-      `${source.owner}/${source.repo}:`,
-  );
-  info("  • Contents:      Read & write   (push backtest branches)");
-  info("  • Pull requests: Read & write   (read the PR, open the simulated PR)");
-  info("  • Metadata:      Read           (required for all tokens)");
+  info(copy.intro);
+  for (const bullet of copy.bullets) {
+    info(bullet);
+  }
   info("");
-  info(`Create a fine-grained token scoped to ${source.owner}/${source.repo}:`);
+  if (copy.note !== undefined) {
+    info(copy.note);
+  }
+  info(`Create a fine-grained token scoped to ${copy.repoLabel}:`);
   info(`  ${PAT_CREATE_URL}`);
   info("");
-  return maskedPaste("Paste your token:");
+  return maskedPaste(copy.promptLabel);
+}
+
+/** Primary prompt: a single token with READ + WRITE on the source (spec §4.2). */
+function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
+  return guidedPaste({
+    repoLabel: `${source.owner}/${source.repo}`,
+    intro:
+      `pr-backtest needs a token with read + write on the source ` +
+      `${source.owner}/${source.repo}:`,
+    bullets: [
+      "  • Contents:      Read & write   (push backtest branches)",
+      "  • Pull requests: Read & write   (read the PR, open the simulated PR)",
+      "  • Metadata:      Read           (required for all tokens)",
+    ],
+    promptLabel: "Paste your token:",
+  });
 }
 
 /** Sandbox token #1: a READ-ONLY source token is enough (spec §4.3). */
-async function defaultGetSandboxReadPaste(
-  source: RepoRef,
-): Promise<string | null> {
-  if (!process.stdin.isTTY) {
-    return null;
-  }
-  info("");
-  info(
-    `pr-backtest needs a token that can read the source ` +
+function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
+  return guidedPaste({
+    repoLabel: `${source.owner}/${source.repo}`,
+    intro:
+      `pr-backtest needs a token that can read the source ` +
       `${source.owner}/${source.repo} — a read-only token is enough:`,
-  );
-  info("  • Contents:      Read   (fetch the PR's commits)");
-  info("  • Pull requests: Read   (read the PR)");
-  info("  • Metadata:      Read   (required for all tokens)");
-  info("");
-  info(`This token is read-only and needs no write access anywhere.`);
-  info(`Create a fine-grained token scoped to ${source.owner}/${source.repo}:`);
-  info(`  ${PAT_CREATE_URL}`);
-  info("");
-  return maskedPaste("Paste your read-only source token:");
+    bullets: [
+      "  • Contents:      Read   (fetch the PR's commits)",
+      "  • Pull requests: Read   (read the PR)",
+      "  • Metadata:      Read   (required for all tokens)",
+    ],
+    note: "This token is read-only and needs no write access anywhere.",
+    promptLabel: "Paste your read-only source token:",
+  });
 }
 
 /** Sandbox token #2: a WRITE token on the destination (spec §4.3). */
-async function defaultGetSandboxWritePaste(
+function defaultGetSandboxWritePaste(
   destination: RepoRef,
 ): Promise<string | null> {
-  if (!process.stdin.isTTY) {
-    return null;
-  }
-  info("");
-  info(
-    `pr-backtest needs a token with write on the destination ` +
+  return guidedPaste({
+    repoLabel: `${destination.owner}/${destination.repo}`,
+    intro:
+      `pr-backtest needs a token with write on the destination ` +
       `${destination.owner}/${destination.repo}:`,
-  );
-  info("  • Contents:      Read & write   (push backtest branches)");
-  info("  • Pull requests: Read & write   (open the simulated PR)");
-  info("  • Metadata:      Read           (required for all tokens)");
-  info("");
-  info(`Create a fine-grained token scoped to ${destination.owner}/${destination.repo}:`);
-  info(`  ${PAT_CREATE_URL}`);
-  info("");
-  return maskedPaste("Paste your destination write token:");
+    bullets: [
+      "  • Contents:      Read & write   (push backtest branches)",
+      "  • Pull requests: Read & write   (open the simulated PR)",
+      "  • Metadata:      Read           (required for all tokens)",
+    ],
+    promptLabel: "Paste your destination write token:",
+  });
 }
 
 /**
@@ -425,8 +447,12 @@ export async function resolveWriteToken(
     () => new NoTokenNonInteractiveError(),
   );
 
-  const login = await captureLogin(make(resolved.token));
+  // A fresh paste is validated via users.getAuthenticated to capture its @login;
+  // env/saved tokens already proved themselves via the accept (repos.get) probe,
+  // so they make no extra getAuthenticated round-trip.
+  let login = "";
   if (resolved.fromPaste) {
+    login = await captureLogin(make(resolved.token));
     success(`Authenticated as @${login}`);
     saveConfig({
       destinationToken: {
@@ -504,8 +530,12 @@ export async function resolveReadToken(
     () => new NoSourceTokenNonInteractiveError(source.owner, source.repo),
   );
 
-  const login = await captureLogin(make(resolved.token));
+  // A fresh paste is validated via users.getAuthenticated to capture its @login;
+  // env/saved tokens (and a reused write token) already proved themselves via
+  // canRead, so they make no extra getAuthenticated round-trip.
+  let login = "";
   if (resolved.fromPaste) {
+    login = await captureLogin(make(resolved.token));
     success(`Authenticated as @${login}`);
     saveConfig({
       sourceToken: {

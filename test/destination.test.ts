@@ -16,7 +16,6 @@ import {
   DestinationArgsError,
   DestinationApiError,
   writePermissionMessage,
-  DEFAULT_SANDBOX_NAME,
   type ChoiceResolvers,
   type DestinationFlags,
   type MenuRow,
@@ -83,9 +82,7 @@ function makeChoiceHarness(opts: {
     promptRemember: async (dest) => {
       if (opts.remember) {
         opts.remembered?.push(dest);
-        return true;
       }
-      return false;
     },
   };
   return {
@@ -399,20 +396,18 @@ test("VAL-DEST-005: makeRememberPrompt persists on yes via mergeConfig", async (
   useTempConfigHome();
   prompts.inject([true]);
   const rememberPrompt = makeRememberPrompt();
-  const saved = await rememberPrompt({ owner: "you", repo: "other" });
-  assert.equal(saved, true);
+  await rememberPrompt({ owner: "you", repo: "other" });
   const cfg = readConfig();
   assert.deepEqual(cfg?.defaultDestination, { owner: "you", repo: "other" });
 });
 
-test("makeRememberPrompt: declining does not persist and returns false", async () => {
+test("makeRememberPrompt: declining does not persist", async () => {
   const persisted: SavedDestination[] = [];
   prompts.inject([false]);
   const rememberPrompt = makeRememberPrompt({
     saveDefault: (d) => persisted.push(d),
   });
-  const saved = await rememberPrompt({ owner: "you", repo: "other" });
-  assert.equal(saved, false);
+  await rememberPrompt({ owner: "you", repo: "other" });
   assert.equal(persisted.length, 0);
 });
 
@@ -742,8 +737,8 @@ function makeFakeOctokit(opts: {
 test("personal-account owner → createForAuthenticatedUser, private+auto_init", async () => {
   const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
   const create = makeSandboxCreator(octokit);
-  const result = await create({ owner: "me", name: DEFAULT_SANDBOX_NAME });
-  assert.deepEqual(result, { owner: "me", repo: DEFAULT_SANDBOX_NAME });
+  const result = await create({ owner: "me", name: "pr-backtest-sandbox" });
+  assert.deepEqual(result, { owner: "me", repo: "pr-backtest-sandbox" });
   const createCall = calls.find((c) => c.method === "createForAuthenticatedUser");
   assert.ok(createCall);
   assert.ok(!calls.some((c) => c.method === "createInOrg"));

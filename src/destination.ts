@@ -25,16 +25,14 @@
 import type { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 import type { RepoVerification } from "./github.js";
-import { createPrivateRepo, isHttpStatus } from "./github.js";
-import { mergeConfig, type SavedDestination } from "./config.js";
+import { createPrivateRepo, isStatus } from "./github.js";
+import { mergeConfig, type RepoRef, type SavedDestination } from "./config.js";
 import { parseRepoSlug } from "./parseUrl.js";
 import { info, warn } from "./log.js";
 
-/** An `owner/repo` pair. */
-export interface RepoRef {
-  owner: string;
-  repo: string;
-}
+// Re-export the shared repo coordinate so existing importers of `RepoRef` from
+// this module keep working; the single declaration lives in config.ts.
+export type { RepoRef };
 
 /** The destination flags parsed from the CLI. */
 export interface DestinationFlags {
@@ -111,8 +109,8 @@ export type MenuPrompt = (rows: MenuRow[]) => Promise<MenuRow>;
 /** Prompt for a free-form `owner/repo` or URL (re-prompt on parse error lives here). */
 export type SlugPrompt = () => Promise<RepoRef>;
 
-/** Offer to remember a non-default sandbox as the saved default; returns whether saved. */
-export type RememberPrompt = (dest: RepoRef) => Promise<boolean>;
+/** Offer to remember a non-default sandbox as the saved default. */
+export type RememberPrompt = (dest: RepoRef) => Promise<void>;
 
 /**
  * A single interactive menu row. `kind` drives the post-select sub-flow; `title`
@@ -137,7 +135,7 @@ export interface ChoiceResolvers {
   prompt: MenuPrompt;
   /** Interactive `owner/repo`-or-URL prompt, re-prompting on a parse error (TTY only). */
   promptForSlug: SlugPrompt;
-  /** Offer remember-as-default; persists on yes. Returns whether it was saved. */
+  /** Offer remember-as-default; persists on yes. */
   promptRemember: RememberPrompt;
 }
 
@@ -393,7 +391,7 @@ export interface RememberPromptOptions {
 /**
  * Build the real remember-as-default prompt — injected as
  * `resolvers.promptRemember`. Asks once and, on yes, persists via the injected
- * `saveDefault` (defaulting to {@link mergeConfig}). Returns whether it was saved.
+ * `saveDefault` (defaulting to {@link mergeConfig}).
  */
 export function makeRememberPrompt(
   options: RememberPromptOptions = {},
@@ -402,7 +400,7 @@ export function makeRememberPrompt(
     options.saveDefault ??
     ((dest: SavedDestination) =>
       mergeConfig({ defaultDestination: dest }));
-  return async (dest: RepoRef): Promise<boolean> => {
+  return async (dest: RepoRef): Promise<void> => {
     const { remember } = await prompts({
       type: "confirm",
       name: "remember",
@@ -412,9 +410,7 @@ export function makeRememberPrompt(
     if (remember === true) {
       saveDefault({ owner: dest.owner, repo: dest.repo });
       info(`Saved ${dest.owner}/${dest.repo} as your default sandbox.`);
-      return true;
     }
-    return false;
   };
 }
 
@@ -698,7 +694,7 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
       );
       return { owner: created.owner, repo: created.repo };
     } catch (err: unknown) {
-      if (isHttpStatus(err, 403)) {
+      if (isStatus(err, 403)) {
         throw new DestinationApiError(
           `Cannot create a sandbox repository under ${request.owner}: ` +
             "the token lacks permission to create repositories there " +
@@ -707,13 +703,13 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
             "a token with creation rights.",
         );
       }
-      if (isHttpStatus(err, 404)) {
+      if (isStatus(err, 404)) {
         throw new DestinationApiError(
           `Cannot create a sandbox repository under ${request.owner}: ` +
             "that owner was not found or is not visible to the token.",
         );
       }
-      if (isHttpStatus(err, 422)) {
+      if (isStatus(err, 422)) {
         throw new DestinationApiError(
           `Cannot create sandbox ${request.owner}/${request.name}: ` +
             "GitHub rejected the creation (the name may already be in use or " +
@@ -726,6 +722,3 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
     }
   };
 }
-
-/** The default name a fresh sandbox is created under. */
-export const DEFAULT_SANDBOX_NAME = "pr-backtest-sandbox";

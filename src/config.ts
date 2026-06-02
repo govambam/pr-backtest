@@ -11,7 +11,17 @@ import path from "node:path";
 import { warn } from "./log.js";
 
 /** The source a token was obtained from. */
-export type TokenSource = "fine-grained" | "classic" | "gh-cli";
+export type TokenSource = "fine-grained" | "classic";
+
+/**
+ * A repo coordinate (`owner`/`repo`). Carries no token value — only the location
+ * a capability acts on. Defined here (a leaf module) so both `auth.ts` and
+ * `destination.ts` share one type without an import cycle.
+ */
+export interface RepoRef {
+  owner: string;
+  repo: string;
+}
 
 /** A saved write destination (the repo branches/PRs are pushed to). */
 export interface SavedDestination {
@@ -70,7 +80,7 @@ export function configPath(): string {
 }
 
 function isTokenSource(value: unknown): value is TokenSource {
-  return value === "fine-grained" || value === "classic" || value === "gh-cli";
+  return value === "fine-grained" || value === "classic";
 }
 
 /** A complete token slot: `token` + `username` (strings) + a valid `source`. */
