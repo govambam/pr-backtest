@@ -257,6 +257,37 @@ test("an unfetchable commit maps to exit 3 (git failure), unchanged", async () =
   assert.match(stderr, /Could not fetch commit/);
 });
 
+test("a closed/merged prior backtest PR is caught by the pre-flight before any clone/push", async () => {
+  // The pre-flight queries `state: "all"`, so a closed or merged prior backtest
+  // PR for the same branch pair is detected up front. An open-only pre-flight
+  // would miss this PR — modelled here by a fake that only returns a URL when
+  // asked for `"all"`, returning null for the open-only default.
+  const calls = { clone: 0, push: 0, create: 0 };
+  const EXISTING_URL = "https://github.com/acme/api/pull/200";
+  const { deps } = makeDeps({
+    findExistingPr: async (_octokit, _owner, _repo, _head, _base, state) =>
+      state === "all" ? EXISTING_URL : null,
+    cloneRepo: async () => {
+      calls.clone += 1;
+      return fakeGit;
+    },
+    pushBranchFromSha: async () => {
+      calls.push += 1;
+    },
+    createPullRequest: async () => {
+      calls.create += 1;
+      return CREATED_URL;
+    },
+  });
+  const { stdout, exit } = await run({ deps });
+
+  assert.equal(exit, 4, "an existing backtest PR is the documented exit 4");
+  assert.equal(stdout, EXISTING_URL + "\n", "stdout is exactly the existing PR URL");
+  assert.equal(calls.clone, 0, "no clone when the pre-flight finds an existing PR");
+  assert.equal(calls.push, 0, "no push when the pre-flight finds an existing PR");
+  assert.equal(calls.create, 0, "no create when the pre-flight finds an existing PR");
+});
+
 test("a verbose run is observation-only — same order, same exit", async () => {
   const { deps, order } = makeDeps();
   const { exit } = await run({ deps, verbose: true });

@@ -305,22 +305,26 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   const baseBranch = `backtest-pr${number}-base`;
 
   // 6. Pre-flight: bail out if a backtest PR already exists for these branches.
+  //    Query `all` states so a closed or merged prior backtest PR is caught here,
+  //    before any clone/fetch/push — not only after the post-create 422 backstop.
+  let existingUrl: string | null;
   try {
-    const existingUrl = await deps.findExistingPr(
+    existingUrl = await deps.findExistingPr(
       octokit,
       destOwner,
       destRepo,
       headBranch,
       baseBranch,
+      "all",
     );
-    if (existingUrl) {
-      info("A backtest PR already exists for these branches:");
-      process.stdout.write(existingUrl + "\n");
-      process.exit(EXIT.EXISTING_PR);
-    }
   } catch (err) {
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
+  }
+  if (existingUrl) {
+    info("A backtest PR already exists for these branches:");
+    process.stdout.write(existingUrl + "\n");
+    process.exit(EXIT.EXISTING_PR);
   }
 
   // 7. Show the plan and confirm (unless -y). A decline is a clean exit 0.
