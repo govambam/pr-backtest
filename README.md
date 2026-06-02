@@ -22,8 +22,8 @@ npx pr-backtest <pr-url>
 
 There is no separate setup step. The first time you run `pr-backtest <pr-url>` in an interactive terminal, it resolves a GitHub token in this order:
 
-1. **`GITHUB_TOKEN`** — if set, it is used and nothing is saved. This is the path for CI and scripting (non-interactive runs require it).
-2. **Saved config** — a token you saved on a previous run (`~/.config/pr-backtest/config.json`, mode `0600`).
+1. **`GITHUB_TOKEN` environment variable** — if this env var is set, its value is used and is never written to the config file. Set it in your shell with `export GITHUB_TOKEN=ghp_...` (or prefix a single run: `GITHUB_TOKEN=ghp_... pr-backtest <pr-url>`). This is the path for CI and scripting (non-interactive runs require it).
+2. **Saved config** — a token saved automatically on a previous run when you pasted one (see step 4), stored at `~/.config/pr-backtest/config.json`, mode `0600`.
 3. **`gh` CLI** — if you already use the [GitHub CLI](https://cli.github.com) and are logged in, pr-backtest offers to reuse that login, so you don't have to create a token at all.
 4. **Paste a token** — otherwise it prompts you to paste one (input is masked) and offers to save it for next time.
 
