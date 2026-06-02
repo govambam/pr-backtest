@@ -25,6 +25,7 @@ import { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 
 import {
+  inferTokenSource,
   mergeConfig,
   readConfig,
   type Config,
@@ -88,12 +89,6 @@ export class NoSourceTokenNonInteractiveError extends NoTokenNonInteractiveError
       `or run in an interactive terminal to paste one.`;
     this.name = "NoSourceTokenNonInteractiveError";
   }
-}
-
-/** Infer the token source from its prefix. */
-function inferPasteSource(token: string): TokenSource {
-  // github_pat_ => fine-grained PAT; ghp_ (and everything else) => classic PAT.
-  return token.startsWith("github_pat_") ? "fine-grained" : "classic";
 }
 
 /**
@@ -236,7 +231,7 @@ function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
 /**
  * Sandbox token #1: a READ-ONLY source token is enough. Exported so the scoped
  * Sandbox interactive fork (authFirst.ts) can reuse this exact copy and collect
- * the read paste in spec §3b order — keeping the guided-paste scope text in ONE
+ * the read paste in user-facing order — keeping the guided-paste scope text in ONE
  * place rather than duplicating it.
  */
 export function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
@@ -258,7 +253,7 @@ export function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | nu
 /**
  * Sandbox token #2: a WRITE token on the destination. Exported so the scoped
  * Sandbox interactive fork (authFirst.ts) can reuse this exact copy and collect
- * the write paste in spec §3b order. The copy requests only Contents + Pull
+ * the write paste in user-facing order. The copy requests only Contents + Pull
  * requests: Read & write — never `Administration` (the scoped path never creates).
  */
 export function defaultGetSandboxWritePaste(
@@ -308,7 +303,7 @@ function envCandidate(value: string | undefined): Candidate | null {
   if (!value || value.length === 0) {
     return null;
   }
-  return { token: value, source: inferPasteSource(value), fromPaste: false };
+  return { token: value, source: inferTokenSource(value), fromPaste: false };
 }
 
 /**
@@ -372,8 +367,8 @@ export type AcceptToken = (
  * A lazily-resolved extra candidate, tried AFTER the eager `candidates` and
  * BEFORE the interactive paste. It is a thunk so it runs ONLY when the eager
  * sources are all rejected — e.g. the interactive inherited-credential detector
- * must not shell out to `git credential` / `gh` when a saved slot already wins
- * (VAL-AUTH-006). Returns null when there is no extra candidate to offer.
+ * must not shell out to `git credential` / `gh` when a saved slot already wins.
+ * Returns null when there is no extra candidate to offer.
  */
 type ExtraCandidate = () => Promise<Candidate | null>;
 
@@ -439,7 +434,7 @@ async function resolveWithAccept(
 
   // The lazy extra candidate (e.g. the inherited credential) is resolved ONLY
   // now — after the eager env/saved sources are all rejected — so a saved slot
-  // that wins never triggers the inherited detector's exec seam (VAL-AUTH-006).
+  // that wins never triggers the inherited detector's exec seam.
   // It carries fromPaste: false, so an accepted inherited token is never
   // persisted to the 0600 config.
   const extra = await getExtra();
@@ -449,7 +444,7 @@ async function resolveWithAccept(
       return extra;
     }
     // The extra (inherited) candidate was offered but cannot satisfy the chosen
-    // destination's capability (VAL-AUTH-004): emit a token-free explanation and
+    // destination's capability: emit a token-free explanation and
     // CONTINUE to the paste path rather than failing. The hook (token-free by
     // construction) is the caller's; the scrubber already covers it anyway.
     onExtraReject();
@@ -462,7 +457,7 @@ async function resolveWithAccept(
     }
     registerSecret(pasted);
     if (await tryAccept(make(pasted), pasted)) {
-      return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
+      return { token: pasted, source: inferTokenSource(pasted), fromPaste: true };
     }
     if (attempt < PASTE_MAX_ATTEMPTS - 1) {
       onPasteReject();
@@ -503,20 +498,19 @@ export interface ResolveWriteTokenOptions {
    * INTERACTIVE-ONLY inherited-credential source, offered AFTER env + saved slot
    * and BEFORE the paste. Returns the inherited credential, or null when none is
    * detected (or off a TTY). OPTIONAL/injectable: non-interactive callers and
-   * tests omit it, so off-TTY it is never consulted (VAL-AUTH-003). The token is
+   * tests omit it, so off-TTY it is never consulted. The token is
    * already registered with the scrubber by the detector and is NOT persisted
    * (it is not a fresh paste). Resolved lazily — only when env/saved are
-   * rejected — so a winning saved slot never triggers detection (VAL-AUTH-006).
+   * rejected — so a winning saved slot never triggers detection.
    */
   getInheritedCredential?: () => Promise<{
     token: string;
-    login: string;
     source: TokenSource;
   } | null>;
   /**
    * Called when an offered inherited credential is REJECTED (cannot write/create
    * the destination) and the resolver falls through to the paste — the place to
-   * emit the VAL-AUTH-004 token-free explanation. OPTIONAL; default is a no-op.
+   * emit the token-free explanation. OPTIONAL; default is a no-op.
    * Never receives or echoes a token.
    */
   onInheritedReject?: () => void;
@@ -621,7 +615,6 @@ export interface ResolveReadTokenOptions {
    */
   getInheritedCredential?: () => Promise<{
     token: string;
-    login: string;
     source: TokenSource;
   } | null>;
   /**
@@ -660,7 +653,7 @@ export async function resolveReadToken(
   // The write token is offered AFTER env + saved slot: single-PAT detection.
   const writeReuse: Candidate | null =
     writeToken.length > 0
-      ? { token: writeToken, source: inferPasteSource(writeToken), fromPaste: false }
+      ? { token: writeToken, source: inferTokenSource(writeToken), fromPaste: false }
       : null;
 
   const resolved = await resolveWithAccept(

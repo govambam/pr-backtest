@@ -248,7 +248,7 @@ export async function detectInheritedCredential(
   const exec = options.exec ?? defaultExec;
   const make = options.makeOctokit ?? makeOctokit;
 
-  // 1. git credential fill — the most universal source. Feed the exact stdin.
+  // 1. git credential fill — the most universal source.
   let token: string | null = null;
   const fill = await exec(
     "git",

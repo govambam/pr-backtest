@@ -14,6 +14,15 @@ import { warn } from "./log.js";
 export type TokenSource = "fine-grained" | "classic";
 
 /**
+ * Infer a token's source from its prefix: `github_pat_` is a fine-grained PAT;
+ * `ghp_` (and everything else) is a classic PAT. Shared by every token entry
+ * point (paste, env, inherited credential) so the prefix rule lives in one place.
+ */
+export function inferTokenSource(token: string): TokenSource {
+  return token.startsWith("github_pat_") ? "fine-grained" : "classic";
+}
+
+/**
  * A repo coordinate (`owner`/`repo`). Carries no token value — only the location
  * a capability acts on. Defined here (a leaf module) so both `auth.ts` and
  * `destination.ts` share one type without an import cycle.

@@ -75,8 +75,6 @@ import {
   makeLandInSourcePrompt,
   makeSandboxNamePrompt,
   resolveAuthFirstChoice,
-  sandboxReadPaste,
-  sandboxWritePaste,
   type AuthFirstResolvers,
 } from "./authFirst.js";
 import type { InheritedCredential } from "./inheritedAuth.js";
@@ -113,10 +111,10 @@ export interface RunBacktestDeps {
   /** Pure destination choice (no token, no network) — flag + non-TTY paths. */
   resolveDestinationChoice: typeof resolveDestinationChoice;
   /**
-   * Interactive (TTY, no-flag) auth-first choice (spec §3). Returns the
+   * Interactive (TTY, no-flag) auth-first choice. Returns the
    * destination AND, on the inherited fork, the detected credential to pass to
    * the resolvers. Only the interactive no-flag path uses this; flag + non-TTY
-   * paths stay on {@link resolveDestinationChoice} (KEEP-002).
+   * paths stay on {@link resolveDestinationChoice}.
    */
   resolveAuthFirstChoice: typeof resolveAuthFirstChoice;
   /** Detect the inherited credential (TTY only) — auth-offer detection seam. */
@@ -129,10 +127,10 @@ export interface RunBacktestDeps {
   makeSandboxNamePrompt: typeof makeSandboxNamePrompt;
   /** Build the scoped-fork "Land in the original source repo? [Y/n]" prompt. */
   makeLandInSourcePrompt: typeof makeLandInSourcePrompt;
-  /** Scoped-sandbox READ-only source paste seam (reused resolver copy). */
-  sandboxReadPaste: typeof sandboxReadPaste;
-  /** Scoped-sandbox READ+WRITE destination paste seam (reused resolver copy). */
-  sandboxWritePaste: typeof sandboxWritePaste;
+  /** Scoped-sandbox READ-only source paste seam (the resolver's own getter). */
+  sandboxReadPaste: typeof defaultGetSandboxReadPaste;
+  /** Scoped-sandbox READ+WRITE destination paste seam (the resolver's own getter). */
+  sandboxWritePaste: typeof defaultGetSandboxWritePaste;
   /** Verify push / create-if-missing for the destination. */
   verifyOrCreateDestination: typeof verifyOrCreateDestination;
   /** Resolve the WRITE token via an injected accept predicate. */
@@ -147,7 +145,7 @@ export interface RunBacktestDeps {
   /** Interactive "create this sandbox?" confirm seam (TTY only). */
   makeConfirmCreate: typeof makeConfirmCreate;
   /**
-   * Build the interactive 403 → Primary-fallback prompt (spec §5). Wired into
+   * Build the interactive 403 → Primary-fallback prompt. Wired into
    * `verifyOrCreateDestination`'s `onCreateForbidden` seam ONLY on the inherited
    * new-sandbox fork; off-TTY / `--create-sandbox` it is never consulted.
    */
@@ -178,8 +176,8 @@ const defaultDeps: RunBacktestDeps = {
   makeLandingChoicePrompt,
   makeLandInSourcePrompt,
   makeSandboxNamePrompt,
-  sandboxReadPaste,
-  sandboxWritePaste,
+  sandboxReadPaste: defaultGetSandboxReadPaste,
+  sandboxWritePaste: defaultGetSandboxWritePaste,
   verifyOrCreateDestination,
   resolveWriteToken,
   resolveReadToken,
@@ -232,7 +230,7 @@ function messageOf(err: unknown): string {
  * Wrap an eagerly-collected paste so the resolver's bounded re-prompt is NOT
  * defeated.
  *
- * The scoped-Sandbox fork collects its pastes eagerly in §3b user-facing order
+ * The scoped-Sandbox fork collects its pastes eagerly in user-facing order
  * (read-then-write) and the orchestrator replays them into the resolvers. But a
  * resolver's `getPaste` is called up to {@link PASTE_MAX_ATTEMPTS} times to
  * re-prompt when a pasted token is rejected. A CONSTANT thunk would hand back the
@@ -295,11 +293,11 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
 
   // 3. Resolve WHERE the backtest PR is written. The INTERACTIVE (TTY, no-flag)
-  //    path is now AUTH-FIRST (spec §3): it offers the inherited GitHub login
+  //    path is now AUTH-FIRST: it offers the inherited GitHub login
   //    BEFORE any destination question, then forks the destination off the
   //    answer (and the inherited credential it carries forward). The flag and
   //    non-TTY paths are UNCHANGED — they stay on the pure `resolveDestinationChoice`
-  //    (its DestinationArgsError → exit 1; KEEP-002). No token resolution or
+  //    (its DestinationArgsError → exit 1). No token resolution or
   //    network happens here beyond the detector's own scrubbed login lookup.
   const isTTY = process.stdin.isTTY === true;
   const interactiveNoFlag =
@@ -318,7 +316,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // It carries `fromPaste: false`, so it is never persisted to the 0600 config.
   let inheritedCredential: InheritedCredential | null = null;
   // The scoped-sandbox fork collects its two pastes (read FIRST, then write) in
-  // §3b user-facing order; the orchestrator feeds them to the resolvers' paste
+  // user-facing order; the orchestrator feeds them to the resolvers' paste
   // getters below so the user is prompted read-then-write even though the write
   // token is resolved (step 4) before the read token (step 5). Null on every
   // other path (the resolvers prompt with their own default paste copy).
@@ -380,7 +378,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // destination, the resolver's accept rejects it and falls through to the paste,
   // emitting its token-free explanation.
   const getInheritedCredential:
-    | (() => Promise<{ token: string; login: string; source: TokenSource } | null>)
+    | (() => Promise<{ token: string; source: TokenSource } | null>)
     | undefined = inheritedCredential
     ? async () => inheritedCredential
     : undefined;
@@ -415,7 +413,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         createSandbox: deps.makeSandboxCreator(octokit as Octokit),
         createFlag: opts.createSandbox === true,
         isTTY,
-        // Spec §5: auto-create in the INTERACTIVE path is inherited-only. A
+        // Auto-create in the INTERACTIVE path is inherited-only. A
         // scoped interactive Sandbox run (no inherited credential) must NEVER
         // invoke the creator — the user pre-creates the repo — so `allowCreate`
         // is false there. Flag / non-TTY paths keep their behavior (the
@@ -427,7 +425,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         // it. The seam self-guards off-TTY; verifyOrCreateDestination only
         // invokes it on the isTTY branch.
         confirmCreate: deps.makeConfirmCreate(),
-        // Spec §5 403 → Primary fallback: wired ONLY on the inherited fork. When
+        // 403 → Primary fallback: wired ONLY on the inherited fork. When
         // the create returns 403 on a TTY, this offers ONLY the source repo as
         // the fallback destination; declining throws PrimaryFallbackDeclinedError
         // (exit 0). Absent on every other path, so off-TTY / `--create-sandbox`
@@ -446,7 +444,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       // and BEFORE the paste. AUTH-004: if it cannot write the destination, the
       // resolver falls through to the paste with its token-free explanation.
       getInheritedCredential,
-      // VAL-AUTH-004: if the inherited token cannot WRITE the destination, explain
+      // If the inherited token cannot WRITE the destination, explain
       // (token-free) and let the resolver drop to the paste path — no hard failure.
       onInheritedReject: inheritedCredential
         ? () =>
@@ -456,13 +454,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
                 "to continue.",
             )
         : undefined,
-      // Scoped-sandbox fork only: the destination write paste was already
-      // collected (after the read paste) in §3b order; replay it here. The eager
-      // value is returned ONCE on the FIRST call; subsequent calls (the
-      // resolver's bounded re-prompt, when the first token is rejected) delegate
-      // to the LIVE default write paste so the user is genuinely re-prompted —
-      // a constant thunk would hand back the same rejected token 3× and defeat
-      // recovery. A null entry falls straight through to the live getter.
+      // Scoped-sandbox fork only: replay the eagerly-collected write paste, then
+      // delegate to the live getter on re-prompt (see {@link makeReplayThenLivePaste}).
       ...(scopedSandboxPastes
         ? {
             getPaste: makeReplayThenLivePaste(
@@ -476,7 +469,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   } catch (err) {
     destTrace.fail();
     if (err instanceof PrimaryFallbackDeclinedError) {
-      // Spec §5: the inherited new-sandbox create returned 403 and the user
+      // The inherited new-sandbox create returned 403 and the user
       // declined the Primary fallback. Nothing was created or written — a clean
       // no-op outcome, NOT an error: exit 0. (Checked BEFORE DestinationApiError,
       // which it deliberately does not extend.)
@@ -501,7 +494,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   destTrace.done(redactedRepoRef(verifiedDest.owner, verifiedDest.repo));
   destOwner = verifiedDest.owner;
   destRepo = verifiedDest.repo;
-  // Spec §5 / decision 3: the destination is now SETTLED — before the plan. A
+  // The destination is now SETTLED — before the plan. A
   // 403 → Primary fallback returns the SOURCE as the verified destination, so the
   // run is no longer a sandbox. Recompute `isSandbox` from the settled dest vs
   // the source so the plan, token routing, and the source-fetch remote all
@@ -530,7 +523,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       // case the write token already reads the source (single-PAT), so this is
       // never consulted; it matters when the inherited write token cannot read.
       getInheritedCredential,
-      // VAL-AUTH-004 (read side): if the inherited token cannot READ the source,
+      // Read side: if the inherited token cannot READ the source,
       // explain (token-free) and drop to the paste rather than failing.
       onInheritedReject: inheritedCredential
         ? () =>
@@ -540,13 +533,10 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
                 "to continue.",
             )
         : undefined,
-      // Scoped-sandbox fork only: replay the source read paste collected in §3b
-      // order. Single-PAT reuse still runs first, so a write token that also reads
-      // the source short-circuits before this is consulted. The eager value is
-      // returned ONCE on the FIRST call; subsequent calls (the resolver's bounded
-      // re-prompt, when the first token is rejected) delegate to the LIVE default
-      // read paste so the user is genuinely re-prompted — a constant thunk would
-      // defeat recovery. A null entry falls straight through to the live getter.
+      // Scoped-sandbox fork only: replay the eagerly-collected read paste, then
+      // delegate to the live getter on re-prompt (see {@link makeReplayThenLivePaste}).
+      // Single-PAT reuse still runs first, so a write token that also reads the
+      // source short-circuits before this is consulted.
       ...(scopedSandboxPastes
         ? {
             getPaste: makeReplayThenLivePaste(
@@ -817,7 +807,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //     /create failure, read-token exit 1, git failure, decline, dup exit 4) can
   //     save a destination the run never proved usable. Gated on a non-default
   //     interactively-chosen Sandbox (`offerRemember`).
-  if (offerRemember && isSandbox) {
+  if (offerRemember) {
     await deps.makeRememberPrompt()({ owner: destOwner, repo: destRepo });
   }
 

@@ -1,5 +1,5 @@
 /**
- * Auth-first interactive onboarding (spec §3 — the heart of the guided flow).
+ * Auth-first interactive onboarding — the heart of the guided flow.
  *
  * On an INTERACTIVE run (stdin is a TTY, no destination flag) the tool now asks
  * about AUTH before anything about destinations:
@@ -30,7 +30,7 @@
  * token before making). The orchestrator (index.ts) consumes the returned choice
  * and runs the EXISTING write/read resolution and verify-or-create paths.
  *
- * Auto-create (spec §5, `inherited-auto-create`): when the user picks "a new
+ * Auto-create (`inherited-auto-create`): when the user picks "a new
  * sandbox repo" this module emits the warn-upfront copy ({@link sandboxCreateWarning},
  * naming `<src-owner>/<src-repo>-backtest` + the repo-creation-scope prerequisite)
  * BEFORE any create attempt, then offers the EDITABLE name (default
@@ -45,10 +45,7 @@
  */
 import prompts from "prompts";
 
-import {
-  defaultGetSandboxReadPaste,
-  defaultGetSandboxWritePaste,
-} from "./auth.js";
+import { sameRepo, type SlugPrompt } from "./destination.js";
 import {
   detectInheritedCredential,
   type InheritedCredential,
@@ -59,6 +56,9 @@ import { parseRepoName } from "./parseUrl.js";
 
 // Re-export the shared repo coordinate so importers can reference it from here.
 export type { RepoRef };
+// Re-export the slug prompt type (declared in destination.ts) so importers that
+// reference it from this module keep working.
+export type { SlugPrompt };
 
 /** The suffix appended to the source repo name for the inherited new-sandbox default. */
 export const SANDBOX_NAME_SUFFIX = "-backtest";
@@ -84,7 +84,7 @@ export interface AuthFirstChoice {
   inheritedCredential: InheritedCredential | null;
   /**
    * On the scoped (NO) Sandbox fork ONLY: the two tokens collected here, in the
-   * spec §3b user-facing order — the READ-only source token FIRST, then the
+   * user-facing order — the READ-only source token FIRST, then the
    * READ+WRITE destination token. The orchestrator feeds these to the read/write
    * resolvers' paste getters so the USER is prompted read-then-write even though
    * the orchestration internally resolves the write token before the read token.
@@ -111,8 +111,8 @@ export type LandingChoicePrompt = () => Promise<"primary" | "sandbox">;
 /**
  * Prompt for the new-sandbox repository NAME on the inherited fork, pre-filled
  * with the default `<src-repo>-backtest`. Returns the (trimmed) name the user
- * accepted or edited; the edited value flows straight through to the creator
- * (VAL-CREATE-003). Off-TTY it returns the default unchanged.
+ * accepted or edited; the edited value flows straight through to the creator.
+ * Off-TTY it returns the default unchanged.
  */
 export type SandboxNamePrompt = (defaultName: string) => Promise<string>;
 
@@ -121,9 +121,6 @@ export type SandboxNamePrompt = (defaultName: string) => Promise<string>;
  * repo? [Y/n]" question and return the answer.
  */
 export type LandInSourcePrompt = () => Promise<boolean>;
-
-/** Prompt for a free-form `owner/repo` or URL (re-prompt on parse error). */
-export type SlugPrompt = () => Promise<RepoRef>;
 
 /**
  * A guided masked paste prompt for the scoped Sandbox fork, returning the trimmed
@@ -149,7 +146,7 @@ export interface AuthFirstResolvers {
   promptLanding: LandingChoicePrompt;
   /**
    * The inherited new-sandbox NAME prompt, pre-filled with `<src-repo>-backtest`
-   * and editable (VAL-CREATE-003). Invoked AFTER the warn-upfront line.
+   * and editable. Invoked AFTER the warn-upfront line.
    */
   promptSandboxName: SandboxNamePrompt;
   /** The scoped-fork "Land in the original source repo? [Y/n]" prompt. */
@@ -164,18 +161,10 @@ export interface AuthFirstResolvers {
   getDefaultDestination: () => { owner: string; repo: string } | undefined;
 }
 
-/** True when two repo refs name the same `owner/repo` (case-insensitive). */
-function sameRepo(a: RepoRef, b: RepoRef): boolean {
-  return (
-    a.owner.toLowerCase() === b.owner.toLowerCase() &&
-    a.repo.toLowerCase() === b.repo.toLowerCase()
-  );
-}
-
 /**
- * Resolve the interactive (TTY, no-flag) auth-first choice (spec §3).
+ * Resolve the interactive (TTY, no-flag) auth-first choice.
  *
- * Call order (the load-bearing guarantee, VAL-FLOW-001): the inherited-login
+ * Call order (the load-bearing guarantee): the inherited-login
  * offer ALWAYS fires before any destination prompt — on BOTH the accept and
  * decline paths. When NO credential is detected, no offer is rendered and the
  * flow enters the scoped fork directly.
@@ -208,12 +197,12 @@ export async function resolveAuthFirstChoice(
  * EXISTING create path. The inherited credential is carried back on both choices
  * so the resolvers use the inherited token (no paste).
  *
- * New-sandbox refinements (spec §5):
+ * New-sandbox refinements:
  *  - WARN UPFRONT, BEFORE any create attempt, naming the repo to be created
  *    (`<src-owner>/<src-repo>-backtest`) and that it needs repo-creation scope on
- *    `<src-owner>` (VAL-CREATE-002).
+ *    `<src-owner>`.
  *  - Show the default name and let the user EDIT it; the edited value flows
- *    through to the creator unchanged (VAL-CREATE-003).
+ *    through to the creator unchanged.
  * The 403 → Primary fallback is settled later, in the orchestrator's destination
  * resolution (before the plan) — not here.
  */
@@ -234,8 +223,8 @@ async function resolveInheritedFork(
     };
   }
   // "a new sandbox repo" → default <src-owner>/<src-repo>-backtest under the
-  // SOURCE owner. WARN UPFRONT first (VAL-CREATE-002), then offer the editable
-  // name (VAL-CREATE-003). The chosen name flows into the dest the orchestrator
+  // SOURCE owner. WARN UPFRONT first, then offer the editable
+  // name. The chosen name flows into the dest the orchestrator
   // routes through the existing verifyOrCreateDestination create path.
   const defaultName = `${source.repo}${SANDBOX_NAME_SUFFIX}`;
   info("");
@@ -255,7 +244,7 @@ async function resolveInheritedFork(
 }
 
 /**
- * The exact warn-upfront copy for the inherited new-sandbox choice (spec §5).
+ * The exact warn-upfront copy for the inherited new-sandbox choice.
  * Names the repo to be created (`<src-owner>/<defaultName>`) and states the one
  * prerequisite: repo-creation scope on the source owner. Exported (and greppable)
  * so a test can assert the rendered string without driving `prompts`. NEVER
@@ -295,7 +284,7 @@ async function resolveScopedFork(
   }
 
   // NO → guidance FIRST, then the slug prompt (re-prompting on a parse error),
-  // then the two scoped pastes in spec §3b USER-FACING order: the READ-only
+  // then the two scoped pastes in USER-FACING order: the READ-only
   // source token FIRST, then the READ+WRITE destination token. Collecting them
   // here (rather than letting the resolvers prompt) is what makes the user see
   // read-then-write even though the orchestrator resolves the write token before
@@ -403,7 +392,7 @@ export function makeLandingChoicePrompt(
 
 /**
  * Build the real inherited new-sandbox NAME prompt, pre-filled with the default
- * `<src-repo>-backtest` and editable (VAL-CREATE-003). The user can accept the
+ * `<src-repo>-backtest` and editable. The user can accept the
  * default (Enter) or type a new name; the trimmed result flows to the creator.
  *
  * The edited name is VALIDATED against the same repo-name rule every other
@@ -441,7 +430,6 @@ export function makeSandboxNamePrompt(
         return parseRepoName(trimmed);
       } catch (err: unknown) {
         warn(err instanceof Error ? err.message : "Invalid repository name.");
-        // Loop to re-prompt rather than pass an invalid name downstream.
       }
     }
   };
@@ -482,20 +470,3 @@ export function makeDetectInherited(
   const isTTY = options.isTTY ?? (() => process.stdin.isTTY === true);
   return () => detectInheritedCredential({ isTTY });
 }
-
-/**
- * The scoped-sandbox READ-only source paste seam — REUSES the resolver's
- * {@link defaultGetSandboxReadPaste} copy (Contents/Pull requests: Read,
- * read-only). Off-TTY it returns null immediately (the resolver's getter
- * self-guards).
- */
-export const sandboxReadPaste: ScopedPastePrompt = (repo) =>
-  defaultGetSandboxReadPaste(repo);
-
-/**
- * The scoped-sandbox READ+WRITE destination paste seam — REUSES the resolver's
- * {@link defaultGetSandboxWritePaste} copy (Contents + Pull requests: Read &
- * write; never `Administration`, since the scoped path never creates).
- */
-export const sandboxWritePaste: ScopedPastePrompt = (repo) =>
-  defaultGetSandboxWritePaste(repo);
