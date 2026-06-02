@@ -16,6 +16,7 @@ import type { SimpleGit } from "simple-git";
 import {
   addRemoteDisplayCommand,
   addSourceRemote,
+  askpassGit,
   buildUnfetchableMessage,
   cleanup,
   cloneDisplayCommand,
@@ -343,27 +344,46 @@ test("the token lives only in the child env, never in the URL, argv, or display 
   }
 });
 
-test("gitEnv strips GIT_EDITOR / GIT_SEQUENCE_EDITOR so an ambient editor can't break git", () => {
-  // simple-git refuses to run when these are present in the child env (an
-  // editor-RCE mitigation). The tool never opens an editor, so gitEnv must drop
-  // them even when the ambient process.env sets one (VS Code, many shells do).
-  const priorEditor = process.env.GIT_EDITOR;
-  const priorSeq = process.env.GIT_SEQUENCE_EDITOR;
+test("gitEnv strips every var simple-git's block-unsafe guard rejects, so an ambient one can't break git", () => {
+  // simple-git refuses to run when any guard-flagged var (editor, pager, ssh
+  // command, external diff, config/exec paths, …) is present in the child env —
+  // each is an injection vector. The tool needs none of them, so gitEnv must
+  // drop them even when the ambient process.env sets them (VS Code, many shells,
+  // and GUI sessions set EDITOR/PAGER/SSH_ASKPASS). GIT_ASKPASS is the one kept,
+  // re-set by gitEnv itself and opted into via askpassGit.
+  const flagged = [
+    "EDITOR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_EDITOR",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_PROXY_COMMAND",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_TEMPLATE_DIR",
+    "PAGER",
+    "PREFIX",
+    "SSH_ASKPASS",
+  ];
+  const prior = new Map(flagged.map((name) => [name, process.env[name]]));
   try {
-    process.env.GIT_EDITOR = "true";
-    process.env.GIT_SEQUENCE_EDITOR = "true";
+    for (const name of flagged) process.env[name] = "ambient-value";
     const env = gitEnv(TOKEN, "/tmp/pr-backtest-xyz/askpass.sh");
-    assert.equal(env.GIT_EDITOR, undefined, "GIT_EDITOR must be stripped from the git child env");
-    assert.equal(
-      env.GIT_SEQUENCE_EDITOR,
-      undefined,
-      "GIT_SEQUENCE_EDITOR must be stripped from the git child env",
-    );
+    for (const name of flagged) {
+      assert.equal(env[name], undefined, `${name} must be stripped from the git child env`);
+    }
+    // The one guarded var we intentionally keep.
+    assert.equal(env.GIT_ASKPASS, "/tmp/pr-backtest-xyz/askpass.sh");
   } finally {
-    if (priorEditor === undefined) delete process.env.GIT_EDITOR;
-    else process.env.GIT_EDITOR = priorEditor;
-    if (priorSeq === undefined) delete process.env.GIT_SEQUENCE_EDITOR;
-    else process.env.GIT_SEQUENCE_EDITOR = priorSeq;
+    for (const [name, value] of prior) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 
@@ -433,6 +453,55 @@ test("a real clone driven through the askpass seam never writes the token into a
     // .git/config in particular records the remote URL — assert it explicitly.
     const config = readFileSync(join(gitDir, "config"), "utf8");
     assert.ok(!config.includes(TOKEN), ".git/config must not contain the token");
+  } finally {
+    cleanup(workDir);
+  }
+});
+
+test("askpassGit drives a real simple-git clone with GIT_ASKPASS set, not tripping the block-unsafe guard", async () => {
+  // Regression: simple-git's block-unsafe-operations plugin (via
+  // @simple-git/argv-parser) refuses to spawn git when GIT_ASKPASS is present
+  // in the child env unless the instance opts in with `unsafe.allowUnsafeAskPass`.
+  // cloneRepo delivers the token through GIT_ASKPASS by design, so every
+  // simpleGit() it builds MUST opt in — otherwise every clone/fetch/push throws
+  // synchronously ("Use of GIT_ASKPASS is not permitted without enabling
+  // allowUnsafeAskPass") in ~1ms, before git runs. The other real-clone test
+  // shells out to the git binary directly and so never exercises the simple-git
+  // factory where the guard lives; this drives the real factory through the
+  // exported askpass seam, against a local bare repo (offline, deterministic).
+  const workDir = mkdtempSync(join(tmpdir(), "pr-backtest-askpass-"));
+  try {
+    const sourceDir = join(workDir, "source");
+    const bareDir = join(workDir, "origin.git");
+    const cloneTarget = join(workDir, "clone");
+    execFileSync("git", ["init", "-q", sourceDir], { stdio: "ignore" });
+    execFileSync("git", ["-C", sourceDir, "config", "user.email", "test@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", sourceDir, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", sourceDir, "commit", "--allow-empty", "-q", "-m", "init"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["clone", "-q", "--bare", sourceDir, bareDir], { stdio: "ignore" });
+
+    // Pollute the ambient env with guard-flagged vars a real dev shell sets, so
+    // the test proves gitEnv + askpassGit survive them end-to-end rather than
+    // relying on a clean CI env. Without the fix this throws the block-unsafe
+    // guard ("Use of GIT_ASKPASS/EDITOR/… is not permitted") before git runs.
+    const ambient = { EDITOR: "vim", PAGER: "less", SSH_ASKPASS: "/usr/bin/ssh-askpass" };
+    const prior = new Map(Object.keys(ambient).map((k) => [k, process.env[k]]));
+    try {
+      Object.assign(process.env, ambient);
+      const askpassPath = writeAskpassHelper(workDir);
+      const env = gitEnv(TOKEN, askpassPath);
+      await askpassGit().env(env).clone(bareDir, cloneTarget, ["--no-checkout"]);
+      assert.ok(existsSync(join(cloneTarget, ".git")), "the clone must produce a .git directory");
+    } finally {
+      for (const [k, v] of prior) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   } finally {
     cleanup(workDir);
   }

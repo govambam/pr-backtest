@@ -177,6 +177,63 @@ export function writeAskpassHelper(tmpDir: string): string {
   return helperPath;
 }
 
+/**
+ * Construct a `simple-git` instance that is allowed to use GIT_ASKPASS.
+ *
+ * simple-git's block-unsafe-operations guard (via `@simple-git/argv-parser`)
+ * scans the git child env and refuses to spawn git when `GIT_ASKPASS` is set,
+ * unless `unsafe.allowUnsafeAskPass` is opted in — it throws synchronously,
+ * before git runs. We deliver the token through GIT_ASKPASS by design, so it
+ * never lands in the URL, on the command line, or in `.git/config` (see
+ * {@link writeAskpassHelper}). Every instance built here carries that askpass
+ * env, so every construction must opt in; routing all `simpleGit()` calls
+ * through this helper keeps the opt-in and its rationale in one place.
+ */
+export function askpassGit(baseDir?: string): SimpleGit {
+  return simpleGit({
+    ...(baseDir ? { baseDir } : {}),
+    unsafe: { allowUnsafeAskPass: true },
+  });
+}
+
+/**
+ * Environment variables simple-git's block-unsafe-operations guard (via
+ * `@simple-git/argv-parser`) refuses to let git inherit. Each names a command
+ * git would execute (an editor, pager, external diff, ssh transport, proxy) or
+ * a config/exec path git would load — all injection vectors. If any is present
+ * in the git child env, the guard throws synchronously, before git runs.
+ *
+ * This tool needs NONE of them: it only clones `--no-checkout`, fetches by SHA,
+ * and pushes by refspec — no editor, pager, diff, ssh, or custom config. So we
+ * strip every one rather than opting into the guard. `GIT_ASKPASS` is the lone
+ * guarded var we keep: we set it deliberately to deliver the token (see
+ * {@link writeAskpassHelper}) and opt in via `unsafe.allowUnsafeAskPass` in
+ * {@link askpassGit}. Stripping `GIT_CONFIG_COUNT` also neutralizes any
+ * `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs (git ignores them without
+ * the count). These are commonly set by VS Code, many shells, and GUI sessions
+ * (`EDITOR`, `PAGER`, `SSH_ASKPASS`), so an unstripped one makes every git op
+ * fail instantly.
+ */
+const UNSAFE_GIT_ENV_VARS = [
+  "EDITOR",
+  "GIT_CONFIG",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_COUNT",
+  "GIT_EDITOR",
+  "GIT_EXEC_PATH",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_PAGER",
+  "GIT_PROXY_COMMAND",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_TEMPLATE_DIR",
+  "PAGER",
+  "PREFIX",
+  "SSH_ASKPASS",
+] as const;
+
 /** Build the git child environment that wires up GIT_ASKPASS with the token. */
 export function gitEnv(token: string, askpassPath: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -185,15 +242,11 @@ export function gitEnv(token: string, askpassPath: string): NodeJS.ProcessEnv {
     GIT_TERMINAL_PROMPT: "0",
     [TOKEN_ENV]: token,
   };
-  // `simple-git` refuses to run when GIT_EDITOR / GIT_SEQUENCE_EDITOR are
-  // present in the child environment (a mitigation against editor-based RCE
-  // from a malicious repo). This tool never opens an editor — it only clones
-  // `--no-checkout`, fetches by SHA, and pushes by refspec; no commit, rebase,
-  // or interactive op. So strip both, otherwise an ambient `GIT_EDITOR` (set by
-  // VS Code and many shells) makes every clone fail instantly. We never need an
-  // editor, so removing them is purely defensive.
-  delete env.GIT_EDITOR;
-  delete env.GIT_SEQUENCE_EDITOR;
+  // Strip every guard-flagged var (see UNSAFE_GIT_ENV_VARS) the ambient env may
+  // carry, otherwise simple-git's block-unsafe guard rejects git before it runs.
+  // GIT_ASKPASS, set above, is intentionally NOT in the list — askpassGit() opts
+  // into it.
+  for (const name of UNSAFE_GIT_ENV_VARS) delete env[name];
   return env;
 }
 
@@ -221,7 +274,7 @@ export async function cloneRepo(
   const trace = log.traceOp(`Cloning ${redactedRepoRef(owner, repo)}`);
   const start = Date.now();
   try {
-    await simpleGit()
+    await askpassGit()
       .env(env)
       .clone(repoHttpsUrl(owner, repo), cloneTarget, ["--no-checkout"]);
   } catch {
@@ -233,7 +286,7 @@ export async function cloneRepo(
   log.verboseLine(
     `$ ${cloneDisplayCommand(owner, repo, cloneTarget)}  ${log.formatElapsed(Date.now() - start)}`,
   );
-  return simpleGit(cloneTarget).env(env);
+  return askpassGit(cloneTarget).env(env);
 }
 
 /**
