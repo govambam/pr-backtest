@@ -4,11 +4,11 @@
  * All progress/info/success/warn/error output goes to stderr so that stdout
  * stays reserved for the final PR URL (pipe-friendly).
  *
- * Defense-in-depth: callers may {@link registerSecret} the GitHub token (and any
- * derived form, e.g. a base64 credential header). Every line written here — and
- * via {@link redact} for stdout — has registered secrets replaced with `***`
- * before it leaves the process, so a stray git/API error string can never leak
- * the token even if an upstream path forgets to sanitize it.
+ * Callers {@link registerSecret} the GitHub token as soon as it is resolved.
+ * Every line written here — and via {@link redact} for stdout — has the
+ * registered raw token replaced with `***` before it leaves the process, so a
+ * stray git/API error string can never leak the token even if an upstream path
+ * forgets to sanitize it.
  *
  * On top of the basic level helpers, this module also hosts the live activity
  * trace surface ({@link setVerbose}/{@link isVerbose}, {@link traceOp},
@@ -37,7 +37,7 @@ export function redact(text: string): string {
   let out = text;
   for (const secret of secrets) {
     if (out.includes(secret)) {
-      out = out.split(secret).join("***");
+      out = out.replaceAll(secret, "***");
     }
   }
   return out;
@@ -47,18 +47,10 @@ function write(line: string): void {
   process.stderr.write(redact(line) + "\n");
 }
 
-// ---------------------------------------------------------------------------
-// Live activity trace (verbose / TTY-aware).
-//
-// The trace surface layers real-time operation feedback on top of the stderr
-// logger above. It reuses the same `redact()` net and the same stderr channel —
-// it is NOT a parallel logging stack. Two module-level switches (mirroring the
-// `secrets` Set pattern) control it: a verbose flag and a TTY accessor that
-// defaults to `process.stderr.isTTY` but can be overridden for tests.
-//
-// Call-site rewiring (github.ts / git.ts / index.ts / cli.ts) is intentionally
-// NOT done here — this module only ships the primitives those layers call.
-// ---------------------------------------------------------------------------
+// Live activity trace (verbose / TTY-aware). Two module-level switches control
+// it: a verbose flag and a TTY accessor that defaults to `process.stderr.isTTY`
+// but can be overridden for tests. It reuses the same `redact()` net and stderr
+// channel as the level helpers above.
 
 /** Whether `--verbose` is active. Off by default. */
 let verbose = false;
@@ -99,10 +91,9 @@ function isStderrTty(): boolean {
 }
 
 /**
- * Format an elapsed millisecond count as the spec's `<N>ms` figure (e.g.
- * `142ms`). The single canonical formatter for every trace line — the api-hook
- * (`github.ts`) and git-trace (`git.ts`) layers import this so the `<N>ms`
- * representation (rounded to whole milliseconds) is defined exactly once.
+ * Format an elapsed millisecond count as a `<N>ms` figure (e.g. `142ms`). The
+ * api-hook (`github.ts`) and git-trace (`git.ts`) layers import this so the
+ * `<N>ms` representation (rounded to whole milliseconds) is defined in one place.
  */
 export function formatElapsed(ms: number): string {
   return `${Math.round(ms)}ms`;
@@ -126,9 +117,8 @@ export interface TraceHandle {
   done(detail?: string): void;
   /**
    * Mark the operation failed. Renders a red `✗ <label>` line with elapsed
-   * timing, overwriting the in-progress line on a TTY. Raw child output must
-   * NOT be passed here (INV-NO-RAW-GIT-STDERR); `detail` is a tool-constructed
-   * note only.
+   * timing, overwriting the in-progress line on a TTY. Raw child output (e.g.
+   * git stderr) must NOT be passed here; `detail` is a tool-constructed note only.
    */
   fail(detail?: string): void;
 }

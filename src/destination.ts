@@ -1,7 +1,7 @@
 /**
  * Destination resolution: decide WHERE the simulated PR is written, run the
  * pre-flight write-permission check, and own the read-only guarantee for the
- * source repo (INV-READONLY).
+ * source repo — the source is only ever read.
  *
  * Modeled on `auth.ts:resolveTokenSource(resolvers)` — a pure-ish function with
  * injected getters (parsed flags, config, an Octokit-backed verify/create, an
@@ -10,11 +10,11 @@
  *
  * The resolver only ever verifies/creates/returns the DESTINATION. It never
  * passes the source owner/repo to a verify-of-destination, create, or write
- * call (INV-READONLY). Reading the source happens elsewhere (index.ts).
+ * call. Reading the source happens elsewhere (index.ts).
  *
  * SECURITY: the token is never an argument here. Verification and creation take
- * an Octokit instance through their injected seams, never a raw token
- * (INV-TOKEN). No message in this module ever echoes a token.
+ * an Octokit instance through their injected seams, never a raw token. No
+ * message in this module ever echoes a token.
  */
 import type { Octokit } from "@octokit/rest";
 import prompts from "prompts";
@@ -30,7 +30,7 @@ export interface RepoRef {
   repo: string;
 }
 
-/** The destination flags parsed from the CLI (commander, in feature 5). */
+/** The destination flags parsed from the CLI. */
 export interface DestinationFlags {
   /** `--primary`: land in the PR's own repo. */
   primary?: boolean;
@@ -44,8 +44,8 @@ export interface DestinationFlags {
  * The resolved destination returned to the caller.
  *
  * `isSandbox` is true ONLY when the destination differs from the source. A
- * `--sandbox` value equal to the source resolves with `isSandbox` false (§10
- * item 4 / VAL-DEST-007), equivalent to `--primary`.
+ * `--sandbox` value equal to the source resolves with `isSandbox` false,
+ * equivalent to `--primary`.
  */
 export interface ResolvedDestination {
   owner: string;
@@ -58,7 +58,6 @@ export interface ResolvedDestination {
  * maps this to exit code 1, alongside `NoTokenNonInteractiveError`.
  */
 export class DestinationArgsError extends Error {
-  readonly kind = "destination-args" as const;
   constructor(message: string) {
     super(message);
     this.name = "DestinationArgsError";
@@ -71,7 +70,6 @@ export class DestinationArgsError extends Error {
  * (the API-error class). Never carries a token.
  */
 export class DestinationApiError extends Error {
-  readonly kind = "destination-api" as const;
   constructor(message: string) {
     super(message);
     this.name = "DestinationApiError";
@@ -79,7 +77,7 @@ export class DestinationApiError extends Error {
 }
 
 /**
- * The §6.1 write-permission message. Names the repo and the missing capability
+ * The write-permission message. Names the repo and the missing capability
  * (Contents:write + Pull requests:write), and offers the alternatives. When the
  * FAILING destination is the primary AND a saved sandbox is known writable this
  * run, includes a bracketed clause naming that sandbox as the suggested
@@ -108,7 +106,7 @@ export function writePermissionMessage(
 
 /**
  * The choice-set identities offered by the interactive menu. The real prompt
- * (feature 4) maps these to `prompts` rows; tests assert on the logical set.
+ * maps these to `prompts` rows; tests assert on the logical set.
  */
 export type DestinationChoiceKind =
   | "primary"
@@ -132,19 +130,16 @@ export interface DestinationChoice {
  * - `create-sandbox` requests the creation sub-flow; `repo` carries the
  *   user-edited owner/name the resolver passes to the creator.
  *
- * `remember` is NOT a `DestinationChoiceKind`; it is a separate boolean flag set
- * by the prompt seam to record that a non-primary, non-default destination was
- * saved as the default (the persist sub-flow runs inside the prompt seam).
+ * Remembering a non-primary destination as the default is a side effect of the
+ * prompt seam (it persists directly); it is not carried back on the selection.
  */
 export interface DestinationSelection {
   kind: DestinationChoiceKind;
   repo?: RepoRef;
-  /** Whether this non-primary destination was remembered as the default. */
-  remember?: boolean;
 }
 
 /**
- * The interactive prompt seam — feature 4 (interactive-menu) fills this in.
+ * The interactive prompt seam.
  *
  * It is handed the menu choice set (so it can render rows) and must return the
  * user's {@link DestinationSelection}. The resolver re-invokes it after a failed
@@ -155,13 +150,11 @@ export type DestinationPrompt = (
 ) => Promise<DestinationSelection>;
 
 /**
- * The sandbox-creation seam — feature 3 (sandbox-create) fills this in.
+ * The sandbox-creation seam.
  *
  * Given a requested name and owner (defaulting to the source owner) it creates
  * a PRIVATE repo via the existing Octokit instance and returns the created
- * destination. In THIS feature it is a clearly-injected seam; the default
- * implementation throws so an unwired create path fails loudly rather than
- * silently writing the wrong place.
+ * destination.
  */
 export type SandboxCreator = (request: {
   owner: string;
@@ -178,36 +171,29 @@ export interface DestinationResolvers {
   getIsTTY: () => boolean;
   /** Octokit-backed pre-flight verify of a DESTINATION repo (never the source). */
   verifyDestination: (owner: string, repo: string) => Promise<RepoVerification>;
-  /** Interactive menu seam (feature 4). */
+  /** Interactive menu seam. */
   prompt: DestinationPrompt;
-  /** Sandbox-creation seam (feature 3). */
+  /** Sandbox-creation seam. */
   createSandbox: SandboxCreator;
 }
 
-/** Default create seam: throws until feature 3 (sandbox-create) wires the real creator. */
-export const unimplementedSandboxCreator: SandboxCreator = async () => {
-  throw new DestinationApiError(
-    "Sandbox creation is not available in this build.",
-  );
-};
-
 /**
- * Build the REAL {@link SandboxCreator} backed by an Octokit instance.
+ * Build the real {@link SandboxCreator} backed by an Octokit instance.
  *
- * Creates a PRIVATE repo (INV-PRIVATE) via {@link createPrivateRepo}, which
- * routes personal-account owners to `repos.createForAuthenticatedUser` and org
- * owners to `repos.createInOrg`. The owner defaults to the source owner upstream
- * (the resolver passes it in); this factory does not re-derive it.
+ * Creates a PRIVATE repo via {@link createPrivateRepo}, which routes
+ * personal-account owners to `repos.createForAuthenticatedUser` and org owners
+ * to `repos.createInOrg`. The owner defaults to the source owner upstream (the
+ * resolver passes it in); this factory does not re-derive it.
  *
- * Failure handling (VAL-CREATE-002): a 403 / insufficient-permission from the
- * create call is re-wrapped as a {@link DestinationApiError} naming the owner and
- * the missing permission, so the caller maps it to exit 2 (non-interactive) or
- * re-presents the menu (interactive) — it NEVER falls through to writing the
- * source repo. Other create failures are also surfaced as a `DestinationApiError`
- * (exit 2) rather than leaking a raw Octokit error.
+ * Failure handling: a 403 / insufficient-permission from the create call is
+ * re-wrapped as a {@link DestinationApiError} naming the owner and the missing
+ * permission, so the caller maps it to exit 2 (non-interactive) or re-presents
+ * the menu (interactive) — it NEVER falls through to writing the source repo.
+ * Other create failures are also surfaced as a `DestinationApiError` (exit 2)
+ * rather than leaking a raw Octokit error.
  *
- * SECURITY: takes an `octokit` instance, never a raw token (INV-TOKEN). No
- * message produced here echoes the token.
+ * SECURITY: takes an `octokit` instance, never a raw token. No message produced
+ * here echoes the token.
  */
 export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
   return async (request) => {
@@ -248,17 +234,10 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
   };
 }
 
-/** Default prompt seam: throws until feature 4 (interactive-menu) wires the real prompt. */
-export const unimplementedPrompt: DestinationPrompt = async () => {
-  throw new DestinationArgsError(
-    "Interactive destination selection is not available in this build.",
-  );
-};
-
 /** The default name a fresh sandbox is created under (matches the resolver). */
 const DEFAULT_SANDBOX_NAME = "pr-backtest-sandbox";
 
-/** A human-readable label for a single menu choice (sample wording, §4.1). */
+/** A human-readable label for a single menu choice. */
 function choiceTitle(choice: DestinationChoice): string {
   switch (choice.kind) {
     case "primary":
@@ -285,30 +264,29 @@ export interface InteractivePromptOptions {
 }
 
 /**
- * Build the REAL interactive destination prompt — the implementation feature 5
- * injects as `resolvers.prompt`.
+ * Build the real interactive destination prompt — injected as `resolvers.prompt`.
  *
- * Renders the choice set the resolver passes (VAL-INT-001/002) as a `prompts`
- * select, then runs the per-choice sub-flows:
+ * Renders the choice set the resolver passes as a `prompts` select, then runs
+ * the per-choice sub-flows:
  *
  * - `primary` / `saved-sandbox` → return the choice's repo unchanged.
- * - `different-repo` (VAL-INT-003) → prompt for an `owner/repo` slug, parse it
- *   with {@link parseRepoSlug}, re-prompting on a parse error; return it in
- *   `repo`. Verification stays in the resolver.
+ * - `different-repo` → prompt for an `owner/repo` slug, parse it with
+ *   {@link parseRepoSlug}, re-prompting on a parse error; return it in `repo`.
+ *   Verification stays in the resolver.
  * - `create-sandbox` → let the user edit the owner (default = source owner) and
  *   name (default `pr-backtest-sandbox`). The edited owner/name are returned in
  *   `repo`, and the resolver's `create-sandbox` branch reads `selection.repo`
  *   and passes those values to the creator (falling back to the source owner and
  *   the default name only when the selection carries no repo).
  *
- * Remember-as-default (VAL-INT-003 / §4.1 step 5): because the resolver never
- * reads `selection.remember`, persistence lives HERE. After the user selects a
- * concrete non-primary destination (`different-repo`) that is not already the
- * saved default, we ask once and, on yes, persist via the injected
- * `saveDefault` (defaulting to {@link mergeConfig}). `saved-sandbox` is already
- * the default, so it is never re-offered; `create-sandbox`'s final name is only
- * known after creation in the resolver, so its remember-prompt is out of this
- * seam's reach (documented limitation).
+ * Remember-as-default: persistence lives HERE, as a side effect — the selection
+ * carries no remember flag. After the user selects a concrete non-primary
+ * destination (`different-repo`) that is not already the saved default, we ask
+ * once and, on yes, persist via the injected `saveDefault` (defaulting to
+ * {@link mergeConfig}). `saved-sandbox` is already the default, so it is never
+ * re-offered; `create-sandbox`'s final name is only known after creation in the
+ * resolver, so its remember-prompt is out of this seam's reach (documented
+ * limitation).
  *
  * Mirrors `auth.ts`'s `prompts` usage and its non-TTY guards: with no TTY there
  * is nothing to prompt, so it throws a {@link DestinationArgsError} rather than
@@ -323,8 +301,8 @@ export function makeInteractivePrompt(
 
   return async (choices: DestinationChoice[]): Promise<DestinationSelection> => {
     if (!isTTY()) {
-      // Defensive: the resolver only enters the interactive path on a TTY, but
-      // never hang waiting on stdin if that guarantee is broken.
+      // The resolver only enters the interactive path on a TTY; never hang
+      // waiting on stdin if that guarantee is broken.
       throw new DestinationArgsError(
         "Cannot prompt for a destination: stdin is not a TTY. " +
           "Pass --primary or --sandbox <owner/repo>.",
@@ -360,8 +338,8 @@ export function makeInteractivePrompt(
     if (chosen.kind === "different-repo") {
       const repo = await promptForSlug();
       // Offer to remember it unless it is already the saved default.
-      const remember = await maybeRememberAndPersist(repo, choices, saveDefault);
-      return { kind: chosen.kind, repo, remember };
+      await maybeRememberAndPersist(repo, choices, saveDefault);
+      return { kind: chosen.kind, repo };
     }
 
     // create-sandbox: collect an editable owner/name (advisory — see the doc
@@ -413,7 +391,7 @@ async function promptForCreateTarget(
   // on Ctrl-C, making an abort indistinguishable from accepting the default. We
   // instead surface the default in the message, so a blank Enter falls back to
   // it (below) while a true abort yields `undefined` and is honored — matching
-  // promptForSlug. The default owner is the source owner (spec §5).
+  // promptForSlug. The default owner is the source owner.
   const ownerMessage = defaultOwner
     ? `Owner for the new sandbox (blank for ${defaultOwner}):`
     : "Owner for the new sandbox:";
@@ -458,7 +436,7 @@ async function maybeRememberAndPersist(
 ): Promise<boolean> {
   const saved = choices.find((c) => c.kind === "saved-sandbox")?.repo;
   if (saved && sameRepo(saved, dest)) {
-    // Already the saved default; do not re-offer (§4.1 step 5).
+    // Already the saved default; do not re-offer.
     return false;
   }
   const { remember } = await prompts({
@@ -483,7 +461,7 @@ async function maybeRememberAndPersist(
  * only rethrows OTHER errors. Letting those escape raw would land in cli.ts's
  * generic catch → exit 1, mis-classifying an API failure as bad args. We never
  * echo the underlying error (it could, in theory, carry request detail) — just
- * a fixed, token-free message naming the repo. (VAL-VERIFY: non-404 → exit 2.)
+ * a fixed, token-free message naming the repo (non-404 → exit 2).
  */
 async function verifyDestination(
   verify: DestinationResolvers["verifyDestination"],
@@ -537,14 +515,12 @@ function sameRepo(a: RepoRef, b: RepoRef): boolean {
 /**
  * Resolve the write destination for a simulated PR.
  *
- * Precedence (VAL-DEST-006): flags → interactive(TTY) → saved-default(non-TTY)
- * → bad-args error. `--primary` and `--sandbox` are each honored in the flag
- * tier; passing BOTH throws {@link DestinationArgsError} BEFORE either is
- * honored (VAL-DEST-003).
+ * Precedence: flags → interactive(TTY) → saved-default(non-TTY) → bad-args
+ * error. `--primary` and `--sandbox` are each honored in the flag tier; passing
+ * BOTH throws {@link DestinationArgsError} BEFORE either is honored.
  *
- * Verification (§6) runs AFTER resolution and BEFORE any clone/push/create
- * (VAL-VERIFY-004). It applies to every destination, including the primary
- * (VAL-VERIFY-003).
+ * Verification runs AFTER resolution and BEFORE any clone/push/create. It
+ * applies to every destination, including the primary.
  *
  * @param source the source PR's `owner/repo` (read-only; never written here).
  */
@@ -554,17 +530,16 @@ export async function resolveDestination(
 ): Promise<ResolvedDestination> {
   const flags = resolvers.getFlags();
 
-  // VAL-DEST-003: reject both flags before honoring either.
+  // Reject both flags before honoring either.
   if (flags.primary === true && typeof flags.sandbox === "string") {
     throw new DestinationArgsError(
       "Pass either --primary or --sandbox, not both.",
     );
   }
 
-
   // --- Flag tier (highest precedence) ---
 
-  // --primary → destination = source (VAL-DEST-001). Still verified (VAL-VERIFY-003).
+  // --primary → destination = source. Still verified.
   if (flags.primary === true) {
     await verifyResolved(
       source,
@@ -577,7 +552,7 @@ export async function resolveDestination(
   // --sandbox <owner/repo>
   if (typeof flags.sandbox === "string") {
     const slug = parseSandboxSlug(flags.sandbox);
-    // VAL-DEST-007: --sandbox == source behaves like --primary.
+    // --sandbox == source behaves like --primary.
     if (sameRepo(slug, source)) {
       await verifyResolved(slug, resolvers, null);
       return { owner: source.owner, repo: source.repo, isSandbox: false };
@@ -592,7 +567,7 @@ export async function resolveDestination(
     return resolveInteractive(source, resolvers);
   }
 
-  // Non-interactive, no flag: use the saved default if present (VAL-DEST-005).
+  // Non-interactive, no flag: use the saved default if present.
   const saved = resolvers.getDefaultDestination();
   if (saved) {
     if (sameRepo(saved, source)) {
@@ -603,7 +578,7 @@ export async function resolveDestination(
     return { owner: saved.owner, repo: saved.repo, isSandbox: true };
   }
 
-  // VAL-DEST-004: nothing to resolve, no TTY → bad args naming both flags.
+  // Nothing to resolve, no TTY → bad args naming both flags.
   throw new DestinationArgsError(
     "No destination specified and stdin is not a TTY. " +
       "Pass --primary to land the simulated PR in the source repo, or " +
@@ -626,10 +601,10 @@ async function resolveSandboxFlag(
   );
 
   if (!verification.exists) {
-    // VAL-CREATE-004: missing → create only with --create-sandbox, else exit 2.
+    // Missing → create only with --create-sandbox, else exit 2.
     if (flags.createSandbox === true) {
       // Defaults the owner to the requested slug owner (which itself defaults to
-      // the source owner upstream); the create seam (feature 3) owns the real logic.
+      // the source owner upstream); the create seam owns the real logic.
       const created = await resolvers.createSandbox({
         owner: slug.owner,
         name: slug.repo,
@@ -643,7 +618,7 @@ async function resolveSandboxFlag(
   }
 
   if (!verification.canPush) {
-    // VAL-VERIFY-002: exists but not writable → §6.1 message, never fall back.
+    // Exists but not writable → write-permission message, never fall back.
     throw new DestinationApiError(writePermissionMessage(slug, null));
   }
 
@@ -656,8 +631,8 @@ async function resolveSandboxFlag(
  * paths, where there is no create-if-missing branch.
  *
  * @param dest the destination to verify (NEVER the source unless dest IS source).
- * @param writableAlt a sandbox known writable this run, named in the §6.1 message
- *        when the failing destination is the primary (VAL-VERIFY-005).
+ * @param writableAlt a sandbox known writable this run, named in the
+ *        write-permission message when the failing destination is the primary.
  */
 async function verifyResolved(
   dest: RepoRef,
@@ -671,8 +646,8 @@ async function verifyResolved(
   );
 
   if (!verification.exists) {
-    // VAL-VERIFY-001 (non-interactive saved-default 404) and the primary case:
-    // never fall back to another repo.
+    // Non-interactive saved-default 404 and the primary case: never fall back
+    // to another repo.
     throw new DestinationApiError(
       `Destination ${dest.owner}/${dest.repo} was not found ` +
         "(it may have been deleted, made private, or the token cannot see it).",
@@ -680,21 +655,20 @@ async function verifyResolved(
   }
 
   if (!verification.canPush) {
-    // VAL-VERIFY-002/003: §6.1 write-permission message; never fall back.
+    // Write-permission message; never fall back.
     throw new DestinationApiError(writePermissionMessage(dest, writableAlt));
   }
 }
 
 /**
- * The saved sandbox, if it is a candidate writable alternative for the §6.1
- * message when the PRIMARY destination fails. We only name it as a suggested
- * alternative; the resolver does not pre-verify it (that would be a second
- * network call against a repo the user did not choose). Returns null when no
- * saved sandbox exists or it equals the source.
+ * The saved sandbox, if it is a candidate writable alternative for the
+ * write-permission message when the PRIMARY destination fails. We only name it
+ * as a suggested alternative; the resolver does not pre-verify it (that would be
+ * a second network call against a repo the user did not choose). Returns null
+ * when no saved sandbox exists or it equals the source.
  *
- * NOTE: per VAL-VERIFY-005 the bracketed clause is included "when a saved
- * sandbox is known writable this run". A saved default carried into the run is
- * the known-writable candidate; index.ts (feature 5) may pass a verified one.
+ * The bracketed clause is included when a saved sandbox is known writable this
+ * run. A saved default carried into the run is the known-writable candidate.
  */
 function savedSandboxAlternative(
   source: RepoRef,
@@ -718,8 +692,8 @@ async function resolveInteractive(
 ): Promise<ResolvedDestination> {
   const saved = resolvers.getDefaultDestination();
 
-  // Build the choice set (VAL-INT-001/002): a saved-sandbox row when a default
-  // exists, otherwise a create-sandbox row; always primary + different-repo.
+  // Build the choice set: a saved-sandbox row when a default exists, otherwise a
+  // create-sandbox row; always primary + different-repo.
   const choices: DestinationChoice[] = [
     { kind: "primary", repo: { owner: source.owner, repo: source.repo } },
   ];
@@ -733,6 +707,32 @@ async function resolveInteractive(
   }
   choices.push({ kind: "different-repo" });
 
+  /**
+   * Verify one chosen destination, emitting the failure reason and signalling a
+   * re-prompt (null) on a 404 / not-writable result. A non-null return is the
+   * resolved destination. `writableAlt` is named in the write-permission message
+   * (only the primary path supplies one). Re-present on failure, never fall back.
+   */
+  async function verifyOrReprompt(
+    dest: RepoRef,
+    writableAlt: RepoRef | null,
+  ): Promise<ResolvedDestination | null> {
+    const ver = await verifyDestination(
+      resolvers.verifyDestination,
+      dest.owner,
+      dest.repo,
+    );
+    if (!ver.exists || !ver.canPush) {
+      emitWriteFailure(dest, writableAlt, ver.exists);
+      return null;
+    }
+    return {
+      owner: dest.owner,
+      repo: dest.repo,
+      isSandbox: !sameRepo(dest, source),
+    };
+  }
+
   // Re-present the menu until a destination verifies (or a creator/prompt throws).
   // The loop is the interactive analogue of the non-interactive exit-2 throw.
   // eslint-disable-next-line no-constant-condition
@@ -740,34 +740,23 @@ async function resolveInteractive(
     const selection = await resolvers.prompt(choices);
 
     if (selection.kind === "primary") {
-      const ver = await verifyDestination(
-        resolvers.verifyDestination,
-        source.owner,
-        source.repo,
+      const resolved = await verifyOrReprompt(
+        { owner: source.owner, repo: source.repo },
+        savedSandboxAlternative(source, resolvers),
       );
-      if (!ver.exists || !ver.canPush) {
-        // VAL-VERIFY-003: §6.1 message (with saved-sandbox alternative if known),
-        // then re-present the menu rather than proceeding.
-        emitWriteFailure(
-          { owner: source.owner, repo: source.repo },
-          savedSandboxAlternative(source, resolvers),
-          ver.exists,
-        );
-        continue;
-      }
-      return { owner: source.owner, repo: source.repo, isSandbox: false };
+      if (!resolved) continue;
+      return resolved;
     }
 
     if (selection.kind === "create-sandbox") {
-      // Feature 3's creator owns name/owner prompting; default owner is the source.
-      // VAL-CREATE-002 (interactive): a creation failure (e.g. a 403 because the
-      // source owner is an org the token cannot create repos in) surfaces its
-      // message and re-presents the menu — it NEVER falls through to writing the
-      // source repo.
+      // The creator owns name/owner prompting; default owner is the source. A
+      // creation failure (e.g. a 403 because the source owner is an org the
+      // token cannot create repos in) surfaces its message and re-presents the
+      // menu — it NEVER falls through to writing the source repo.
       let created: RepoRef;
       try {
-        // Honor an edited owner/name from the prompt (§5 intent); fall back to
-        // the source owner + default name when the selection carries no repo.
+        // Honor an edited owner/name from the prompt; fall back to the source
+        // owner + default name when the selection carries no repo.
         created = await resolvers.createSandbox({
           owner: selection.repo?.owner ?? source.owner,
           name: selection.repo?.repo ?? DEFAULT_SANDBOX_NAME,
@@ -788,41 +777,26 @@ async function resolveInteractive(
     // saved-sandbox or different-repo: a concrete destination to verify.
     const dest = selection.repo;
     if (!dest) {
-      // Defensive: a prompt that returns no repo for these kinds is a bug, not
-      // a reason to fall back to the source.
+      // A prompt that returns no repo for these kinds is a bug, not a reason to
+      // fall back to the source.
       throw new DestinationApiError(
         "Interactive selection returned no destination repository.",
       );
     }
-    // The verify-then-emit logic is identical whether or not the chosen repo
-    // equals the source; only the resulting `isSandbox` differs, which
-    // `sameRepo` already decides. VAL-VERIFY-001/002: re-present on failure,
-    // never fall back.
-    const ver = await verifyDestination(
-      resolvers.verifyDestination,
-      dest.owner,
-      dest.repo,
-    );
-    if (!ver.exists || !ver.canPush) {
-      emitWriteFailure(dest, null, ver.exists);
-      continue;
-    }
-    return {
-      owner: dest.owner,
-      repo: dest.repo,
-      isSandbox: !sameRepo(dest, source),
-    };
+    const resolved = await verifyOrReprompt(dest, null);
+    if (!resolved) continue;
+    return resolved;
   }
 }
 
 /**
  * Surface a failed-verification reason to the user before re-presenting the
  * interactive menu. Kept tiny and side-effect-light (it only computes the
- * message); index.ts/feature 4 may wire richer logging, but the §6.1 text is
- * produced here so it is consistent with the non-interactive path.
+ * message); the write-permission text is produced here so it is consistent with
+ * the non-interactive path.
  *
- * NOTE: emitting goes through the shared logger so registered secrets are
- * scrubbed; for a missing repo we use a plain not-found note.
+ * Emitting goes through the shared logger so registered secrets are scrubbed;
+ * for a missing repo we use a plain not-found note.
  */
 function emitWriteFailure(
   dest: RepoRef,

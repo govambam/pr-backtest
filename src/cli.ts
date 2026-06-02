@@ -11,7 +11,7 @@ import { Command } from "commander";
 
 import { deleteConfig } from "./config.js";
 import { runBacktest } from "./index.js";
-import { success } from "./log.js";
+import { redact, success } from "./log.js";
 
 /** Read the package version from package.json (single source of truth). */
 function packageVersion(): string {
@@ -95,9 +95,11 @@ program
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   // runBacktest owns all expected exit codes via process.exit; reaching here
-  // means an unexpected throw. Fail with a generic code-1 error.
+  // means an unexpected throw. Fail with a generic code-1 error. The message
+  // goes through redact() so a registered token can never escape via an
+  // unexpected error, the same net every other output path uses.
   process.stderr.write(
-    (err instanceof Error ? err.message : String(err)) + "\n",
+    redact(err instanceof Error ? err.message : String(err)) + "\n",
   );
   process.exit(1);
 });

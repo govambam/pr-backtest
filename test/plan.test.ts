@@ -47,7 +47,7 @@ test("confirmPlan resolves true without prompting when yes is set", async () => 
   assert.equal(result, true);
 });
 
-// --- Destination read/write split (§8) ---------------------------------------
+// --- Destination read/write split ---
 
 test("dest == source: source is NOT tagged read-only, one repo for read+write", () => {
   // No targetRepo and an explicit equal targetRepo both mean destination == source.

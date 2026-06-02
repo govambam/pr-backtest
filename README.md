@@ -6,6 +6,10 @@ Recreate a GitHub pull request at a chosen commit, so a PR-review bot can review
 
 **Security:** pr-backtest only ever talks to GitHub — `api.github.com` and `github.com`, nothing else. No telemetry, no analytics, no third-party calls. Your token stays on your machine (read from `GITHUB_TOKEN` / `gh`, or saved locally with `0600` permissions) and is never sent anywhere except GitHub.
 
+## Requirements
+
+Node.js `>=18`.
+
 ## Install
 
 ```bash
@@ -13,6 +17,17 @@ npm install -g pr-backtest
 # or run it without installing:
 npx pr-backtest <pr-url>
 ```
+
+## Setup
+
+There is no separate setup step. The first time you run `pr-backtest <pr-url>` in an interactive terminal, it resolves a GitHub token in this order:
+
+1. **`GITHUB_TOKEN`** — if set, it is used and nothing is saved. This is the path for CI and scripting (non-interactive runs require it).
+2. **Saved config** — a token you saved on a previous run (`~/.config/pr-backtest/config.json`, mode `0600`).
+3. **`gh` CLI** — if you already use the [GitHub CLI](https://cli.github.com) and are logged in, pr-backtest offers to reuse that login, so you don't have to create a token at all.
+4. **Paste a token** — otherwise it prompts you to paste one (input is masked) and offers to save it for next time.
+
+So if you already have `gh` authed or `GITHUB_TOKEN` exported, you're ready with zero token setup. Otherwise, create a fine-grained token with the permissions in [Recommendations](#recommendations). Run `pr-backtest logout` to clear a saved token (and any saved default destination).
 
 ## Usage
 
@@ -34,12 +49,24 @@ pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sa
 
 # Create that sandbox first if it doesn't exist yet (private)
 pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox --create-sandbox
+
+# Remove the saved token and default destination
+pr-backtest logout
 ```
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `pr-backtest <pr-url> [options]` | Recreate the PR at a chosen commit and open a backtest PR. |
+| `pr-backtest logout` | Delete the saved config (GitHub token and any saved default destination). |
 
 On first run it prompts for a GitHub token (and offers to reuse your `gh` CLI login if you have one). The new PR's URL is printed to stdout. Run `pr-backtest logout` to remove a saved token (this also deletes the saved default destination — see [Destination](#destination)).
 
+Running against a **Primary** destination (the PR's own repo) prints a plan like this:
+
 ```
-$ pr-backtest https://github.com/acme/api/pull/123
+$ pr-backtest https://github.com/acme/api/pull/123 --primary
 
 PR:      acme/api#123 "Add retry logic to webhook handler" by @stevem
 Target:  a1b2c3d (initial commit)
@@ -48,13 +75,35 @@ Base:    f0e9d8c (parent of target)
 Plan:
   1. Clone acme/api into a temp directory
   2. Fetch commits a1b2c3d and f0e9d8c from origin
-  3. Push f0e9d8c → backtest-pr123-base
-  4. Push a1b2c3d → backtest-pr123-head
-  5. Open PR: backtest-pr123-head → backtest-pr123-base
+  3. Push f0e9d8c → acme/api:backtest-pr123-base
+  4. Push a1b2c3d → acme/api:backtest-pr123-head
+  5. Open PR in acme/api: backtest-pr123-head → backtest-pr123-base
 
 Continue? [y/N] y
 
 https://github.com/acme/api/pull/451
+```
+
+A **Sandbox** destination reads the PR from its own repo but writes everything to the repo you choose. The source is tagged `(read-only)` and the write target is named on an `Into:` line:
+
+```
+$ pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox
+
+PR:      acme/api#123 "Add retry logic to webhook handler" by @stevem   (read-only — source is never written)
+Target:  a1b2c3d (initial commit)
+Base:    f0e9d8c (parent of target)
+Into:    myuser/pr-backtest-sandbox (sandbox — branches and PR are created here)
+
+Plan:
+  1. Clone myuser/pr-backtest-sandbox into a temp directory
+  2. Fetch commits a1b2c3d and f0e9d8c from source (acme/api)
+  3. Push f0e9d8c → myuser/pr-backtest-sandbox:backtest-pr123-base
+  4. Push a1b2c3d → myuser/pr-backtest-sandbox:backtest-pr123-head
+  5. Open PR in myuser/pr-backtest-sandbox: backtest-pr123-head → backtest-pr123-base
+
+Continue? [y/N] y
+
+https://github.com/myuser/pr-backtest-sandbox/pull/12
 ```
 
 ## Destination
@@ -84,17 +133,20 @@ When you run without a destination flag in a terminal, pr-backtest asks once whe
 
 pr-backtest shows you what it is doing as it does it. The whole point is trust: you can watch that it only ever **reads** the source PR, only **writes** the destination you chose, and only ever talks to `api.github.com`.
 
-**Default view.** Each operation prints a friendly `✓` completion marker as it finishes:
+**Default view.** Each operation prints a friendly `✓` completion marker as it finishes (a sandbox run, which also shows the `source` remote step):
 
 ```
 ✓ Authenticated as @octocat
-✓ Read PR acme/api#123  "Add retry to fetch"
-✓ Verified destination octocat/pr-backtest-sandbox  github.com/octocat/pr-backtest-sandbox
+✓ Verified destination  github.com/octocat/pr-backtest-sandbox
+✓ Read PR github.com/acme/api#123  "Add retry logic to webhook handler"
 ✓ Cloning github.com/octocat/pr-backtest-sandbox
-✓ Fetching 9f3c1a2 from source
-✓ Pushing 9f3c1a2 → backtest-pr123-base
+✓ Adding source remote github.com/acme/api
+✓ Fetching f0e9d8c from source
+✓ Fetching a1b2c3d from source
+✓ Pushing f0e9d8c → backtest-pr123-base
 ✓ Pushing a1b2c3d → backtest-pr123-head
 ✓ Opened backtest PR
+✓ Backtest PR created.
 ```
 
 On a terminal, a slow step (clone/fetch/push) first shows an in-progress line that is replaced in place by its completion line; piped to a file, only the completion line is written. All of this goes to **stderr** — stdout stays exactly the final PR URL, so `pr-backtest … | pbcopy` still works.
@@ -106,12 +158,17 @@ pr-backtest https://github.com/acme/api/pull/123 --verbose
 ```
 
 ```
-  → GET   /repos/acme/api/pulls/123                          200  142ms
-  $ git clone --no-checkout https://x-access-token@github.com/octocat/pr-backtest-sandbox.git <tmp>/repo   1.1s
-  $ git fetch source 9f3c1a2                                 312ms
-  $ git push origin 9f3c1a2:refs/heads/backtest-pr123-base   640ms
-  → POST  /repos/octocat/pr-backtest-sandbox/pulls           201  301ms
+→ GET   /repos/acme/api/pulls/123  200  142ms
+$ git clone --no-checkout https://x-access-token@github.com/octocat/pr-backtest-sandbox.git <tmp>/repo  1100ms
+$ git remote add source https://x-access-token@github.com/acme/api.git  18ms
+$ git fetch source f0e9d8c  312ms
+$ git fetch source a1b2c3d  298ms
+$ git push origin f0e9d8c:refs/heads/backtest-pr123-base  640ms
+$ git push origin a1b2c3d:refs/heads/backtest-pr123-head  635ms
+→ POST  /repos/octocat/pr-backtest-sandbox/pulls  201  301ms
 ```
+
+Each git command shows the real argv (the token never appears — see below); each API line shows method, path, status, and elapsed time. Elapsed times are always rendered in whole milliseconds.
 
 `--verbose` is off by default and has no short alias (`-v` is `--version`).
 
@@ -135,6 +192,26 @@ A token like this can't reach your other repos or touch org settings. For `--cre
 - **WRITE** on the destination repo (Contents + Pull requests).
 
 A token scoped to only the sandbox can't read a private source PR; a token scoped to only the source can't write the sandbox. If the source repo is **public**, read access is implicit and a token with write on the sandbox is enough. For a **Primary** destination, one repo's worth of access (read + write on the source) is all you need.
+
+## Exit codes
+
+The tool exits with a stable code so it can be wired into CI:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success, or the user declined the confirmation prompt (no changes made). |
+| `1` | Bad args — invalid PR URL, invalid `--commit`, both `--primary` and `--sandbox`, or no token in a non-interactive run. |
+| `2` | GitHub API error — PR not found, auth rejected, or the destination is missing / not writable. |
+| `3` | A git operation failed (clone / fetch / push). |
+| `4` | A backtest PR already exists for the planned branches. The existing PR's URL is printed to stdout — a useful CI signal. |
+
+Because exit `4` prints the existing PR's URL to stdout, a re-run is idempotent: a script can treat exit `0` and exit `4` alike and read the PR URL from stdout in both cases.
+
+## Limitations
+
+- **Deleted or unreachable commits.** If the target or base commit can no longer be fetched — the commit was deleted (an old force-push, a repo transfer/delete), the PR came from a fork whose owner deleted their branch, or your token can't read the commit — the run fails (exit `3`) with the two manual `git push` lines you can use to recreate the branches yourself.
+- **No diff between the two commits.** If the target commit and its parent produce no difference, GitHub rejects the empty PR (422) and the tool exits `2` rather than opening a no-op PR.
+- **PRs with more than 250 commits.** The GitHub API lists only the first 250 commits of a PR. For a PR larger than that, `--commit initial` still works (the first commit is always listed), but a `--commit <sha>` pointing at a commit in the unlisted tail is reported as not matching any commit in the PR; push that commit as a branch manually instead.
 
 ## License
 

@@ -1,10 +1,10 @@
 /**
- * Gated end-to-end integration test (SPEC §8, VAL-TEST-003).
+ * Gated end-to-end integration test.
  *
  * WHAT THIS DOES
  * --------------
  * When `GITHUB_TOKEN` is set, this test drives the built CLI end-to-end against
- * a public fixture PR and asserts the three SPEC §8 properties:
+ * a public fixture PR and asserts three properties:
  *   1. The created PR's diff matches the target commit's diff.
  *   2. The pushed branches are named `backtest-pr<N>-base` / `backtest-pr<N>-head`.
  *   3. Cleanup happened — no leftover `/tmp/pr-backtest-*` directory remains.
@@ -16,7 +16,7 @@
  * GATING
  * ------
  * The whole test is SKIPPED unless `GITHUB_TOKEN` is set, so `npm test` stays
- * green for contributors with no token (the validator cannot supply one).
+ * green for contributors with no token.
  * Running it for real requires a token with PUSH access to the fixture repo —
  * it pushes branches and opens a PR. Point it at your own repo via the
  * `TEST_FIXTURE_REPO` env var; do NOT run it against a repo you don't control.
@@ -65,8 +65,7 @@ test(
   "end-to-end: backtest a fixture PR, matching diff/branches and cleaning up",
   { skip: SKIP },
   async () => {
-    // Sanity: GITHUB_TOKEN must be present for this branch (the literal is here
-    // both for the gate and so the validator's grep finds it).
+    // Sanity: GITHUB_TOKEN must be present for this branch.
     assert.ok(process.env.GITHUB_TOKEN, "GITHUB_TOKEN must be set to run this test");
 
     const { owner, repo, number } = parseUrl(FIXTURE_PR);
@@ -97,7 +96,7 @@ test(
     const prUrl = lines[lines.length - 1];
     assert.match(prUrl, /\/pull\/\d+$/, "final stdout line should be the created PR URL");
 
-    // 2. Branch names follow the SPEC §3 convention.
+    // 2. Branch names follow the backtest-pr<N>-{head,base} convention.
     const headBranch = `backtest-pr${number}-head`;
     const baseBranch = `backtest-pr${number}-base`;
     const createdNumber = Number(prUrl.split("/").pop());

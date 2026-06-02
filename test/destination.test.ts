@@ -12,8 +12,6 @@ import {
   DestinationArgsError,
   DestinationApiError,
   writePermissionMessage,
-  unimplementedSandboxCreator,
-  unimplementedPrompt,
   type DestinationResolvers,
   type DestinationFlags,
   type DestinationChoice,
@@ -87,16 +85,14 @@ function assertSourceNeverWritten(calls: RecordedCall[]): void {
   }
 }
 
-// --- VAL-DEST-001 ---
-test("VAL-DEST-001: --primary resolves to source, no prompt, isSandbox false", async () => {
+test("--primary resolves to source, no prompt, isSandbox false", async () => {
   const h = makeHarness({ flags: { primary: true } });
   const result = await resolveDestination(SOURCE, h.resolvers);
   assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
   assert.ok(!h.calls.some((c) => c.fn === "prompt"));
 });
 
-// --- VAL-DEST-002 ---
-test("VAL-DEST-002: --sandbox existing+writable resolves to that repo, no prompt", async () => {
+test("--sandbox existing+writable resolves to that repo, no prompt", async () => {
   const h = makeHarness({
     flags: { sandbox: "me/sandbox" },
     verify: () => ({ exists: true, canPush: true }),
@@ -106,8 +102,7 @@ test("VAL-DEST-002: --sandbox existing+writable resolves to that repo, no prompt
   assert.ok(!h.calls.some((c) => c.fn === "prompt"));
 });
 
-// --- VAL-DEST-003 ---
-test("VAL-DEST-003: --primary + --sandbox throws bad-args before any verify/create", async () => {
+test("--primary + --sandbox throws bad-args before any verify/create", async () => {
   const h = makeHarness({ flags: { primary: true, sandbox: "me/sandbox" } });
   await assert.rejects(
     () => resolveDestination(SOURCE, h.resolvers),
@@ -116,8 +111,7 @@ test("VAL-DEST-003: --primary + --sandbox throws bad-args before any verify/crea
   assert.equal(h.calls.length, 0, "no verify/create/prompt before bad-args");
 });
 
-// --- VAL-DEST-004 ---
-test("VAL-DEST-004: non-interactive, no flag, no saved default → bad-args naming both flags", async () => {
+test("non-interactive, no flag, no saved default → bad-args naming both flags", async () => {
   const h = makeHarness({ isTTY: false });
   await assert.rejects(
     () => resolveDestination(SOURCE, h.resolvers),
@@ -131,8 +125,7 @@ test("VAL-DEST-004: non-interactive, no flag, no saved default → bad-args nami
   assert.equal(h.calls.length, 0, "no verify/write fake invoked");
 });
 
-// --- VAL-DEST-005 ---
-test("VAL-DEST-005: non-interactive, no flag, saved default → returns saved (after verify), no prompt", async () => {
+test("non-interactive, no flag, saved default → returns saved (after verify), no prompt", async () => {
   const h = makeHarness({
     isTTY: false,
     saved: { owner: "me", repo: "sandbox" },
@@ -145,8 +138,7 @@ test("VAL-DEST-005: non-interactive, no flag, saved default → returns saved (a
   assert.deepEqual(h.calls.find((c) => c.fn === "verify")?.args, ["me", "sandbox"]);
 });
 
-// --- VAL-DEST-006 ---
-test("VAL-DEST-006: precedence flags → interactive(TTY) → saved-default(non-TTY) → error", async () => {
+test("precedence flags → interactive(TTY) → saved-default(non-TTY) → error", async () => {
   // (1) flag wins over config + TTY: --primary with a saved default + TTY still ignores both.
   {
     const h = makeHarness({
@@ -193,8 +185,7 @@ test("VAL-DEST-006: precedence flags → interactive(TTY) → saved-default(non-
   }
 });
 
-// --- VAL-DEST-007 ---
-test("VAL-DEST-007: --sandbox equal to source resolves as destination==source, isSandbox false", async () => {
+test("--sandbox equal to source resolves as destination==source, isSandbox false", async () => {
   const h = makeHarness({
     flags: { sandbox: "acme/api" },
     verify: () => ({ exists: true, canPush: true }),
@@ -204,8 +195,7 @@ test("VAL-DEST-007: --sandbox equal to source resolves as destination==source, i
   assert.ok(!h.calls.some((c) => c.fn === "prompt"));
 });
 
-// --- VAL-DEST-007 (case-insensitive) ---
-test("VAL-DEST-007: --sandbox with different case than source resolves as primary (isSandbox false)", async () => {
+test("--sandbox with different case than source resolves as primary (isSandbox false)", async () => {
   // Mixed-case owner AND repo vs the lowercase source acme/api.
   const h = makeHarness({
     flags: { sandbox: "Acme/API" },
@@ -286,8 +276,7 @@ test("--create-sandbox alone (no --sandbox, non-TTY, no default) → bad-args, n
   );
 });
 
-// --- VAL-VERIFY-001 ---
-test("VAL-VERIFY-001: saved default 404 — non-interactive throws exit-2, interactive re-prompts", async () => {
+test("saved default 404 — non-interactive throws exit-2, interactive re-prompts", async () => {
   // Non-interactive branch.
   {
     const h = makeHarness({
@@ -321,9 +310,8 @@ test("VAL-VERIFY-001: saved default 404 — non-interactive throws exit-2, inter
   }
 });
 
-// --- VAL-VERIFY-002 ---
-test("VAL-VERIFY-002: non-primary exists-but-not-writable — §6.1 message, non-interactive exit-2 / interactive re-prompt", async () => {
-  // Non-interactive: exit-2 with §6.1 message naming repo + capability.
+test("non-primary exists-but-not-writable — write-permission message, non-interactive exit-2 / interactive re-prompt", async () => {
+  // Non-interactive: exit-2 with write-permission message naming repo + capability.
   {
     const h = makeHarness({
       flags: { sandbox: "me/ro" },
@@ -359,9 +347,8 @@ test("VAL-VERIFY-002: non-primary exists-but-not-writable — §6.1 message, non
   }
 });
 
-// --- VAL-VERIFY-003 ---
-test("VAL-VERIFY-003: primary not writable — §6.1 message before clone, non-interactive exit-2 / interactive re-prompt", async () => {
-  // Non-interactive (--primary): exit-2 with §6.1 message, no clone/push.
+test("primary not writable — write-permission message before clone, non-interactive exit-2 / interactive re-prompt", async () => {
+  // Non-interactive (--primary): exit-2 with write-permission message, no clone/push.
   {
     const h = makeHarness({
       flags: { primary: true },
@@ -396,12 +383,11 @@ test("VAL-VERIFY-003: primary not writable — §6.1 message before clone, non-i
   }
 });
 
-// --- VAL-VERIFY-004 ---
 // The resolver never clones/pushes (that is index.ts's job), so the earlier
 // version of this test could never fail: `firstWrite` was always -1. We make it
 // non-vacuous by driving the create-if-missing path — `create` IS a write the
 // resolver performs — and asserting a verify is recorded strictly before it.
-test("VAL-VERIFY-004: verify runs before the create write (non-vacuous call order)", async () => {
+test("verify runs before the create write (non-vacuous call order)", async () => {
   const h = makeHarness({
     flags: { sandbox: "me/new", createSandbox: true },
     // Report missing so the resolver proceeds to create.
@@ -415,12 +401,11 @@ test("VAL-VERIFY-004: verify runs before the create write (non-vacuous call orde
   assert.ok(firstCreate >= 0, "a create write was recorded (assertion is live)");
   assert.ok(
     firstVerify < firstCreate,
-    "verify must precede the create write (VAL-VERIFY-004)",
+    "verify must precede the create write",
   );
 });
 
-// --- VAL-VERIFY-005 ---
-test("VAL-VERIFY-005: primary fails + saved writable sandbox known → §6.1 names it; otherwise omitted", async () => {
+test("primary fails + saved writable sandbox known → names it; otherwise omitted", async () => {
   // With a saved sandbox: bracketed clause names it.
   {
     const msg = writePermissionMessage(SOURCE, { owner: "me", repo: "sandbox" });
@@ -451,8 +436,7 @@ test("VAL-VERIFY-005: primary fails + saved writable sandbox known → §6.1 nam
   }
 });
 
-// --- VAL-INV-001 ---
-test("VAL-INV-001: destination ≠ source → source never an arg to verify/create/write", async () => {
+test("destination ≠ source → source never an arg to verify/create/write", async () => {
   const h = makeHarness({
     flags: { sandbox: "me/sandbox" },
     verify: () => ({ exists: true, canPush: true }),
@@ -462,8 +446,8 @@ test("VAL-INV-001: destination ≠ source → source never an arg to verify/crea
   assertSourceNeverWritten(h.calls);
 });
 
-// --- Create paths (supporting feature 3 seam) ---
-test("VAL-CREATE-004 (resolver half): --sandbox X --create-sandbox creates missing X; missing X alone exits 2", async () => {
+// --- Create paths (supporting the create seam) ---
+test("--sandbox X --create-sandbox creates missing X; missing X alone exits 2", async () => {
   // With --create-sandbox: missing → create + use.
   {
     const h = makeHarness({
@@ -544,8 +528,7 @@ function makeFakeOctokit(opts: {
   return { octokit: fake as unknown as Octokit, calls };
 }
 
-// --- VAL-CREATE-001 ---
-test("VAL-CREATE-001: personal-account owner → createForAuthenticatedUser, private", async () => {
+test("personal-account owner → createForAuthenticatedUser, private", async () => {
   const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
   const create = makeSandboxCreator(octokit);
   const result = await create({ owner: "me", name: "pr-backtest-sandbox" });
@@ -566,7 +549,7 @@ test("VAL-CREATE-001: personal-account owner → createForAuthenticatedUser, pri
   assert.equal(args.auto_init, true, "repo auto-initialized");
 });
 
-test("VAL-CREATE-001: org owner → createInOrg, private, owner defaults to source owner", async () => {
+test("org owner → createInOrg, private, owner defaults to source owner", async () => {
   // authed login differs from the requested (source) owner → org route.
   const { octokit, calls } = makeFakeOctokit({ authedLogin: "personal-me" });
   const create = makeSandboxCreator(octokit);
@@ -590,8 +573,7 @@ test("VAL-CREATE-001: org owner → createInOrg, private, owner defaults to sour
   assert.equal(args.auto_init, true, "repo auto-initialized");
 });
 
-// --- VAL-CREATE-002 (creator half) ---
-test("VAL-CREATE-002: 403 from create → DestinationApiError naming owner + permission, never writes source", async () => {
+test("403 from create → DestinationApiError naming owner + permission, never writes source", async () => {
   const { octokit, calls } = makeFakeOctokit({
     authedLogin: "personal-me",
     failStatus: 403,
@@ -617,8 +599,7 @@ test("VAL-CREATE-002: 403 from create → DestinationApiError naming owner + per
   );
 });
 
-// --- VAL-CREATE-002 (both branches through the resolver) ---
-test("VAL-CREATE-002: 403 — non-interactive exits 2; interactive re-prompts", async () => {
+test("403 — non-interactive exits 2; interactive re-prompts", async () => {
   const failingCreate = makeSandboxCreator(
     makeFakeOctokit({ authedLogin: "personal-me", failStatus: 403 }).octokit,
   );
@@ -685,8 +666,7 @@ test("VAL-CREATE-002: 403 — non-interactive exits 2; interactive re-prompts", 
   }
 });
 
-// --- VAL-INV-002 (token safety on the create path) ---
-test("VAL-INV-002: creation wrapper receives octokit, never a token; no token in args", async () => {
+test("creation wrapper receives octokit, never a token; no token in args", async () => {
   // makeSandboxCreator's parameter is an Octokit instance, not a string token.
   // We pass a fake octokit; the request carries only owner + name (no token).
   const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
@@ -706,21 +686,8 @@ test("VAL-INV-002: creation wrapper receives octokit, never a token; no token in
   ]);
 });
 
-test("default seams throw clearly (create + prompt)", async () => {
-  await assert.rejects(
-    () => unimplementedSandboxCreator({ owner: "a", name: "b" }),
-    (err: unknown) => err instanceof DestinationApiError,
-  );
-  await assert.rejects(
-    () => unimplementedPrompt([]),
-    (err: unknown) => err instanceof DestinationArgsError,
-  );
-});
-
-// =====================================================================
-// Interactive prompt (feature: interactive-menu) — the REAL prompts impl.
+// Interactive prompt — the real prompts impl.
 // `prompts.inject([...])` feeds scripted answers, so these run with no TTY.
-// =====================================================================
 
 /** Point config at a fresh temp dir via XDG_CONFIG_HOME and return it. */
 function useTempConfigHome(): string {
@@ -751,8 +718,7 @@ function makeTestPrompt(saved?: { saved: SavedDestination[] }) {
   });
 }
 
-// --- VAL-INT-001 ---
-test("VAL-INT-001: saved-default menu — picking saved-sandbox returns that kind + repo", async () => {
+test("saved-default menu — picking saved-sandbox returns that kind + repo", async () => {
   prompts.inject(["saved-sandbox"]);
   const prompt = makeTestPrompt();
   const sel = await prompt(SAVED_CHOICES);
@@ -761,8 +727,7 @@ test("VAL-INT-001: saved-default menu — picking saved-sandbox returns that kin
   // saved-sandbox is already the default: no remember prompt fired (no extra inject consumed).
 });
 
-// --- VAL-INT-002 ---
-test("VAL-INT-002: no-default menu — picking create returns create-sandbox kind", async () => {
+test("no-default menu — picking create returns create-sandbox kind", async () => {
   // select create-sandbox; then owner + name sub-prompts (accept defaults via "").
   prompts.inject(["create-sandbox", "", ""]);
   const prompt = makeTestPrompt();
@@ -772,7 +737,6 @@ test("VAL-INT-002: no-default menu — picking create returns create-sandbox kin
   assert.deepEqual(sel.repo, { owner: "acme", repo: "pr-backtest-sandbox" });
 });
 
-// --- VAL-INT-002 (primary row still selectable) ---
 test("interactive: picking primary returns primary kind + the source repo", async () => {
   prompts.inject(["primary"]);
   const prompt = makeTestPrompt();
@@ -780,19 +744,18 @@ test("interactive: picking primary returns primary kind + the source repo", asyn
   assert.deepEqual(sel, { kind: "primary", repo: { owner: "acme", repo: "api" } });
 });
 
-// --- VAL-INT-003: different-repo collects + parses a slug ---
-test("VAL-INT-003: different-repo prompts for a slug, parses it, returns it in repo", async () => {
+// --- different-repo collects + parses a slug ---
+test("different-repo prompts for a slug, parses it, returns it in repo", async () => {
   // select different-repo; enter slug; decline remember.
   prompts.inject(["different-repo", "you/other", false]);
   const prompt = makeTestPrompt();
   const sel = await prompt(NO_SAVED_CHOICES);
   assert.equal(sel.kind, "different-repo");
   assert.deepEqual(sel.repo, { owner: "you", repo: "other" });
-  assert.equal(sel.remember, false);
 });
 
-// --- VAL-INT-003: bad slug re-prompts ---
-test("VAL-INT-003: different-repo re-prompts on an unparseable slug", async () => {
+// --- bad slug re-prompts ---
+test("different-repo re-prompts on an unparseable slug", async () => {
   // first slug is invalid (no slash), second is valid; decline remember.
   prompts.inject(["different-repo", "not-a-slug", "you/other", false]);
   const prompt = makeTestPrompt();
@@ -801,21 +764,20 @@ test("VAL-INT-003: different-repo re-prompts on an unparseable slug", async () =
   assert.deepEqual(sel.repo, { owner: "you", repo: "other" });
 });
 
-// --- VAL-INT-003: remember=yes persists via the merge writer ---
-test("VAL-INT-003: remember-yes triggers persistence via mergeConfig", async () => {
+// --- remember=yes persists via the merge writer ---
+test("remember-yes triggers persistence via mergeConfig", async () => {
   useTempConfigHome();
   // Use the REAL saveDefault (mergeConfig) by not injecting one.
   prompts.inject(["different-repo", "you/other", true]);
   const prompt = makeInteractivePrompt({ isTTY: () => true });
-  const sel = await prompt(NO_SAVED_CHOICES);
-  assert.equal(sel.remember, true);
+  await prompt(NO_SAVED_CHOICES);
   // mergeConfig wrote the default destination; read it back.
   const cfg = readConfig();
   assert.deepEqual(cfg?.defaultDestination, { owner: "you", repo: "other" });
 });
 
-// --- VAL-INT-003: choosing the already-saved default does NOT re-offer remember ---
-test("VAL-INT-003: different-repo equal to the saved default skips the remember prompt", async () => {
+// --- choosing the already-saved default does NOT re-offer remember ---
+test("different-repo equal to the saved default skips the remember prompt", async () => {
   const saved = { saved: [] as SavedDestination[] };
   // Only the select + slug are injected; if a remember prompt fired it would
   // consume a non-existent injection and abort.
@@ -824,7 +786,6 @@ test("VAL-INT-003: different-repo equal to the saved default skips the remember 
   const sel = await prompt(SAVED_CHOICES);
   assert.equal(sel.kind, "different-repo");
   assert.deepEqual(sel.repo, { owner: "me", repo: "sandbox" });
-  assert.equal(sel.remember, false);
   assert.equal(saved.saved.length, 0, "no persistence for an already-default repo");
 });
 
@@ -837,7 +798,7 @@ test("interactive: create-sandbox lets the user edit owner and name", async () =
   assert.deepEqual(sel.repo, { owner: "myorg", repo: "custom-name" });
 });
 
-// --- create-sandbox: aborting the owner prompt cancels (Macroscope finding) ---
+// --- create-sandbox: aborting the owner prompt cancels ---
 test("interactive: aborting the create-sandbox owner prompt throws bad-args", async () => {
   // select create-sandbox, then Ctrl-C (undefined) at the owner prompt.
   prompts.inject(["create-sandbox", undefined]);

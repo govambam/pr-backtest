@@ -17,7 +17,7 @@ import {
   type TokenSource,
 } from "./config.js";
 import { makeOctokit } from "./github.js";
-import { info, step, success } from "./log.js";
+import { info, registerSecret, step, success } from "./log.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,8 +39,9 @@ export class NoTokenNonInteractiveError extends Error {
   constructor() {
     super(
       "No GitHub token configured and stdin is not a TTY. " +
-        "Set GITHUB_TOKEN, run `pr-backtest` interactively to configure one, " +
-        "or see the setup instructions in the README.",
+        "Set GITHUB_TOKEN, run `pr-backtest <pr-url>` in an interactive terminal " +
+        "to configure one (it can reuse your `gh` login), or see the setup " +
+        "instructions in the README.",
     );
     this.name = "NoTokenNonInteractiveError";
   }
@@ -190,8 +191,6 @@ async function defaultGetInteractiveToken(): Promise<string | null> {
 /** The validated, ready-to-use result returned to callers. */
 export interface AuthResult {
   token: string;
-  username: string;
-  source: TokenSource;
 }
 
 /** Options for {@link resolveToken} (primarily for testing / injection). */
@@ -222,10 +221,15 @@ export async function resolveToken(
 
   const resolved = await resolveTokenSource(resolvers);
 
+  // Arm the secret scrubber the instant a token is resolved, before any network
+  // request is issued. This keeps the redaction net active for the entire
+  // authenticated lifetime — including the validation request below.
+  registerSecret(resolved.token);
+
   // Validate the token by calling the authenticated-user endpoint. The default
   // path routes through the shared `makeOctokit` factory so the `GET /user`
-  // validation call is traced and carries the `pr-backtest` userAgent
-  // (VAL-API-002). `options.makeOctokit` is the test-injection seam, preserved.
+  // validation call is traced and carries the `pr-backtest` userAgent.
+  // `options.makeOctokit` is the test-injection seam, preserved.
   const octokit = options.makeOctokit
     ? options.makeOctokit(resolved.token)
     : makeOctokit(resolved.token);
@@ -251,5 +255,5 @@ export async function resolveToken(
     success(`Token saved (mode 0600).`);
   }
 
-  return { token: resolved.token, username: login, source: resolved.source };
+  return { token: resolved.token };
 }

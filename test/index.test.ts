@@ -2,18 +2,17 @@
  * Full-flow tests for `runBacktest` (`src/index.ts`), driving the real
  * orchestration through an injected `deps` fake so no network or git runs.
  *
- * Coverage (live-activity-trace mission):
- *  - VAL-CH-001: on a successful run stdout is EXACTLY the PR URL + "\n", and
- *    every trace line the run emits is on stderr (stdout carries nothing else).
- *  - VAL-CH-003: the captured stderr shows `✓` completion markers for the
- *    user-facing operations (authenticated, read PR, verified destination,
- *    cloned, fetched, pushed base, pushed head, opened PR).
- *  - VAL-SAFE-003: the recorded operation order matches the base sequence
- *    (read PR → verify destination → clone → fetch base → fetch head →
- *    push base → push head → open PR), AND a failure path keeps its exit code
- *    (an unfetchable commit → exit 3). Because `deps` defaults to production and
- *    is only substituted here, this exercises the REAL ordering in `runBacktest`
- *    — not a hardcoded copy.
+ * Coverage:
+ *  - On a successful run stdout is EXACTLY the PR URL + "\n", and every trace
+ *    line the run emits is on stderr (stdout carries nothing else).
+ *  - The captured stderr shows `✓` completion markers for the user-facing
+ *    operations (authenticated, read PR, verified destination, cloned, fetched,
+ *    pushed base, pushed head, opened PR).
+ *  - The recorded operation order matches the base sequence (read PR → verify
+ *    destination → clone → fetch base → fetch head → push base → push head →
+ *    open PR), AND a failure path keeps its exit code (an unfetchable commit →
+ *    exit 3). Because `deps` defaults to production and is only substituted here,
+ *    this exercises the real ordering in `runBacktest` — not a hardcoded copy.
  *
  * `process.exit` is stubbed to throw a tagged error so the test can assert the
  * code without killing the test process (mirrors the cli.test.ts intent of
@@ -105,14 +104,7 @@ function makeDeps(overrides: Partial<RunBacktestDeps> = {}): {
     getPullRequest: async () => {
       order.push("read-pr");
       return {
-        number: 123,
         title: "Add retry to fetch",
-        htmlUrl: PR_URL,
-        headRef: "feature",
-        baseRef: "main",
-        headSha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        baseSha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
-        state: "open",
         user: "octocat",
       };
     },
@@ -194,7 +186,7 @@ afterEach(() => {
   setTtyOverride(null);
 });
 
-test("VAL-CH-001: on success stdout is exactly the PR URL + newline; trace is on stderr", async () => {
+test("on success stdout is exactly the PR URL + newline; trace is on stderr", async () => {
   const { deps } = makeDeps();
   const { stdout, stderr, exit } = await run({ deps });
 
@@ -208,7 +200,7 @@ test("VAL-CH-001: on success stdout is exactly the PR URL + newline; trace is on
   assert.match(stderr, /✓/);
 });
 
-test("VAL-CH-003: a default run's stderr shows ✓ completion markers for each operation", async () => {
+test("a default run's stderr shows ✓ completion markers for each operation", async () => {
   const { deps } = makeDeps();
   const { stderr } = await run({ deps });
 
@@ -220,7 +212,7 @@ test("VAL-CH-003: a default run's stderr shows ✓ completion markers for each o
   assert.match(stderr, /✓ Backtest PR created/);
 });
 
-test("VAL-CH-003: git-layer ops (clone/fetch/push) narrate their own ✓ — no duplicate index-level line", async () => {
+test("git-layer ops (clone/fetch/push) narrate their own ✓ — no duplicate index-level line", async () => {
   // Drive through the REAL git ops (not the deps stubs) by injecting a fake
   // SimpleGit so clone/fetch/push render their `traceOp` ✓ lines. Here we let
   // the default deps git stubs stand and instead assert the index layer does
@@ -237,7 +229,7 @@ test("VAL-CH-003: git-layer ops (clone/fetch/push) narrate their own ✓ — no 
   assert.equal(indexClonedLines.length, 0, "index.ts emits no `→ Cloning` line");
 });
 
-test("VAL-SAFE-003: the success operation order matches the base sequence", async () => {
+test("the success operation order matches the base sequence", async () => {
   const { deps, order } = makeDeps();
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
@@ -253,7 +245,7 @@ test("VAL-SAFE-003: the success operation order matches the base sequence", asyn
   ]);
 });
 
-test("VAL-SAFE-003: an unfetchable commit maps to exit 3 (git failure), unchanged", async () => {
+test("an unfetchable commit maps to exit 3 (git failure), unchanged", async () => {
   const { deps } = makeDeps({
     fetchCommit: async (_git, sha, prNumber, remote) => {
       throw new UnfetchableCommitError(sha, prNumber, remote);
@@ -265,7 +257,38 @@ test("VAL-SAFE-003: an unfetchable commit maps to exit 3 (git failure), unchange
   assert.match(stderr, /Could not fetch commit/);
 });
 
-test("VAL-SAFE-003: a verbose run is observation-only — same order, same exit", async () => {
+test("a closed/merged prior backtest PR is caught by the pre-flight before any clone/push", async () => {
+  // The pre-flight queries `state: "all"`, so a closed or merged prior backtest
+  // PR for the same branch pair is detected up front. An open-only pre-flight
+  // would miss this PR — modelled here by a fake that only returns a URL when
+  // asked for `"all"`, returning null for the open-only default.
+  const calls = { clone: 0, push: 0, create: 0 };
+  const EXISTING_URL = "https://github.com/acme/api/pull/200";
+  const { deps } = makeDeps({
+    findExistingPr: async (_octokit, _owner, _repo, _head, _base, state) =>
+      state === "all" ? EXISTING_URL : null,
+    cloneRepo: async () => {
+      calls.clone += 1;
+      return fakeGit;
+    },
+    pushBranchFromSha: async () => {
+      calls.push += 1;
+    },
+    createPullRequest: async () => {
+      calls.create += 1;
+      return CREATED_URL;
+    },
+  });
+  const { stdout, exit } = await run({ deps });
+
+  assert.equal(exit, 4, "an existing backtest PR is the documented exit 4");
+  assert.equal(stdout, EXISTING_URL + "\n", "stdout is exactly the existing PR URL");
+  assert.equal(calls.clone, 0, "no clone when the pre-flight finds an existing PR");
+  assert.equal(calls.push, 0, "no push when the pre-flight finds an existing PR");
+  assert.equal(calls.create, 0, "no create when the pre-flight finds an existing PR");
+});
+
+test("a verbose run is observation-only — same order, same exit", async () => {
   const { deps, order } = makeDeps();
   const { exit } = await run({ deps, verbose: true });
   assert.equal(exit, 0, "verbose does not change the exit code");
@@ -282,5 +305,139 @@ test("VAL-SAFE-003: a verbose run is observation-only — same order, same exit"
       "open-pr",
     ],
     "verbose does not change the operation order",
+  );
+});
+
+// --- writes target the destination, never the read-only source --
+
+/** A single git/API call that wrote somewhere, tagged with its target repo. */
+interface WriteTarget {
+  op: string;
+  owner: string;
+  repo: string;
+}
+
+/**
+ * Build deps whose clone/push/create/add-source-remote fakes RECORD the
+ * owner/repo they were handed (the base `makeDeps` fakes discard them). Returns
+ * the deps plus the captured write targets and the source remote target.
+ */
+function makeRecordingDeps(overrides: Partial<RunBacktestDeps> = {}): {
+  deps: Partial<RunBacktestDeps>;
+  writes: WriteTarget[];
+  sourceRemote: WriteTarget[];
+  fetchRemotes: string[];
+} {
+  const writes: WriteTarget[] = [];
+  const sourceRemote: WriteTarget[] = [];
+  const fetchRemotes: string[] = [];
+  const { deps: base } = makeDeps({
+    cloneRepo: async (owner, repo) => {
+      writes.push({ op: "clone", owner, repo });
+      return fakeGit;
+    },
+    addSourceRemote: async (_git, owner, repo) => {
+      sourceRemote.push({ op: "add-source-remote", owner, repo });
+    },
+    fetchCommit: async (_git, _sha, _prNumber, remote = "origin") => {
+      fetchRemotes.push(remote);
+    },
+    pushBranchFromSha: async (_git, _sha, branch) => {
+      // The push fake cannot see owner/repo (pushBranchFromSha pushes to the
+      // clone's `origin`, which cloneRepo set to the destination). The clone
+      // target is therefore the write target asserted for push; record the
+      // branch so the call is observable.
+      writes.push({ op: `push:${branch}`, owner: "", repo: "" });
+    },
+    createPullRequest: async (_octokit, owner, repo) => {
+      writes.push({ op: "create", owner, repo });
+      return CREATED_URL;
+    },
+    ...overrides,
+  });
+  return { deps: base, writes, sourceRemote, fetchRemotes };
+}
+
+const SOURCE_OWNER = "acme";
+const SOURCE_REPO = "api";
+const SANDBOX_OWNER = "octocat";
+const SANDBOX_REPO = "pr-backtest-sandbox";
+
+test("a sandbox run clones and opens the PR against the destination, never the source", async () => {
+  const { deps, writes } = makeRecordingDeps({
+    resolveDestination: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+    }),
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // clone and create target the destination.
+  const clone = writes.find((w) => w.op === "clone");
+  const create = writes.find((w) => w.op === "create");
+  assert.deepEqual(
+    { owner: clone?.owner, repo: clone?.repo },
+    { owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
+    "clone targets the destination",
+  );
+  assert.deepEqual(
+    { owner: create?.owner, repo: create?.repo },
+    { owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
+    "createPullRequest targets the destination",
+  );
+
+  // push happened (the branches were pushed to the clone's origin = destination).
+  assert.ok(
+    writes.some((w) => w.op === "push:backtest-pr123-head"),
+    "the head branch was pushed",
+  );
+
+  // The source owner/repo is NEVER a clone/push/create target.
+  for (const w of writes) {
+    assert.ok(
+      !(w.owner === SOURCE_OWNER && w.repo === SOURCE_REPO),
+      `the source repo must never be a write target (was for ${w.op})`,
+    );
+  }
+});
+
+test("a sandbox run adds the source remote for the source repo and fetches from it", async () => {
+  const { deps, sourceRemote, fetchRemotes } = makeRecordingDeps({
+    resolveDestination: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+    }),
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // addSourceRemote is called exactly for the SOURCE owner/repo.
+  assert.deepEqual(sourceRemote, [
+    { op: "add-source-remote", owner: SOURCE_OWNER, repo: SOURCE_REPO },
+  ]);
+  // Both commits are fetched from the `source` remote, not origin.
+  assert.deepEqual(fetchRemotes, ["source", "source"]);
+});
+
+test("a primary run never adds a source remote and fetches from origin", async () => {
+  // Default resolveDestination returns the source repo with isSandbox:false.
+  const { deps, writes, sourceRemote, fetchRemotes } = makeRecordingDeps();
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // No source remote in primary mode; fetch uses origin.
+  assert.deepEqual(sourceRemote, [], "primary mode never adds a source remote");
+  assert.deepEqual(fetchRemotes, ["origin", "origin"], "primary mode fetches from origin");
+
+  // In primary mode destination == source, so clone/create DO target the source
+  // repo (by design — the user opted in). That is the destination here.
+  const clone = writes.find((w) => w.op === "clone");
+  assert.deepEqual(
+    { owner: clone?.owner, repo: clone?.repo },
+    { owner: SOURCE_OWNER, repo: SOURCE_REPO },
+    "primary mode clones the source repo (which is the chosen destination)",
   );
 });

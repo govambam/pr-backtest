@@ -11,14 +11,6 @@ export interface PrCommit {
   parents: { sha: string }[];
 }
 
-/** The resolved commit pair the rest of the tool operates on. */
-export interface ResolvedCommit {
-  /** Full SHA of the commit whose state the backtest PR head will point at. */
-  targetSha: string;
-  /** Full SHA of the target's first parent — the backtest PR base. */
-  baseSha: string;
-}
-
 /** Looks up a commit's first-parent SHA. In production: a GitHub getCommit call. */
 export type GetParentSha = (sha: string) => string;
 
@@ -99,21 +91,4 @@ export function resolveBase(
     );
   }
   return parentSha;
-}
-
-/**
- * Resolve `--commit` to a `{ targetSha, baseSha }` pair.
- *
- * @param commitOption  `"initial"` or a full / >=7-char abbreviated SHA.
- * @param prCommits     the PR's commits in `pulls.listCommits` (API) order.
- * @param getParentSha  injectable lookup for the target's first parent.
- */
-export function resolveCommit(
-  commitOption: string,
-  prCommits: PrCommit[],
-  getParentSha: GetParentSha,
-): ResolvedCommit {
-  const target = resolveTarget(commitOption, prCommits);
-  const baseSha = resolveBase(target, getParentSha);
-  return { targetSha: target.sha, baseSha };
 }

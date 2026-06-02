@@ -1,18 +1,14 @@
 /**
  * Tests for the API request trace hook installed in the single `makeOctokit`
- * factory (`src/github.ts`). These cover the `api-hook` feature's four
- * assertions:
+ * factory (`src/github.ts`). These cover:
  *
- *  - VAL-API-001: the hook fires exactly once per request (a fake `fetch`
- *    transport counts the underlying calls; one hook pass per request).
- *  - VAL-API-003: in verbose mode each request prints exactly one stderr line
- *    carrying method, path+query, status, and a `<N>ms` figure — and the request
- *    body never appears; in default mode no per-request line prints.
- *  - VAL-API-004: a request whose resolved host is not `api.github.com` makes
- *    the hook throw (a hard error, not a silent skip).
- *
- * The file is structured so later features (e.g. the full redact-net flow) can
- * add cases without reshaping these.
+ *  - The hook fires exactly once per request (a fake `fetch` transport counts
+ *    the underlying calls; one hook pass per request).
+ *  - In verbose mode each request prints exactly one stderr line carrying
+ *    method, path+query, status, and a `<N>ms` figure — and the request body
+ *    never appears; in default mode no per-request line prints.
+ *  - A request whose resolved host is not `api.github.com` makes the hook throw
+ *    (a hard error, not a silent skip).
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -22,6 +18,7 @@ import type { SimpleGit } from "simple-git";
 import { makeOctokit } from "../src/github.js";
 import { fetchCommit } from "../src/git.js";
 import {
+  redact,
   registerSecret,
   setVerbose,
   setTtyOverride,
@@ -87,7 +84,7 @@ afterEach(() => {
   setTtyOverride(null);
 });
 
-test("VAL-API-001: the hook fires once per request (N requests → N transport calls)", async () => {
+test("the hook fires once per request (N requests → N transport calls)", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const octokit = makeOctokit("ghp_sentinel_token_value_123");
 
@@ -111,7 +108,7 @@ test("VAL-API-001: the hook fires once per request (N requests → N transport c
   assert.equal(calls.length, 3);
 });
 
-test("VAL-API-003: verbose prints one line per request with method/path+query/status/<N>ms; body never appears", async () => {
+test("verbose prints one line per request with method/path+query/status/<N>ms; body never appears", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   setVerbose(true);
 
@@ -141,7 +138,7 @@ test("VAL-API-003: verbose prints one line per request with method/path+query/st
   assert.ok(!line.includes("sha"), "request/response body must not appear in trace");
 });
 
-test("VAL-API-003: a request body is never written to the trace (POST)", async () => {
+test("a request body is never written to the trace (POST)", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   setVerbose(true);
   const SECRET_BODY_MARKER = "do-not-leak-this-body-payload";
@@ -168,7 +165,7 @@ test("VAL-API-003: a request body is never written to the trace (POST)", async (
   );
 });
 
-test("VAL-API-003: default mode (verbose off) prints zero per-request lines", async () => {
+test("default mode (verbose off) prints zero per-request lines", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   // verbose stays false (beforeEach default).
 
@@ -186,7 +183,7 @@ test("VAL-API-003: default mode (verbose off) prints zero per-request lines", as
   assert.equal(lines.length, 0, `expected no per-request line, got: ${out}`);
 });
 
-test("VAL-GIT-003: on a TTY a git op rewrites its start line in place (carriage return)", async () => {
+test("on a TTY a git op rewrites its start line in place (carriage return)", async () => {
   setTtyOverride(true);
   const out = await captureStderr(async () => {
     await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
@@ -197,7 +194,7 @@ test("VAL-GIT-003: on a TTY a git op rewrites its start line in place (carriage 
   assert.match(out, /✓/);
 });
 
-test("VAL-GIT-003: with no TTY a git op prints only the completion line, no carriage returns", async () => {
+test("with no TTY a git op prints only the completion line, no carriage returns", async () => {
   setTtyOverride(false);
   const out = await captureStderr(async () => {
     await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
@@ -206,7 +203,7 @@ test("VAL-GIT-003: with no TTY a git op prints only the completion line, no carr
   assert.match(out, /✓/);
 });
 
-test("VAL-SAFE-001: a sentinel token never appears across a full traced flow (API + git, verbose)", async () => {
+test("a sentinel token never appears across a full traced flow (API + git, verbose)", async () => {
   // A long, distinctive sentinel — registerSecret ignores values < 8 chars.
   const SENTINEL = "ghp_SENTINEL_token_value_should_never_leak_0001";
   registerSecret(SENTINEL);
@@ -238,7 +235,7 @@ test("VAL-SAFE-001: a sentinel token never appears across a full traced flow (AP
   assert.match(out, /git fetch source/);
 });
 
-test("VAL-SAFE-001: redact() is the proven net — a sentinel passed INTO a trace line is scrubbed to ***", async () => {
+test("redact() is the proven net — a sentinel passed INTO a trace line is scrubbed to ***", async () => {
   const SENTINEL = "ghp_SENTINEL_redact_net_proof_value_0002";
   registerSecret(SENTINEL);
   setVerbose(true);
@@ -253,7 +250,21 @@ test("VAL-SAFE-001: redact() is the proven net — a sentinel passed INTO a trac
   assert.match(out, /token=\*\*\*/, "the secret is replaced with ***");
 });
 
-test("VAL-API-004: a request to a non-api.github.com host is a hard error (throws)", async () => {
+test("the top-level error formatter scrubs a registered secret from an unexpected throw", () => {
+  // cli.ts's last-resort catch writes redact(err.message) to stderr so a token
+  // can never escape via an unexpected error. This pins that contract: an error
+  // message that happens to carry a registered secret comes out scrubbed.
+  const SENTINEL = "ghp_SENTINEL_toplevel_catch_proof_0003";
+  registerSecret(SENTINEL);
+
+  const err = new Error("unexpected failure with " + SENTINEL);
+  const formatted = redact(err instanceof Error ? err.message : String(err));
+
+  assert.ok(!formatted.includes(SENTINEL), "the secret must not survive the formatter");
+  assert.match(formatted, /unexpected failure with \*\*\*/, "the secret is replaced with ***");
+});
+
+test("a request to a non-api.github.com host is a hard error (throws)", async () => {
   const octokit = makeOctokit("ghp_token");
   const calls: Array<{ url: string; init: RequestInit }> = [];
 
