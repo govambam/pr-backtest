@@ -50,7 +50,7 @@ import {
   makeOctokit,
   verifyRepo,
 } from "./github.js";
-import { readConfig, type RepoRef } from "./config.js";
+import { readConfig, type RepoRef, type TokenSource } from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
@@ -63,6 +63,17 @@ import {
   verifyOrCreateDestination,
   type ChoiceResolvers,
 } from "./destination.js";
+import {
+  makeAuthOfferPrompt,
+  makeDetectInherited,
+  makeLandingChoicePrompt,
+  makeLandInSourcePrompt,
+  resolveAuthFirstChoice,
+  sandboxReadPaste,
+  sandboxWritePaste,
+  type AuthFirstResolvers,
+} from "./authFirst.js";
+import type { InheritedCredential } from "./inheritedAuth.js";
 import { error, info, setVerbose, success, traceOp } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
@@ -93,8 +104,27 @@ const EXIT = {
  */
 export interface RunBacktestDeps {
   makeOctokit: typeof makeOctokit;
-  /** Pure destination choice (no token, no network). */
+  /** Pure destination choice (no token, no network) — flag + non-TTY paths. */
   resolveDestinationChoice: typeof resolveDestinationChoice;
+  /**
+   * Interactive (TTY, no-flag) auth-first choice (spec §3). Returns the
+   * destination AND, on the inherited fork, the detected credential to pass to
+   * the resolvers. Only the interactive no-flag path uses this; flag + non-TTY
+   * paths stay on {@link resolveDestinationChoice} (KEEP-002).
+   */
+  resolveAuthFirstChoice: typeof resolveAuthFirstChoice;
+  /** Detect the inherited credential (TTY only) — auth-offer detection seam. */
+  detectInheritedCredential: () => Promise<InheritedCredential | null>;
+  /** Build the "Use your existing GitHub login? [Y/n]" offer prompt. */
+  makeAuthOfferPrompt: typeof makeAuthOfferPrompt;
+  /** Build the inherited-fork "Where should the backtest PR land?" prompt. */
+  makeLandingChoicePrompt: typeof makeLandingChoicePrompt;
+  /** Build the scoped-fork "Land in the original source repo? [Y/n]" prompt. */
+  makeLandInSourcePrompt: typeof makeLandInSourcePrompt;
+  /** Scoped-sandbox READ-only source paste seam (reused resolver copy). */
+  sandboxReadPaste: typeof sandboxReadPaste;
+  /** Scoped-sandbox READ+WRITE destination paste seam (reused resolver copy). */
+  sandboxWritePaste: typeof sandboxWritePaste;
   /** Verify push / create-if-missing for the destination. */
   verifyOrCreateDestination: typeof verifyOrCreateDestination;
   /** Resolve the WRITE token via an injected accept predicate. */
@@ -128,6 +158,13 @@ export interface RunBacktestDeps {
 const defaultDeps: RunBacktestDeps = {
   makeOctokit,
   resolveDestinationChoice,
+  resolveAuthFirstChoice,
+  detectInheritedCredential: makeDetectInherited(),
+  makeAuthOfferPrompt,
+  makeLandingChoicePrompt,
+  makeLandInSourcePrompt,
+  sandboxReadPaste,
+  sandboxWritePaste,
   verifyOrCreateDestination,
   resolveWriteToken,
   resolveReadToken,
@@ -211,10 +248,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 3. Resolve WHERE the backtest PR is written — a PURE local choice. No token,
-  //    no network. `isSandbox` is true only when the destination differs from
-  //    the source. A DestinationArgsError (both flags / no dest non-TTY) → exit 1.
+  // 3. Resolve WHERE the backtest PR is written. The INTERACTIVE (TTY, no-flag)
+  //    path is now AUTH-FIRST (spec §3): it offers the inherited GitHub login
+  //    BEFORE any destination question, then forks the destination off the
+  //    answer (and the inherited credential it carries forward). The flag and
+  //    non-TTY paths are UNCHANGED — they stay on the pure `resolveDestinationChoice`
+  //    (its DestinationArgsError → exit 1; KEEP-002). No token resolution or
+  //    network happens here beyond the detector's own scrubbed login lookup.
   const isTTY = process.stdin.isTTY === true;
+  const interactiveNoFlag =
+    isTTY && opts.primary !== true && typeof opts.sandbox !== "string";
+  const source: RepoRef = { owner, repo };
   let destOwner: string;
   let destRepo: string;
   let isSandbox: boolean;
@@ -222,26 +266,57 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // 13). Persisting here, before the destination is verified/created and before
   // the run succeeds, would poison the saved default with an unusable repo.
   let offerRemember = false;
+  // The accepted inherited credential (interactive YES fork only); null on every
+  // other path. When present it is threaded into the write/read resolvers as the
+  // `getInheritedCredential` source so the inherited token is USED (no paste).
+  // It carries `fromPaste: false`, so it is never persisted to the 0600 config.
+  let inheritedCredential: InheritedCredential | null = null;
+  // The scoped-sandbox fork collects its two pastes (read FIRST, then write) in
+  // §3b user-facing order; the orchestrator feeds them to the resolvers' paste
+  // getters below so the user is prompted read-then-write even though the write
+  // token is resolved (step 4) before the read token (step 5). Null on every
+  // other path (the resolvers prompt with their own default paste copy).
+  let scopedSandboxPastes: { read: string | null; write: string | null } | null =
+    null;
   try {
-    const choiceResolvers: ChoiceResolvers = {
-      getFlags: () => ({
-        primary: opts.primary,
-        sandbox: opts.sandbox,
-        createSandbox: opts.createSandbox,
-      }),
-      getDefaultDestination: () => deps.readConfig()?.defaultDestination,
-      getIsTTY: () => isTTY,
-      prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
-      promptForSlug: deps.makeSlugPrompt(),
-    };
-    const choice = await deps.resolveDestinationChoice(
-      { owner, repo },
-      choiceResolvers,
-    );
-    destOwner = choice.owner;
-    destRepo = choice.repo;
-    isSandbox = choice.isSandbox;
-    offerRemember = choice.offerRemember;
+    if (interactiveNoFlag) {
+      const authResolvers: AuthFirstResolvers = {
+        detectInherited: () => deps.detectInheritedCredential(),
+        offerInherited: deps.makeAuthOfferPrompt({ isTTY: () => isTTY }),
+        promptLanding: deps.makeLandingChoicePrompt(source, { isTTY: () => isTTY }),
+        promptLandInSource: deps.makeLandInSourcePrompt(source, {
+          isTTY: () => isTTY,
+        }),
+        promptForSlug: deps.makeSlugPrompt(),
+        getSandboxReadPaste: deps.sandboxReadPaste,
+        getSandboxWritePaste: deps.sandboxWritePaste,
+        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+      };
+      const choice = await deps.resolveAuthFirstChoice(source, authResolvers);
+      destOwner = choice.owner;
+      destRepo = choice.repo;
+      isSandbox = choice.isSandbox;
+      offerRemember = choice.offerRemember;
+      inheritedCredential = choice.inheritedCredential;
+      scopedSandboxPastes = choice.scopedSandboxPastes;
+    } else {
+      const choiceResolvers: ChoiceResolvers = {
+        getFlags: () => ({
+          primary: opts.primary,
+          sandbox: opts.sandbox,
+          createSandbox: opts.createSandbox,
+        }),
+        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+        getIsTTY: () => isTTY,
+        prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
+        promptForSlug: deps.makeSlugPrompt(),
+      };
+      const choice = await deps.resolveDestinationChoice(source, choiceResolvers);
+      destOwner = choice.owner;
+      destRepo = choice.repo;
+      isSandbox = choice.isSandbox;
+      offerRemember = choice.offerRemember;
+    }
   } catch (err) {
     if (err instanceof DestinationArgsError) {
       error(messageOf(err));
@@ -249,6 +324,19 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     }
     throw err;
   }
+
+  // The inherited credential, adapted to the resolvers' `getInheritedCredential`
+  // thunk. On the inherited (YES) fork this yields the detected credential (so it
+  // sits AFTER env + saved and BEFORE the paste); on every other path it is
+  // undefined, so the resolvers go env → saved → paste with NO detection. AUTH-004
+  // is handled naturally: if the inherited token cannot write the Primary
+  // destination, the resolver's accept rejects it and falls through to the paste,
+  // emitting its token-free explanation.
+  const getInheritedCredential:
+    | (() => Promise<{ token: string; login: string; source: TokenSource } | null>)
+    | undefined = inheritedCredential
+    ? async () => inheritedCredential
+    : undefined;
 
   // 4. Resolve the WRITE token AND verify/create the destination together. The
   //    write token's `accept` predicate wraps verifyOrCreateDestination so a
@@ -292,6 +380,26 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       destination: dest,
       isPrimary: !isSandbox,
       accept,
+      // Interactive YES fork only: the inherited credential sits AFTER env + saved
+      // and BEFORE the paste. AUTH-004: if it cannot write the destination, the
+      // resolver falls through to the paste with its token-free explanation.
+      getInheritedCredential,
+      // VAL-AUTH-004: if the inherited token cannot WRITE the destination, explain
+      // (token-free) and let the resolver drop to the paste path — no hard failure.
+      onInheritedReject: inheritedCredential
+        ? () =>
+            info(
+              `Your existing GitHub login (@${inheritedCredential.login}) cannot ` +
+                `write ${dest.owner}/${dest.repo}. Paste a token with write access ` +
+                "to continue.",
+            )
+        : undefined,
+      // Scoped-sandbox fork only: the destination write paste was already
+      // collected (after the read paste) in §3b order; replay it here so the
+      // resolver does not re-prompt. Null entries fall back to the default paste.
+      ...(scopedSandboxPastes
+        ? { getPaste: async () => scopedSandboxPastes.write }
+        : {}),
     });
     writeToken = resolved.token;
   } catch (err) {
@@ -328,6 +436,27 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const resolved = await deps.resolveReadToken({
       source: { owner, repo },
       writeToken,
+      // Interactive YES fork only: the inherited credential is offered AFTER env +
+      // saved + single-PAT write-reuse and BEFORE the paste. In the both-capability
+      // case the write token already reads the source (single-PAT), so this is
+      // never consulted; it matters when the inherited write token cannot read.
+      getInheritedCredential,
+      // VAL-AUTH-004 (read side): if the inherited token cannot READ the source,
+      // explain (token-free) and drop to the paste rather than failing.
+      onInheritedReject: inheritedCredential
+        ? () =>
+            info(
+              `Your existing GitHub login (@${inheritedCredential.login}) cannot ` +
+                `read the source ${owner}/${repo}. Paste a read-only source token ` +
+                "to continue.",
+            )
+        : undefined,
+      // Scoped-sandbox fork only: replay the source read paste collected in §3b
+      // order. Single-PAT reuse still runs first, so a write token that also reads
+      // the source short-circuits before this is consulted.
+      ...(scopedSandboxPastes
+        ? { getPaste: async () => scopedSandboxPastes.read }
+        : {}),
     });
     readToken = resolved.token;
   } catch (err) {

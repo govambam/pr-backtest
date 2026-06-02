@@ -233,8 +233,13 @@ function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
   });
 }
 
-/** Sandbox token #1: a READ-ONLY source token is enough. */
-function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
+/**
+ * Sandbox token #1: a READ-ONLY source token is enough. Exported so the scoped
+ * Sandbox interactive fork (authFirst.ts) can reuse this exact copy and collect
+ * the read paste in spec §3b order — keeping the guided-paste scope text in ONE
+ * place rather than duplicating it.
+ */
+export function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
   return guidedPaste({
     repoLabel: `${source.owner}/${source.repo}`,
     intro:
@@ -250,8 +255,13 @@ function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
   });
 }
 
-/** Sandbox token #2: a WRITE token on the destination. */
-function defaultGetSandboxWritePaste(
+/**
+ * Sandbox token #2: a WRITE token on the destination. Exported so the scoped
+ * Sandbox interactive fork (authFirst.ts) can reuse this exact copy and collect
+ * the write paste in spec §3b order. The copy requests only Contents + Pull
+ * requests: Read & write — never `Administration` (the scoped path never creates).
+ */
+export function defaultGetSandboxWritePaste(
   destination: RepoRef,
 ): Promise<string | null> {
   return guidedPaste({
@@ -395,6 +405,7 @@ async function resolveWithAccept(
   onPasteReject: () => void,
   notInteractiveError: () => NoTokenNonInteractiveError,
   getExtra: ExtraCandidate = async () => null,
+  onExtraReject: () => void = () => {},
 ): Promise<Candidate> {
   // The last DestinationApiError a candidate was rejected with, if any. When
   // every source is rejected for the SAME destination reason (e.g. the repo
@@ -437,6 +448,11 @@ async function resolveWithAccept(
     if (await tryAccept(make(extra.token), extra.token)) {
       return extra;
     }
+    // The extra (inherited) candidate was offered but cannot satisfy the chosen
+    // destination's capability (VAL-AUTH-004): emit a token-free explanation and
+    // CONTINUE to the paste path rather than failing. The hook (token-free by
+    // construction) is the caller's; the scrubber already covers it anyway.
+    onExtraReject();
   }
 
   for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
@@ -498,6 +514,13 @@ export interface ResolveWriteTokenOptions {
     source: TokenSource;
   } | null>;
   /**
+   * Called when an offered inherited credential is REJECTED (cannot write/create
+   * the destination) and the resolver falls through to the paste — the place to
+   * emit the VAL-AUTH-004 token-free explanation. OPTIONAL; default is a no-op.
+   * Never receives or echoes a token.
+   */
+  onInheritedReject?: () => void;
+  /**
    * Accept a candidate write token via the caller's verify-or-create check —
    * this lets a token that can CREATE a missing destination be accepted even
    * though `canWrite` (existing repo) would reject it. A candidate that cannot
@@ -550,6 +573,7 @@ export async function resolveWriteToken(
       ),
     () => new NoTokenNonInteractiveError(),
     inheritedExtra(options.getInheritedCredential),
+    options.onInheritedReject,
   );
 
   // A fresh paste is validated via users.getAuthenticated to capture its @login;
@@ -600,6 +624,11 @@ export interface ResolveReadTokenOptions {
     login: string;
     source: TokenSource;
   } | null>;
+  /**
+   * Called when an offered inherited credential is rejected (cannot read the
+   * source) and the resolver falls through to the paste. OPTIONAL; default no-op.
+   */
+  onInheritedReject?: () => void;
 }
 
 /**
@@ -646,6 +675,7 @@ export async function resolveReadToken(
       ),
     () => new NoSourceTokenNonInteractiveError(source.owner, source.repo),
     inheritedExtra(options.getInheritedCredential),
+    options.onInheritedReject,
   );
 
   // A fresh paste is validated via users.getAuthenticated to capture its @login;
