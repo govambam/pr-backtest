@@ -20,14 +20,21 @@ npx pr-backtest <pr-url>
 
 ## Setup
 
-There is no separate setup step. The first time you run `pr-backtest <pr-url>` in an interactive terminal, it resolves a GitHub token in this order:
+There is no separate setup step. **The tool asks where the backtest PR goes before it asks for any token** — Primary (the PR's own repo) or Sandbox (a separate repo you control). Only then does it resolve the exact token(s) the chosen destination needs. The source is only ever *read* for a Sandbox; see [Destination](#destination).
 
-1. **`GITHUB_TOKEN` environment variable** — if this env var is set, its value is used and is never written to the config file. Set it in your shell with `export GITHUB_TOKEN=ghp_...` (or prefix a single run: `GITHUB_TOKEN=ghp_... pr-backtest <pr-url>`). This is the path for CI and scripting (non-interactive runs require it).
-2. **Saved config** — a token saved automatically on a previous run when you pasted one (see step 4), stored at `~/.config/pr-backtest/config.json`, mode `0600`.
-3. **`gh` CLI** — if you already use the [GitHub CLI](https://cli.github.com) and are logged in, pr-backtest offers to reuse that login, so you don't have to create a token at all.
-4. **Paste a token** — otherwise it prompts you to paste one (input is masked) and offers to save it for next time.
+A backtest needs exactly two capabilities: **read** the source and **write** the destination. One token may provide both, or you may split them across two; the tool detects which you gave rather than predicting it.
 
-So if you already have `gh` authed or `GITHUB_TOKEN` exported, you're ready with zero token setup. Otherwise, create a fine-grained token with the permissions in [Recommendations](#recommendations). Run `pr-backtest logout` to clear a saved token (and any saved default destination).
+**Two environment variables (owner-agnostic):**
+
+- **`GITHUB_TOKEN`** — the destination/write token. It also reads the source when it covers the source too (the single-PAT case). For a **Primary** destination it is the one read + write token. Set it with `export GITHUB_TOKEN=ghp_...` (or prefix a single run: `GITHUB_TOKEN=ghp_... pr-backtest <pr-url>`). Non-interactive runs require it.
+- **`GITHUB_SOURCE_TOKEN`** — optional read-only source token. When set, it reads the source and `GITHUB_TOKEN` only writes the destination. This is the quarantined two-token setup (the source token can be scoped read-only, so a write to the source is impossible by scope).
+
+Per-capability resolution order (first match that validates wins; no owner logic, no source-visibility probe):
+
+- **Write/destination token:** `GITHUB_TOKEN` env → saved `destinationToken` → interactive paste.
+- **Read/source token:** `GITHUB_SOURCE_TOKEN` env → saved `sourceToken` → the resolved write token *iff* it can read the source → interactive paste.
+
+A pasted token is saved automatically to `~/.config/pr-backtest/config.json` (mode `0600`) so a later run resolves it without prompting. In a terminal, a missing token is prompted for in-flow with the exact scope it needs; non-interactively, a missing token exits `1` naming the relevant env var. Otherwise, create a fine-grained token with the permissions in [Recommendations](#recommendations). Run `pr-backtest status` to see what is saved, and `pr-backtest logout` to clear it (tokens and any saved default destination).
 
 ## Usage
 
@@ -59,9 +66,19 @@ pr-backtest logout
 | Command | Description |
 |---|---|
 | `pr-backtest <pr-url> [options]` | Recreate the PR at a chosen commit and open a backtest PR. |
-| `pr-backtest logout` | Delete the saved config (GitHub token and any saved default destination). |
+| `pr-backtest status` | Print the saved source/destination token logins + types and the default destination. Never prints a token value; makes no network call. |
+| `pr-backtest logout` | Delete the saved config (both token slots and any saved default destination). |
 
-On first run it prompts for a GitHub token (and offers to reuse your `gh` CLI login if you have one). The new PR's URL is printed to stdout. Run `pr-backtest logout` to remove a saved token (this also deletes the saved default destination — see [Destination](#destination)).
+On first run it asks where the backtest PR goes, then prompts for the token(s) that destination needs. The new PR's URL is printed to stdout. `pr-backtest status` shows what is saved:
+
+```
+$ pr-backtest status
+Source token:        saved · authenticates as @octocat · fine-grained
+Destination token:   saved · authenticates as @octocat · classic
+Default destination: acme/backtests
+```
+
+Each line reads `not set` when its slot is empty. Run `pr-backtest logout` to remove the saved tokens (this also deletes the saved default destination — see [Destination](#destination)).
 
 Running against a **Primary** destination (the PR's own repo) prints a plan like this:
 
@@ -75,9 +92,9 @@ Base:    f0e9d8c (parent of target)
 Plan:
   1. Clone acme/api into a temp directory
   2. Fetch commits a1b2c3d and f0e9d8c from origin
-  3. Push f0e9d8c → acme/api:backtest-pr123-base
-  4. Push a1b2c3d → acme/api:backtest-pr123-head
-  5. Open PR in acme/api: backtest-pr123-head → backtest-pr123-base
+  3. Push f0e9d8c → acme/api:backtest-pr123-a1b2c3d-base
+  4. Push a1b2c3d → acme/api:backtest-pr123-a1b2c3d-head
+  5. Open PR in acme/api: backtest-pr123-a1b2c3d-head → backtest-pr123-a1b2c3d-base
 
 Continue? [y/N] y
 
@@ -97,9 +114,9 @@ Into:    myuser/pr-backtest-sandbox (sandbox — branches and PR are created her
 Plan:
   1. Clone myuser/pr-backtest-sandbox into a temp directory
   2. Fetch commits a1b2c3d and f0e9d8c from source (acme/api)
-  3. Push f0e9d8c → myuser/pr-backtest-sandbox:backtest-pr123-base
-  4. Push a1b2c3d → myuser/pr-backtest-sandbox:backtest-pr123-head
-  5. Open PR in myuser/pr-backtest-sandbox: backtest-pr123-head → backtest-pr123-base
+  3. Push f0e9d8c → myuser/pr-backtest-sandbox:backtest-pr123-a1b2c3d-base
+  4. Push a1b2c3d → myuser/pr-backtest-sandbox:backtest-pr123-a1b2c3d-head
+  5. Open PR in myuser/pr-backtest-sandbox: backtest-pr123-a1b2c3d-head → backtest-pr123-a1b2c3d-base
 
 Continue? [y/N] y
 
@@ -115,7 +132,7 @@ pr-backtest always **reads** the PR from its own repo (the source). The branches
 
 **Read-only guarantee:** the repository a PR is read from is **never written to** unless you explicitly choose it as the destination (Primary). A sandbox destination only ever reads the source.
 
-When you run without a destination flag in a terminal, pr-backtest asks once where the simulated PR should go (Primary, a saved sandbox, create a sandbox, or a different repo) and offers to remember a sandbox as your default. Non-interactively (or with a flag) it resolves without prompting.
+When you run without a destination flag in a terminal, pr-backtest asks once where the simulated PR should go — **Primary** or **Sandbox**. With no saved default the Sandbox row reads "a separate repo you control" and prompts for the `owner/repo` (or a GitHub URL); with a saved default it offers that saved Sandbox plus "a different repo". A non-default Sandbox choice offers to remember it as your default. Non-interactively (or with a flag) it resolves without prompting. The tool never classifies the destination owner (no org-vs-personal branching).
 
 ### Flags
 
@@ -128,6 +145,26 @@ When you run without a destination flag in a terminal, pr-backtest asks once whe
 `--primary` and `--sandbox` are mutually exclusive. `--create-sandbox` on its own is a no-op.
 
 `pr-backtest logout` deletes the whole config file — including any saved default sandbox destination, not just the token.
+
+## Branch names and re-runs
+
+Each backtest pushes two branches whose names include the **short SHA of the target commit**:
+
+```
+backtest-pr<N>-<shortSha>-head
+backtest-pr<N>-<shortSha>-base
+```
+
+So the **(PR, commit)** pair is the backtest's identity: the same PR replayed at two different commits produces distinct branches (no collision), while re-running the same PR at the same commit targets the same branches.
+
+Before pushing, pr-backtest checks for an existing **open** backtest PR for those branches. If one exists, it exits `4` and prints that PR's URL to stdout:
+
+```
+A backtest for acme/api#123 at commit a1b2c3d already exists: https://github.com/acme/api/pull/451
+To recreate it, close that PR and re-run (the branch names include the commit SHA).
+```
+
+To recreate the backtest, **close that PR and re-run** — a *closed* prior backtest PR no longer blocks, so the re-run opens a fresh one (the re-push to the SHA-named branches is a no-op).
 
 ## Live activity trace
 
@@ -186,23 +223,18 @@ Each git command shows the real argv (the token never appears — see below); ea
 
 A token like this can't reach your other repos or touch org settings. For `--create-sandbox`, the token also needs permission to create repositories for the destination owner.
 
-**A non-primary destination needs a token spanning two repos.** When the destination is a sandbox (not the PR's own repo), one token must cover **both**:
+**A Sandbox destination needs read on the source and write on the destination.** A backtest needs two capabilities — **read** the source (to read the PR and fetch its commits) and **write** the destination (Contents + Pull requests). For a **Primary** destination those are the same repo, so one token with read + write on the source is all you need. For a **Sandbox** destination they may be the same token or two different tokens; pr-backtest detects which you gave instead of predicting it.
 
-- **READ** on the source repo (to read the PR and fetch its commits), and
-- **WRITE** on the destination repo (Contents + Pull requests).
+**One token or two — detected, not predicted.** If a single token can both read the source and write the destination, pr-backtest uses it and never asks for a second. It detects this with the write-permission check it already runs (`repos.get(dest).permissions.push`). When you instead supply two tokens, the split is the trust boundary:
 
-A token scoped to only the sandbox can't read a private source PR; a token scoped to only the source can't write the sandbox. If the source repo is **public**, read access is implicit and a token with write on the sandbox is enough. For a **Primary** destination, one repo's worth of access (read + write on the source) is all you need.
+- a **read-only** source token — reads the PR and fetches its commits, and needs **no write access anywhere**, and
+- a **write** destination token — Contents + Pull requests on the destination (plus repo-creation rights for `--create-sandbox`).
 
-**When you need a second token (the two-token model).** A GitHub *fine-grained* token is bound to exactly one resource owner. So when the source and the sandbox sit under **different owners** — the common case for testing a private company PR in a sandbox under your own account — **no single fine-grained token can cover both**. That is when pr-backtest splits the work across two tokens:
+The source is *only ever read* with the source token, and the write token *only ever writes* the destination. When the run uses two distinct tokens, the confirmation plan notes it: the source line is tagged `(read-only token)` and the `Into:` line `(write token)`. A one-token run renders with no token tags.
 
-- a **read-only** token for the **source** owner — reads the PR and fetches its commits, and needs **no write access anywhere**, and
-- a **write** token for the **destination** owner — Contents + Pull requests write on the sandbox (plus repo-creation rights for `--create-sandbox`).
+To run a `--sandbox <owner/repo>` non-interactively with a quarantined source token, set **`GITHUB_SOURCE_TOKEN`** to the read-only source token; `GITHUB_TOKEN` is then used to write the destination. If `GITHUB_TOKEN` alone can both read the source and write the destination, that one token suffices and `GITHUB_SOURCE_TOKEN` is unnecessary. In a terminal, pr-backtest instead prompts for any missing token in-flow with the exact scope it needs.
 
-The source is *only ever read* with the read-only token, and the write token *only ever writes* the destination — the read/write split is the trust boundary. A single token still covers both when it happens to span both owners (a classic PAT, or a fine-grained token scoped to all the repos involved); pr-backtest detects this and never asks for a second token it doesn't need. When the run does use two distinct tokens, the confirmation plan notes it: the source line is tagged `(read-only token)` and the `Into:` line `(write token)`.
-
-To run a cross-owner `--sandbox <owner/repo>` non-interactively, set **`GITHUB_SOURCE_TOKEN`** to the read-only source token; `GITHUB_TOKEN` is then used for the write/destination and `GITHUB_SOURCE_TOKEN` for reading the source. In a terminal, pr-backtest instead prompts for the missing token in-flow with the exact scope it needs.
-
-**Personal vs org sandbox — a trade-off.** A sandbox under **your personal account** is the lowest-fuss path (you can always create repos there), but the company's code lands in a repo under your personal account — an egress consideration to weigh. A sandbox **inside the org** keeps the code within the org boundary, but you need org repo-creation rights to make the sandbox there. Pick whichever matches your compliance posture; cross-owner (personal) sandboxes are the case that triggers the two-token split above.
+**The read-only source token is defense in depth.** Scoping the source token read-only makes a write to the source *impossible by scope*, beyond the code's read-only-source invariant — useful when testing a private company PR in a sandbox you control. A sandbox under your **personal account** is the lowest-fuss path (you can always create repos there) but lands the source's code under your account — an egress consideration to weigh; a sandbox **inside the org** keeps the code within the org boundary but needs org repo-creation rights. Pick whichever matches your compliance posture.
 
 ## Exit codes
 
