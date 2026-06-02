@@ -707,6 +707,32 @@ async function resolveInteractive(
   }
   choices.push({ kind: "different-repo" });
 
+  /**
+   * Verify one chosen destination, emitting the failure reason and signalling a
+   * re-prompt (null) on a 404 / not-writable result. A non-null return is the
+   * resolved destination. `writableAlt` is named in the write-permission message
+   * (only the primary path supplies one). Re-present on failure, never fall back.
+   */
+  async function verifyOrReprompt(
+    dest: RepoRef,
+    writableAlt: RepoRef | null,
+  ): Promise<ResolvedDestination | null> {
+    const ver = await verifyDestination(
+      resolvers.verifyDestination,
+      dest.owner,
+      dest.repo,
+    );
+    if (!ver.exists || !ver.canPush) {
+      emitWriteFailure(dest, writableAlt, ver.exists);
+      return null;
+    }
+    return {
+      owner: dest.owner,
+      repo: dest.repo,
+      isSandbox: !sameRepo(dest, source),
+    };
+  }
+
   // Re-present the menu until a destination verifies (or a creator/prompt throws).
   // The loop is the interactive analogue of the non-interactive exit-2 throw.
   // eslint-disable-next-line no-constant-condition
@@ -714,22 +740,12 @@ async function resolveInteractive(
     const selection = await resolvers.prompt(choices);
 
     if (selection.kind === "primary") {
-      const ver = await verifyDestination(
-        resolvers.verifyDestination,
-        source.owner,
-        source.repo,
+      const resolved = await verifyOrReprompt(
+        { owner: source.owner, repo: source.repo },
+        savedSandboxAlternative(source, resolvers),
       );
-      if (!ver.exists || !ver.canPush) {
-        // Write-permission message (with saved-sandbox alternative if known),
-        // then re-present the menu rather than proceeding.
-        emitWriteFailure(
-          { owner: source.owner, repo: source.repo },
-          savedSandboxAlternative(source, resolvers),
-          ver.exists,
-        );
-        continue;
-      }
-      return { owner: source.owner, repo: source.repo, isSandbox: false };
+      if (!resolved) continue;
+      return resolved;
     }
 
     if (selection.kind === "create-sandbox") {
@@ -767,23 +783,9 @@ async function resolveInteractive(
         "Interactive selection returned no destination repository.",
       );
     }
-    // The verify-then-emit logic is identical whether or not the chosen repo
-    // equals the source; only the resulting `isSandbox` differs, which
-    // `sameRepo` already decides. Re-present on failure, never fall back.
-    const ver = await verifyDestination(
-      resolvers.verifyDestination,
-      dest.owner,
-      dest.repo,
-    );
-    if (!ver.exists || !ver.canPush) {
-      emitWriteFailure(dest, null, ver.exists);
-      continue;
-    }
-    return {
-      owner: dest.owner,
-      repo: dest.repo,
-      isSandbox: !sameRepo(dest, source),
-    };
+    const resolved = await verifyOrReprompt(dest, null);
+    if (!resolved) continue;
+    return resolved;
   }
 }
 
