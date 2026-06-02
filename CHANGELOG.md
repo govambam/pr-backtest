@@ -6,6 +6,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-01
+
+### Changed
+- The existing-PR pre-flight now also detects closed and merged prior backtest
+  PRs, catching a duplicate before any clone or push and exiting `4` with the
+  existing PR's URL.
+
+### Security
+- Hardened token redaction: the secret scrubber is now armed before the first
+  authenticated request, and the top-level error handler passes through the
+  same redaction net as every other output path (defense-in-depth; no known
+  leak path existed).
+
+### Fixed
+- Corrected the README plan and live-activity-trace examples to match the
+  tool's real output, and documented `gh`-login reuse, the exit-code contract,
+  and limitations.
+
 ## [0.2.0] - 2026-06-01
 
 ### Added
