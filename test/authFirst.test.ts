@@ -38,6 +38,8 @@ function makeResolvers(opts: {
   landInSource?: boolean;
   slug?: RepoRef;
   saved?: { owner: string; repo: string };
+  /** When set, the editable-name prompt returns this instead of the default. */
+  editName?: string;
 }): { resolvers: AuthFirstResolvers; order: string[] } {
   const order: string[] = [];
   const resolvers: AuthFirstResolvers = {
@@ -52,6 +54,10 @@ function makeResolvers(opts: {
     promptLanding: async () => {
       order.push("landing");
       return opts.landing ?? "primary";
+    },
+    promptSandboxName: async (defaultName) => {
+      order.push(`name:${defaultName}`);
+      return opts.editName ?? defaultName;
     },
     promptLandInSource: async () => {
       order.push("land-in-source");
@@ -158,6 +164,57 @@ test("VAL-FLOW-002: inherited + new sandbox → <src-owner>/<src-repo>-backtest,
   );
   assert.equal(choice.inheritedCredential, CRED);
   assert.equal(choice.offerRemember, true, "a fresh non-default sandbox flags remember");
+});
+
+// --- VAL-CREATE-002 / VAL-CREATE-003: warn upfront + editable name -----------
+
+test("VAL-CREATE-002: choosing a new sandbox warns upfront (repo + scope) BEFORE the name prompt", async () => {
+  const { sandboxCreateWarning } = await import("../src/authFirst.js");
+  // The exact greppable copy names the repo to be created and the scope needed.
+  const warning = sandboxCreateWarning(SOURCE, `${SOURCE.repo}${SANDBOX_NAME_SUFFIX}`);
+  assert.match(warning, /acme\/api-backtest/, "names <src-owner>/<src-repo>-backtest");
+  assert.match(warning, /create repos in acme/, "states the repo-creation scope on <src-owner>");
+
+  // And in the real choice flow the name prompt fires AFTER the landing choice
+  // (the warning is emitted between them — its stderr emission is asserted
+  // end-to-end in index.test.ts where stdout/stderr are captured).
+  const { resolvers, order } = makeResolvers({
+    detected: CRED,
+    useInherited: true,
+    landing: "sandbox",
+  });
+  await resolveAuthFirstChoice(SOURCE, resolvers);
+  const landingIdx = order.indexOf("landing");
+  const nameIdx = order.findIndex((o) => o.startsWith("name:"));
+  assert.ok(landingIdx >= 0 && nameIdx >= 0, "landing then name prompt both fired");
+  assert.ok(landingIdx < nameIdx, "the landing choice precedes the name prompt");
+  // The default name handed to the prompt is <src-repo>-backtest.
+  assert.ok(order.includes(`name:${SOURCE.repo}${SANDBOX_NAME_SUFFIX}`), "name prompt defaulted to <src-repo>-backtest");
+});
+
+test("VAL-CREATE-003: the default name flows through unchanged", async () => {
+  const { resolvers } = makeResolvers({
+    detected: CRED,
+    useInherited: true,
+    landing: "sandbox",
+    // editName omitted → the prompt returns the default.
+  });
+  const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.equal(choice.owner, SOURCE.owner);
+  assert.equal(choice.repo, `${SOURCE.repo}${SANDBOX_NAME_SUFFIX}`);
+});
+
+test("VAL-CREATE-003: an EDITED name flows through to the resolved choice (foo)", async () => {
+  const { resolvers } = makeResolvers({
+    detected: CRED,
+    useInherited: true,
+    landing: "sandbox",
+    editName: "foo",
+  });
+  const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.equal(choice.owner, SOURCE.owner, "still under the source owner");
+  assert.equal(choice.repo, "foo", "the edited name replaces the default");
+  assert.equal(choice.isSandbox, true);
 });
 
 // --- VAL-FLOW-003: scoped fork routing --------------------------------------

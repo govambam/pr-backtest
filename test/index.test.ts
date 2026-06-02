@@ -41,7 +41,11 @@ import {
   resolveWriteToken,
   type ResolverOctokit,
 } from "../src/auth.js";
-import { DestinationApiError } from "../src/destination.js";
+import {
+  DestinationApiError,
+  SandboxCreateForbiddenError,
+  verifyOrCreateDestination,
+} from "../src/destination.js";
 import { resolveAuthFirstChoice } from "../src/authFirst.js";
 import type { InheritedCredential } from "../src/inheritedAuth.js";
 import type { RepoRef } from "../src/config.js";
@@ -1223,6 +1227,8 @@ function makeAuthFirstDeps(opts: {
   landing?: "primary" | "sandbox";
   landInSource?: boolean;
   slug?: RepoRef;
+  /** The new-sandbox name the editable-name prompt returns (default unchanged). */
+  editName?: string;
   overrides?: Partial<RunBacktestDeps>;
   tokenOpts?: { writeToken?: string; readToken?: string };
 }): { deps: Partial<RunBacktestDeps>; order: string[] } {
@@ -1241,6 +1247,12 @@ function makeAuthFirstDeps(opts: {
       makeLandingChoicePrompt: () => async () => {
         order.push("landing");
         return opts.landing ?? "primary";
+      },
+      // The editable-name prompt: record it and return the edited name (or the
+      // default) WITHOUT touching real `prompts` (which would hang under withTty).
+      makeSandboxNamePrompt: () => async (defaultName: string) => {
+        order.push(`name:${defaultName}`);
+        return opts.editName ?? defaultName;
       },
       makeLandInSourcePrompt: () => async () => {
         order.push("land-in-source");
@@ -1788,4 +1800,282 @@ test("VAL-KEEP-001: inherited broad token, new sandbox → push/PR get the DESTI
   for (const f of fetches) {
     assert.equal(f.remote, "source", "commits are fetched from the source remote only");
   }
+});
+
+// ===========================================================================
+// CREATE — auto-create policy + the 403 → Primary fallback (spec §5)
+// ===========================================================================
+
+const SANDBOX_DEFAULT_REPO = `${SOURCE_REPO}-backtest`;
+
+/** A recorded create call against the injected sandbox creator seam. */
+interface CreateCall {
+  owner: string;
+  name: string;
+}
+
+/**
+ * Build deps for an INHERITED new-sandbox run driving the REAL
+ * `verifyOrCreateDestination` (so the create gate + 403 fallback are genuinely
+ * exercised). The creator/verify/confirm/primary-fallback seams are injected and
+ * recorded. `createOutcome` controls what the creator does: "ok" creates the
+ * sandbox; "403" throws a SandboxCreateForbiddenError.
+ */
+function makeInheritedSandboxDeps(opts: {
+  editName?: string;
+  createOutcome: "ok" | "403";
+  /** The Primary-fallback answer (only used on a 403). */
+  fallback?: "accept" | "decline";
+  overrides?: Partial<RunBacktestDeps>;
+}): {
+  deps: Partial<RunBacktestDeps>;
+  order: string[];
+  creates: CreateCall[];
+} {
+  const creates: CreateCall[] = [];
+  const createdNames = new Set<string>();
+  const { deps, order } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "sandbox",
+    editName: opts.editName,
+    tokenOpts: { writeToken: INHERITED_TOKEN, readToken: INHERITED_TOKEN },
+    overrides: {
+      // REAL verify/create orchestration.
+      verifyOrCreateDestination,
+      // The sandbox is missing until it is created; the source exists + is
+      // writable (so a Primary fallback re-verify passes). A just-created sandbox
+      // verifies as existing + writable (so the post-create reprobe succeeds with
+      // no real sleeps).
+      verifyRepo: async (_octokit, owner, repo) => {
+        if (owner === SOURCE_OWNER && repo === SOURCE_REPO) {
+          return { exists: true, canPush: true };
+        }
+        if (createdNames.has(`${owner}/${repo}`)) {
+          return { exists: true, canPush: true };
+        }
+        return { exists: false, canPush: false };
+      },
+      makeSandboxCreator: () => async (req) => {
+        creates.push({ owner: req.owner, name: req.name });
+        if (opts.createOutcome === "403") {
+          throw new SandboxCreateForbiddenError(
+            req.owner,
+            `Cannot create a sandbox repository under ${req.owner}: the token ` +
+              "lacks permission to create repositories there.",
+          );
+        }
+        createdNames.add(`${req.owner}/${req.name}`);
+        return { owner: req.owner, repo: req.name };
+      },
+      makeConfirmCreate: () => async () => true,
+      makePrimaryFallbackPrompt: (source) => async () => {
+        order.push("primary-fallback");
+        return opts.fallback === "accept"
+          ? { owner: source.owner, repo: source.repo }
+          : null;
+      },
+      // Record confirmPlan + its destination for the create-before-plan and
+      // 403→Primary assertions.
+      confirmPlan: async (planInput) => {
+        order.push(`confirm-plan:${planInput.targetRepo}`);
+        return true;
+      },
+      addSourceRemote: async () => {
+        order.push("add-source-remote");
+      },
+      ...opts.overrides,
+    },
+  });
+  return { deps, order, creates };
+}
+
+// --- VAL-CREATE-002: warn upfront before the create attempt -----------------
+
+test("VAL-CREATE-002: the new-sandbox warning is emitted BEFORE the create seam (location + scope)", async () => {
+  const { deps, order, creates } = makeInheritedSandboxDeps({
+    createOutcome: "ok",
+  });
+  const { stderr, exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  // The warning names the repo to be created and the required scope on the owner.
+  assert.match(stderr, /acme\/api-backtest/, "warning names <src-owner>/<src-repo>-backtest");
+  assert.match(stderr, /create repos in acme/, "warning states repo-creation scope on <src-owner>");
+  // Call order: the editable-name prompt (which fires right after the warning) is
+  // recorded BEFORE the create call, proving the warn-upfront precedes the create.
+  const nameIdx = order.findIndex((o) => o.startsWith("name:"));
+  assert.ok(nameIdx >= 0, "the name prompt fired");
+  assert.equal(creates.length, 1, "the creator ran exactly once");
+});
+
+// --- VAL-CREATE-003: editable name flows through to the creator --------------
+
+test("VAL-CREATE-003: default name → creator receives <src-repo>-backtest", async () => {
+  const { deps, creates } = makeInheritedSandboxDeps({ createOutcome: "ok" });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(creates, [{ owner: SOURCE_OWNER, name: SANDBOX_DEFAULT_REPO }]);
+});
+
+test("VAL-CREATE-003: edited name 'foo' → creator receives name 'foo' (under the source owner)", async () => {
+  const { deps, creates } = makeInheritedSandboxDeps({
+    createOutcome: "ok",
+    editName: "foo",
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(creates, [{ owner: SOURCE_OWNER, name: "foo" }]);
+});
+
+// --- VAL-CREATE-001: scoped Sandbox never creates ---------------------------
+
+test("VAL-CREATE-001: a scoped interactive Sandbox run NEVER invokes the sandbox creator", async () => {
+  const creates: CreateCall[] = [];
+  // Scoped fork: nothing detected → no inherited credential. The user picks "no"
+  // (land in source? no → guided sandbox) and supplies a pre-created repo slug.
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource = args.owner === SOURCE_OWNER && args.repo === SOURCE_REPO;
+          if (isSource) {
+            if (token !== READ_TOKEN) throw httpError(404);
+            return { data: {} };
+          }
+          // The pre-created destination exists + is writable for the write token.
+          return { data: { permissions: { push: token === WRITE_TOKEN } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { deps } = makeDeps(
+    {
+      resolveAuthFirstChoice,
+      verifyOrCreateDestination,
+      detectInheritedCredential: async () => null, // scoped fork
+      makeAuthOfferPrompt: () => async () => false,
+      makeLandingChoicePrompt: () => async () => "primary",
+      makeLandInSourcePrompt: () => async () => false, // → guided sandbox
+      makeSlugPrompt: () => async () => ({ owner: "you", repo: "sandbox" }),
+      sandboxReadPaste: async () => READ_TOKEN,
+      sandboxWritePaste: async () => WRITE_TOKEN,
+      makeSandboxCreator: () => async (req) => {
+        creates.push({ owner: req.owner, name: req.name });
+        return { owner: req.owner, repo: req.name };
+      },
+      verifyRepo: async (octokit, owner, repo) => {
+        const { data } = await (octokit as unknown as ResolverOctokit).repos.get({
+          owner,
+          repo,
+        });
+        return { exists: true, canPush: data.permissions?.push === true };
+      },
+      addSourceRemote: async () => {},
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(creates, [], "the scoped Sandbox path never invokes the creator");
+});
+
+// --- VAL-CREATE-004: create-before-plan + 403 → Primary-only fallback --------
+
+test("VAL-CREATE-004: the create runs BEFORE confirmPlan", async () => {
+  const { deps, order } = makeInheritedSandboxDeps({ createOutcome: "ok" });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  const createIdx = order.findIndex((o) => o.startsWith("name:")); // create is right after the name prompt
+  const confirmIdx = order.findIndex((o) => o.startsWith("confirm-plan:"));
+  assert.ok(createIdx >= 0 && confirmIdx >= 0);
+  assert.ok(createIdx < confirmIdx, "the create/name step precedes confirmPlan");
+});
+
+test("VAL-CREATE-004: 403 + ACCEPT → destination becomes the source; confirmPlan sees dest === source; run proceeds", async () => {
+  const { deps, order, creates } = makeInheritedSandboxDeps({
+    createOutcome: "403",
+    fallback: "accept",
+  });
+  const { stdout, exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "the run proceeds against the source after the Primary fallback");
+  assert.equal(stdout, CREATED_URL + "\n", "a PR URL is produced");
+  // The fallback was offered, then confirmPlan saw the SOURCE as the destination.
+  assert.ok(order.includes("primary-fallback"), "the Primary fallback was offered");
+  assert.ok(
+    order.includes(`confirm-plan:${SOURCE_OWNER}/${SOURCE_REPO}`),
+    "confirmPlan received destination === source",
+  );
+  assert.equal(creates.length, 1, "the creator was attempted exactly once");
+});
+
+test("VAL-CREATE-004: 403 + DECLINE → exit 0, zero clone/push, creator called exactly once, no other-owner retry", async () => {
+  const writes = { clone: 0, push: 0 };
+  const { deps, order, creates } = makeInheritedSandboxDeps({
+    createOutcome: "403",
+    fallback: "decline",
+    overrides: {
+      cloneRepo: async () => {
+        writes.clone += 1;
+        return fakeGit;
+      },
+      pushBranchFromSha: async () => {
+        writes.push += 1;
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "declining the Primary fallback is a clean exit 0 (NOT 2)");
+  assert.deepEqual(writes, { clone: 0, push: 0 }, "nothing was cloned or pushed");
+  assert.equal(creates.length, 1, "the creator was called exactly once");
+  // No retry under any other owner: the single create targeted only the source owner.
+  assert.deepEqual(creates, [{ owner: SOURCE_OWNER, name: SANDBOX_DEFAULT_REPO }]);
+  assert.ok(order.includes("primary-fallback"), "the fallback was offered before the decline");
+  assert.ok(
+    !order.some((o) => o.startsWith("confirm-plan:")),
+    "no plan was shown on the declined fallback",
+  );
+});
+
+test("VAL-CREATE-004: non-interactive --create-sandbox 403 → exit 2 (unchanged, no fallback)", async () => {
+  const creates: CreateCall[] = [];
+  // Non-interactive: --sandbox X --create-sandbox, no TTY. The create returns 403
+  // (SandboxCreateForbiddenError). This must stay exit 2 — no Primary fallback.
+  const { deps } = makeDeps({
+    verifyOrCreateDestination,
+    resolveDestinationChoice: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+      offerRemember: false,
+    }),
+    verifyRepo: async () => ({ exists: false, canPush: false }),
+    makeSandboxCreator: () => async (req) => {
+      creates.push({ owner: req.owner, name: req.name });
+      throw new SandboxCreateForbiddenError(req.owner, "no creation scope");
+    },
+  });
+  const { exit } = await run({
+    deps,
+    sandbox: `${SANDBOX_OWNER}/${SANDBOX_REPO}`,
+    createSandbox: true,
+  });
+  assert.equal(exit, 2, "a non-interactive --create-sandbox 403 still exits 2");
+  assert.equal(creates.length, 1, "the creator was attempted once");
 });

@@ -54,12 +54,15 @@ import { readConfig, type RepoRef, type TokenSource } from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
+  PrimaryFallbackDeclinedError,
   makeConfirmCreate,
   makeMenuPrompt,
+  makePrimaryFallbackPrompt,
   makeRememberPrompt,
   makeSandboxCreator,
   makeSlugPrompt,
   resolveDestinationChoice,
+  sameRepo,
   verifyOrCreateDestination,
   type ChoiceResolvers,
 } from "./destination.js";
@@ -68,6 +71,7 @@ import {
   makeDetectInherited,
   makeLandingChoicePrompt,
   makeLandInSourcePrompt,
+  makeSandboxNamePrompt,
   resolveAuthFirstChoice,
   sandboxReadPaste,
   sandboxWritePaste,
@@ -119,6 +123,8 @@ export interface RunBacktestDeps {
   makeAuthOfferPrompt: typeof makeAuthOfferPrompt;
   /** Build the inherited-fork "Where should the backtest PR land?" prompt. */
   makeLandingChoicePrompt: typeof makeLandingChoicePrompt;
+  /** Build the inherited new-sandbox editable-name prompt (default `<src-repo>-backtest`). */
+  makeSandboxNamePrompt: typeof makeSandboxNamePrompt;
   /** Build the scoped-fork "Land in the original source repo? [Y/n]" prompt. */
   makeLandInSourcePrompt: typeof makeLandInSourcePrompt;
   /** Scoped-sandbox READ-only source paste seam (reused resolver copy). */
@@ -138,6 +144,12 @@ export interface RunBacktestDeps {
   makeRememberPrompt: typeof makeRememberPrompt;
   /** Interactive "create this sandbox?" confirm seam (TTY only). */
   makeConfirmCreate: typeof makeConfirmCreate;
+  /**
+   * Build the interactive 403 → Primary-fallback prompt (spec §5). Wired into
+   * `verifyOrCreateDestination`'s `onCreateForbidden` seam ONLY on the inherited
+   * new-sandbox fork; off-TTY / `--create-sandbox` it is never consulted.
+   */
+  makePrimaryFallbackPrompt: typeof makePrimaryFallbackPrompt;
   readConfig: typeof readConfig;
   getPullRequest: typeof getPullRequest;
   listPullRequestCommits: typeof listPullRequestCommits;
@@ -163,6 +175,7 @@ const defaultDeps: RunBacktestDeps = {
   makeAuthOfferPrompt,
   makeLandingChoicePrompt,
   makeLandInSourcePrompt,
+  makeSandboxNamePrompt,
   sandboxReadPaste,
   sandboxWritePaste,
   verifyOrCreateDestination,
@@ -174,6 +187,7 @@ const defaultDeps: RunBacktestDeps = {
   makeSlugPrompt,
   makeRememberPrompt,
   makeConfirmCreate,
+  makePrimaryFallbackPrompt,
   readConfig,
   getPullRequest,
   listPullRequestCommits,
@@ -284,6 +298,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         detectInherited: () => deps.detectInheritedCredential(),
         offerInherited: deps.makeAuthOfferPrompt({ isTTY: () => isTTY }),
         promptLanding: deps.makeLandingChoicePrompt(source, { isTTY: () => isTTY }),
+        promptSandboxName: deps.makeSandboxNamePrompt({ isTTY: () => isTTY }),
         promptLandInSource: deps.makeLandInSourcePrompt(source, {
           isTTY: () => isTTY,
         }),
@@ -368,11 +383,26 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         createSandbox: deps.makeSandboxCreator(octokit as Octokit),
         createFlag: opts.createSandbox === true,
         isTTY,
+        // Spec §5: auto-create in the INTERACTIVE path is inherited-only. A
+        // scoped interactive Sandbox run (no inherited credential) must NEVER
+        // invoke the creator — the user pre-creates the repo — so `allowCreate`
+        // is false there. Flag / non-TTY paths keep their behavior (the
+        // `--create-sandbox` flag is governed by `createFlag`, not this gate;
+        // a `--sandbox X` + TTY run keeps its existing interactive create offer).
+        allowCreate: !interactiveNoFlag || inheritedCredential !== null,
         // Interactive create offer: without this seam, a TTY
         // user who picks a not-yet-existing sandbox is never offered to create
         // it. The seam self-guards off-TTY; verifyOrCreateDestination only
         // invokes it on the isTTY branch.
         confirmCreate: deps.makeConfirmCreate(),
+        // Spec §5 403 → Primary fallback: wired ONLY on the inherited fork. When
+        // the create returns 403 on a TTY, this offers ONLY the source repo as
+        // the fallback destination; declining throws PrimaryFallbackDeclinedError
+        // (exit 0). Absent on every other path, so off-TTY / `--create-sandbox`
+        // a 403 stays a DestinationApiError → exit 2 (unchanged).
+        onCreateForbidden: inheritedCredential
+          ? deps.makePrimaryFallbackPrompt(source, { isTTY: () => isTTY })
+          : undefined,
       });
       return true;
     };
@@ -404,13 +434,23 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     writeToken = resolved.token;
   } catch (err) {
     destTrace.fail();
+    if (err instanceof PrimaryFallbackDeclinedError) {
+      // Spec §5: the inherited new-sandbox create returned 403 and the user
+      // declined the Primary fallback. Nothing was created or written — a clean
+      // no-op outcome, NOT an error: exit 0. (Checked BEFORE DestinationApiError,
+      // which it deliberately does not extend.)
+      info("Aborted: no changes were made.");
+      process.exit(EXIT.SUCCESS);
+    }
     if (err instanceof NoTokenNonInteractiveError) {
       // Names GITHUB_TOKEN — no destination-write token, non-interactive (exit 1).
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
     }
     if (err instanceof DestinationApiError) {
-      // Not-writable / can't-create destination, terminal (exit 2).
+      // Not-writable / can't-create destination, terminal (exit 2). This
+      // includes a SandboxCreateForbiddenError that reached here off a TTY /
+      // `--create-sandbox` (no Primary-fallback seam wired) — unchanged.
       error(messageOf(err));
       process.exit(EXIT.API_ERROR);
     }
@@ -420,6 +460,14 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   destTrace.done(redactedRepoRef(verifiedDest.owner, verifiedDest.repo));
   destOwner = verifiedDest.owner;
   destRepo = verifiedDest.repo;
+  // Spec §5 / decision 3: the destination is now SETTLED — before the plan. A
+  // 403 → Primary fallback returns the SOURCE as the verified destination, so the
+  // run is no longer a sandbox. Recompute `isSandbox` from the settled dest vs
+  // the source so the plan, token routing, and the source-fetch remote all
+  // reflect Primary (dest === source ⇒ the source IS the destination and may be
+  // written — intended for Primary). Every non-fallback case is unaffected: a
+  // real sandbox stays != source (isSandbox true) and a Primary stays == source.
+  isSandbox = !sameRepo(verifiedDest, source);
 
   // 5. Resolve the READ token. Reuses the write token IFF it reads the source
   //    (single-PAT); else GITHUB_SOURCE_TOKEN / saved sourceToken / paste. A

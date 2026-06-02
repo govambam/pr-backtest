@@ -88,6 +88,42 @@ export class DestinationApiError extends Error {
 }
 
 /**
+ * Thrown specifically when the WRITE token lacks repo-creation scope on the
+ * requested owner (a 403 from the create call). It extends
+ * {@link DestinationApiError} on purpose: every NON-interactive caller (the
+ * `--create-sandbox` flag, the resolver's reject-tracking) keeps treating it
+ * exactly as before (exit 2, no behavior change). The INTERACTIVE inherited
+ * new-sandbox path catches THIS subclass specifically to offer the §5 Primary
+ * fallback ("create the backtest PR in the source repo instead?"). Carries the
+ * `owner` so the explanation can name it. Never carries a token.
+ */
+export class SandboxCreateForbiddenError extends DestinationApiError {
+  /** The owner the create was forbidden under (e.g. the source owner). */
+  readonly owner: string;
+  constructor(owner: string, message: string) {
+    super(message);
+    this.name = "SandboxCreateForbiddenError";
+    this.owner = owner;
+  }
+}
+
+/**
+ * Thrown when the interactive Primary fallback (§5) is DECLINED: the login could
+ * not create the sandbox and the user said no to landing in the source repo. It
+ * is a clean, no-op outcome — nothing was created or written — so the caller maps
+ * it to exit 0 (NOT the exit 2 of a {@link DestinationApiError}). It deliberately
+ * does NOT extend {@link DestinationApiError} so it propagates straight out of the
+ * write-token resolver (which only swallows `DestinationApiError`s as candidate
+ * rejections) rather than triggering a retry under another token/owner.
+ */
+export class PrimaryFallbackDeclinedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PrimaryFallbackDeclinedError";
+  }
+}
+
+/**
  * The write-permission message. Names the repo and the missing capability
  * (Contents:write + Pull requests:write), and offers the alternatives.
  *
@@ -485,6 +521,49 @@ export function makeConfirmCreate(): ConfirmCreate {
   };
 }
 
+/**
+ * Build the real interactive Primary-fallback prompt (spec §5 / VAL-CREATE-004).
+ *
+ * Invoked by the orchestrator's `onCreateForbidden` seam when an inherited
+ * new-sandbox create returns 403 (the login lacks repo-creation scope on the
+ * source owner). It prints the plain "no scope to create in `<src-owner>`"
+ * explanation, then offers ONLY the Primary fallback — create the backtest PR in
+ * the source repo instead — defaulting to NO ([y/N]). On ACCEPT it returns the
+ * SOURCE repo (the run continues as Primary); on DECLINE it returns null (the
+ * orchestrator exits cleanly with code 0). There is NO personal-account option.
+ *
+ * Off-TTY it returns null (decline) rather than hanging — though the orchestrator
+ * only wires this on the interactive inherited path.
+ *
+ * SECURITY: no token is on this path; the message names only owners/repos.
+ */
+export function makePrimaryFallbackPrompt(
+  source: RepoRef,
+  options: MenuPromptOptions = {},
+): () => Promise<RepoRef | null> {
+  const isTTY = options.isTTY ?? (() => process.stdin.isTTY === true);
+  return async (): Promise<RepoRef | null> => {
+    info("");
+    info(
+      `I don't have scope to create a repo in ${source.owner}. ` +
+        `Create the backtest PR in the original source repo ` +
+        `${source.owner}/${source.repo} instead?`,
+    );
+    if (!isTTY()) {
+      return null;
+    }
+    const { useSource } = await prompts({
+      type: "confirm",
+      name: "useSource",
+      message: `Land the backtest PR in ${source.owner}/${source.repo}?`,
+      initial: false,
+    });
+    return useSource === true
+      ? { owner: source.owner, repo: source.repo }
+      : null;
+  };
+}
+
 // =====================================================================
 // Stage 2 — verifyOrCreateDestination (WRITE-token seams)
 // =====================================================================
@@ -515,8 +594,33 @@ export interface VerifyOrCreateOptions {
   createFlag: boolean;
   /** Whether stdin is a TTY (drives the interactive create offer). */
   isTTY: boolean;
+  /**
+   * Whether the INTERACTIVE create path may run at all (spec §5: auto-create is
+   * inherited-only). True only on the inherited new-sandbox fork; false for the
+   * scoped Sandbox path, where the user pre-creates the repo and the tool must
+   * NEVER invoke the creator. When false, a missing sandbox on a TTY surfaces the
+   * "create it yourself and re-run" error WITHOUT offering to create or calling
+   * the creator seam (VAL-CREATE-001). It does NOT affect the non-interactive
+   * `--create-sandbox` flag path, which is governed by {@link createFlag}.
+   * Defaults to true so existing callers/tests (which model the inherited offer)
+   * keep their behavior; the orchestrator passes the explicit gate.
+   */
+  allowCreate?: boolean;
   /** Interactive confirm seam: "create this sandbox?" (TTY only). */
   confirmCreate?: ConfirmCreate;
+  /**
+   * The INTERACTIVE 403 → Primary fallback seam (spec §5 / VAL-CREATE-004). Wired
+   * only on the inherited new-sandbox fork. Invoked ONLY when a create attempt
+   * fails with a {@link SandboxCreateForbiddenError} on a TTY: it should explain
+   * "no scope to create in `<owner>`" and offer to create the backtest PR in the
+   * source repo instead. Returns the new (source) destination on ACCEPT, or null
+   * on DECLINE. On accept the resolver re-verifies push to the returned repo and
+   * the run continues as Primary; on decline {@link verifyOrCreateDestination}
+   * throws a {@link PrimaryFallbackDeclinedError} (the caller maps it to exit 0).
+   * Off-TTY / `--create-sandbox` this is absent, so a 403 propagates as the
+   * {@link SandboxCreateForbiddenError} (exit 2) — unchanged.
+   */
+  onCreateForbidden?: () => Promise<RepoRef | null>;
   /**
    * Injectable delay between post-create write-probe retries (eventual
    * consistency). Defaults to a small real sleep; tests pass a no-op so they
@@ -655,8 +759,19 @@ export async function verifyOrCreateDestination(
     );
   }
 
-  // Interactive sandbox: offer to create only when the write token can create.
+  // Interactive sandbox: offer to create only when the write token can create —
+  // and only when creation is ALLOWED for this run (inherited-only; the scoped
+  // Sandbox path pre-creates the repo and must never invoke the creator).
   if (opts.isTTY) {
+    if (opts.allowCreate === false) {
+      // Scoped Sandbox path: the user was asked to pre-create the repo, so a
+      // missing one is a "create it yourself and re-run" error — the creator is
+      // NEVER invoked (VAL-CREATE-001).
+      throw new DestinationApiError(
+        `Sandbox ${dest.owner}/${dest.repo} was not found. ` +
+          "Create it yourself and re-run, or choose an existing repo you can write to.",
+      );
+    }
     return createSandboxInteractive(dest, opts);
   }
 
@@ -693,11 +808,21 @@ async function createSandboxAndReverify(
 }
 
 /**
- * Interactive missing-sandbox flow: offer to create. Creation
- * only succeeds when the write token can create — on a permission failure
- * surface the explain message and throw {@link DestinationApiError}; do NOT fall
- * back to the source. Declining the offer also throws (the user must pick a
- * usable destination or re-run).
+ * Interactive missing-sandbox flow (inherited new-sandbox fork): offer to create.
+ *
+ * Declining the create offer throws (the user must pick a usable destination or
+ * re-run). On confirm we create and re-verify push.
+ *
+ * 403 → Primary fallback (spec §5 / VAL-CREATE-004): a create that fails because
+ * the login lacks repo-creation scope on the owner surfaces as a
+ * {@link SandboxCreateForbiddenError}. When an {@link VerifyOrCreateOptions.onCreateForbidden}
+ * seam is wired (the inherited fork), invoke it ONCE:
+ *  - ACCEPT (returns the source repo) → re-verify push to it and continue as
+ *    Primary (the orchestrator recomputes `isSandbox` from the returned dest);
+ *  - DECLINE (returns null) → throw {@link PrimaryFallbackDeclinedError} (exit 0).
+ * The creator is called EXACTLY ONCE — there is no retry under any other owner,
+ * and no personal-account fallback. With NO seam wired (should not happen on the
+ * interactive path) the forbidden error propagates as the exit-2 DestinationApiError.
  */
 async function createSandboxInteractive(
   dest: RepoRef,
@@ -712,9 +837,36 @@ async function createSandboxInteractive(
         "Create it yourself and re-run, or choose an existing repo you can write to.",
     );
   }
-  // createSandbox surfaces a permission failure as a DestinationApiError naming
-  // the owner + missing creation right; we let it propagate (never fall back).
-  return createSandboxAndReverify(dest, opts);
+  try {
+    // createSandbox surfaces a permission failure as a SandboxCreateForbiddenError
+    // (a DestinationApiError subclass). The create is attempted exactly once.
+    return await createSandboxAndReverify(dest, opts);
+  } catch (err: unknown) {
+    if (err instanceof SandboxCreateForbiddenError && opts.onCreateForbidden) {
+      // §5 Primary fallback: explain + offer ONLY the source repo. No retry, no
+      // personal-account fallback. The seam owns the explanation + the prompt.
+      const fallback = await opts.onCreateForbidden();
+      if (fallback === null) {
+        throw new PrimaryFallbackDeclinedError(
+          "No sandbox was created and the Primary fallback was declined — " +
+            "nothing was created or written.",
+        );
+      }
+      // Accepted: continue as Primary against the returned (source) repo. Verify
+      // push with the SAME candidate token before proceeding; a non-writable
+      // result surfaces the write-permission message (exit 2).
+      const ver = await verifyOrApiError(
+        opts.verifyDestination,
+        fallback.owner,
+        fallback.repo,
+      );
+      if (!ver.exists || !ver.canPush) {
+        throw new DestinationApiError(writePermissionMessage(fallback));
+      }
+      return fallback;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -744,7 +896,13 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
       return { owner: created.owner, repo: created.repo };
     } catch (err: unknown) {
       if (isStatus(err, 403)) {
-        throw new DestinationApiError(
+        // A 403 means the WRITE token lacks repo-creation scope on this owner.
+        // Throw the dedicated subclass (still a DestinationApiError) so the
+        // interactive inherited path can recognise it and offer the §5 Primary
+        // fallback, while every non-interactive caller maps it to exit 2 as
+        // before.
+        throw new SandboxCreateForbiddenError(
+          request.owner,
           `Cannot create a sandbox repository under ${request.owner}: ` +
             "the token lacks permission to create repositories there " +
             "(needs Administration:write / repo-creation rights on that " +

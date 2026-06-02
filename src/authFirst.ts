@@ -30,11 +30,14 @@
  * token before making). The orchestrator (index.ts) consumes the returned choice
  * and runs the EXISTING write/read resolution and verify-or-create paths.
  *
- * BOUNDARY with the next feature (`inherited-auto-create`): when the user picks
- * "a new sandbox repo" this module routes to dest `<src-owner>/<src-repo>-backtest`
- * with `isSandbox` true and lets the EXISTING `verifyOrCreateDestination` interactive
- * create path run. The warn-upfront copy, the editable-name prompt, the 403→Primary
- * fallback, and the create-gating are deliberately NOT implemented here.
+ * Auto-create (spec §5, `inherited-auto-create`): when the user picks "a new
+ * sandbox repo" this module emits the warn-upfront copy ({@link sandboxCreateWarning},
+ * naming `<src-owner>/<src-repo>-backtest` + the repo-creation-scope prerequisite)
+ * BEFORE any create attempt, then offers the EDITABLE name (default
+ * `<src-repo>-backtest`); the chosen name flows into the dest the orchestrator
+ * routes through `verifyOrCreateDestination`. The create-gating (inherited-only)
+ * and the 403→Primary fallback are settled in the orchestrator + destination
+ * module (before the plan), not here.
  *
  * SECURITY: the inherited token is a secret the detector has already registered
  * with the scrubber before its first use. No message in this module ever echoes a
@@ -105,6 +108,14 @@ export type AuthOfferPrompt = (login: string) => Promise<boolean>;
 export type LandingChoicePrompt = () => Promise<"primary" | "sandbox">;
 
 /**
+ * Prompt for the new-sandbox repository NAME on the inherited fork, pre-filled
+ * with the default `<src-repo>-backtest`. Returns the (trimmed) name the user
+ * accepted or edited; the edited value flows straight through to the creator
+ * (VAL-CREATE-003). Off-TTY it returns the default unchanged.
+ */
+export type SandboxNamePrompt = (defaultName: string) => Promise<string>;
+
+/**
  * Render the scoped (NO) fork's "Land the backtest PR in the original source
  * repo? [Y/n]" question and return the answer.
  */
@@ -135,6 +146,11 @@ export interface AuthFirstResolvers {
   offerInherited: AuthOfferPrompt;
   /** The inherited-fork two-option "Where should the backtest PR land?" prompt. */
   promptLanding: LandingChoicePrompt;
+  /**
+   * The inherited new-sandbox NAME prompt, pre-filled with `<src-repo>-backtest`
+   * and editable (VAL-CREATE-003). Invoked AFTER the warn-upfront line.
+   */
+  promptSandboxName: SandboxNamePrompt;
   /** The scoped-fork "Land in the original source repo? [Y/n]" prompt. */
   promptLandInSource: LandInSourcePrompt;
   /** The scoped-fork `owner/repo`-or-URL prompt (re-prompts on parse error). */
@@ -190,6 +206,15 @@ export async function resolveAuthFirstChoice(
  * `isSandbox` true, dest `<src-owner>/<src-repo>-backtest`, routed into the
  * EXISTING create path. The inherited credential is carried back on both choices
  * so the resolvers use the inherited token (no paste).
+ *
+ * New-sandbox refinements (spec §5):
+ *  - WARN UPFRONT, BEFORE any create attempt, naming the repo to be created
+ *    (`<src-owner>/<src-repo>-backtest`) and that it needs repo-creation scope on
+ *    `<src-owner>` (VAL-CREATE-002).
+ *  - Show the default name and let the user EDIT it; the edited value flows
+ *    through to the creator unchanged (VAL-CREATE-003).
+ * The 403 → Primary fallback is settled later, in the orchestrator's destination
+ * resolution (before the plan) — not here.
  */
 async function resolveInheritedFork(
   source: RepoRef,
@@ -207,13 +232,15 @@ async function resolveInheritedFork(
       scopedSandboxPastes: null,
     };
   }
-  // "a new sandbox repo" → the default <src-owner>/<src-repo>-backtest, routed
-  // into the existing verifyOrCreateDestination create path (next feature owns
-  // the warn-upfront / editable-name / 403-fallback refinements).
-  const dest: RepoRef = {
-    owner: source.owner,
-    repo: `${source.repo}${SANDBOX_NAME_SUFFIX}`,
-  };
+  // "a new sandbox repo" → default <src-owner>/<src-repo>-backtest under the
+  // SOURCE owner. WARN UPFRONT first (VAL-CREATE-002), then offer the editable
+  // name (VAL-CREATE-003). The chosen name flows into the dest the orchestrator
+  // routes through the existing verifyOrCreateDestination create path.
+  const defaultName = `${source.repo}${SANDBOX_NAME_SUFFIX}`;
+  info("");
+  info(sandboxCreateWarning(source, defaultName));
+  const name = await resolvers.promptSandboxName(defaultName);
+  const dest: RepoRef = { owner: source.owner, repo: name };
   const saved = resolvers.getDefaultDestination();
   const offerRemember = !(saved && sameRepo(saved, dest));
   return {
@@ -224,6 +251,24 @@ async function resolveInheritedFork(
     inheritedCredential: inherited,
     scopedSandboxPastes: null,
   };
+}
+
+/**
+ * The exact warn-upfront copy for the inherited new-sandbox choice (spec §5).
+ * Names the repo to be created (`<src-owner>/<defaultName>`) and states the one
+ * prerequisite: repo-creation scope on the source owner. Exported (and greppable)
+ * so a test can assert the rendered string without driving `prompts`. NEVER
+ * echoes a token.
+ */
+export function sandboxCreateWarning(
+  source: RepoRef,
+  defaultName: string,
+): string {
+  return (
+    `I'll create a new private repo ${source.owner}/${defaultName} to hold the ` +
+    `backtests. This only works if your login can create repos in ` +
+    `${source.owner}.`
+  );
 }
 
 /**
@@ -352,6 +397,35 @@ export function makeLandingChoicePrompt(
       ],
     });
     return index === 1 ? "sandbox" : "primary";
+  };
+}
+
+/**
+ * Build the real inherited new-sandbox NAME prompt, pre-filled with the default
+ * `<src-repo>-backtest` and editable (VAL-CREATE-003). The user can accept the
+ * default (Enter) or type a new name; the trimmed result flows straight to the
+ * creator. An empty/aborted entry falls back to the default. Off-TTY it returns
+ * the default unchanged rather than hanging.
+ */
+export function makeSandboxNamePrompt(
+  options: AuthOfferPromptOptions = {},
+): SandboxNamePrompt {
+  const isTTY = options.isTTY ?? (() => process.stdin.isTTY === true);
+  return async (defaultName: string): Promise<string> => {
+    if (!isTTY()) {
+      return defaultName;
+    }
+    const { name } = await prompts({
+      type: "text",
+      name: "name",
+      message: "New sandbox repo name:",
+      initial: defaultName,
+    });
+    if (typeof name !== "string") {
+      return defaultName;
+    }
+    const trimmed = name.trim();
+    return trimmed.length > 0 ? trimmed : defaultName;
   };
 }
 
