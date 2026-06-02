@@ -16,9 +16,12 @@
 import type { Octokit } from "@octokit/rest";
 
 import {
+  computeTokenNeeds,
   NoTokenNonInteractiveError,
   resolveToken,
+  resolveTokensForRun,
   type AuthResult,
+  type RunTokens,
 } from "./auth.js";
 import {
   addSourceRemote,
@@ -87,6 +90,18 @@ const EXIT = {
  */
 export interface RunBacktestDeps {
   resolveToken: typeof resolveToken;
+  /**
+   * Compute the required token purposes from source/destination/visibility
+   * (pure). Injected so a routing test can drive `resolveTokensForRun` without
+   * re-deriving the needs rule.
+   */
+  computeTokenNeeds: typeof computeTokenNeeds;
+  /**
+   * Resolve a token per required purpose, collapsing to one when a single token
+   * covers both. The routing then builds one or two Octokit instances from the
+   * returned `{ readToken, writeToken, twoToken }`.
+   */
+  resolveTokensForRun: typeof resolveTokensForRun;
   makeOctokit: typeof makeOctokit;
   resolveDestination: (
     source: RepoRef,
@@ -116,6 +131,8 @@ export interface RunBacktestDeps {
 /** Production wiring for {@link RunBacktestDeps} — the live, non-test path. */
 const defaultDeps: RunBacktestDeps = {
   resolveToken,
+  computeTokenNeeds,
+  resolveTokensForRun,
   makeOctokit,
   resolveDestination,
   verifyRepo,
@@ -214,8 +231,28 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   // The token is already registered with the secret scrubber inside
   // resolveToken (armed before the validation request), so it is scrubbed from
-  // all output for the rest of the run.
-  const octokit: Octokit = deps.makeOctokit(token);
+  // all output for the rest of the run. This default token is the WRITE/default
+  // candidate; its Octokit drives RESOLUTION (the source-visibility probe below
+  // and the destination verify/create) — not the run's source read.
+  const defaultOctokit: Octokit = deps.makeOctokit(token);
+
+  // 2a. Source-visibility probe (RESOLUTION, not the run's source-read). Attempt
+  //     repos.get(source) with the DEFAULT token via `verifyRepo`. This decides
+  //     whether the run needs a SEPARATE read token: when the default token can
+  //     read the source (`exists` true), no second token is required, so we mark
+  //     `sourcePrivate = false` (computeTokenNeeds keeps the source read on the
+  //     default token). On a 403/404 (verifyRepo → `exists: false`) or any probe
+  //     error the default token cannot read the source, so we assume it is
+  //     private/unreadable and force a read purpose, which resolves a scoped read
+  //     token (GITHUB_SOURCE_TOKEN / owner-scoped / guided paste). Using the
+  //     default token HERE is allowed — this is resolution, not a run source-read.
+  let sourcePrivate = true;
+  try {
+    const verification = await deps.verifyRepo(defaultOctokit, owner, repo);
+    sourcePrivate = !verification.exists;
+  } catch {
+    sourcePrivate = true;
+  }
 
   // 2b. Resolve where writes go. The source PR is always READ from `owner/repo`;
   //     the destination is where the branches and simulated PR are CREATED. The
@@ -241,16 +278,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         }),
         getDefaultDestination: () => deps.readConfig()?.defaultDestination,
         getIsTTY: () => process.stdin.isTTY === true,
+        // Destination verify/create + the authenticated-login lookup are
+        // RESOLUTION steps that decide WHERE writes go; they run on the default
+        // token's Octokit. The per-owner WRITE Octokit is built below from the
+        // resolved write token and used for the actual destination run calls
+        // (findExistingPr / createPullRequest).
         verifyDestination: (vOwner, vRepo) =>
-          deps.verifyRepo(octokit, vOwner, vRepo),
-        createSandbox: deps.makeSandboxCreator(octokit),
+          deps.verifyRepo(defaultOctokit, vOwner, vRepo),
+        createSandbox: deps.makeSandboxCreator(defaultOctokit),
         prompt: deps.makeInteractivePrompt(),
-        // Minimal seam wiring: back the personal-sandbox menu row with the
-        // authenticated login. Per-purpose token routing is finalized by the
-        // later routing feature; here a single octokit suffices. The resolver
-        // degrades gracefully if this throws.
         getAuthenticatedLogin: async () =>
-          (await octokit.users.getAuthenticated()).data.login,
+          (await defaultOctokit.users.getAuthenticated()).data.login,
       },
     );
     destOwner = resolved.owner;
@@ -270,16 +308,63 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   destTrace.done(redactedRepoRef(destOwner, destRepo));
 
+  // 2c. Resolve a token PER PURPOSE and route each run operation by the owner it
+  //     touches (spec §10). `computeTokenNeeds` turns source/destination/source-
+  //     visibility into the required purposes; `resolveTokensForRun` resolves a
+  //     token for each (collapsing to ONE when a single token covers both — the
+  //     common case, byte-for-byte unchanged from today). The WRITE purpose's
+  //     candidate is the already-resolved default token; the READ purpose
+  //     resolves via GITHUB_SOURCE_TOKEN / owner-scoped saved / the default token
+  //     (when it passed the source probe) / a guided read-only paste.
+  //
+  //     A non-interactive run that needs a read token it cannot resolve throws
+  //     NoTokenNonInteractiveError HERE — before any clone/push/create — so no
+  //     write side effect occurs (maps to exit 1, matching the no-token mapping).
+  const purposes = deps.computeTokenNeeds({
+    source: { owner, repo },
+    destination: { owner: destOwner, repo: destRepo },
+    sourcePrivate,
+  });
+  let runTokens: RunTokens;
+  try {
+    runTokens = await deps.resolveTokensForRun({
+      purposes,
+      makeOctokit: deps.makeOctokit,
+      // The write purpose's default candidate is the already-resolved default
+      // token — reuse it directly so the gh-CLI / paste prompt never re-fires.
+      getDefaultToken: async () => ({ token, source: "classic", fromPaste: false }),
+    });
+  } catch (err) {
+    if (err instanceof NoTokenNonInteractiveError) {
+      // Missing read token, non-interactive: exit 1 before any write side effect.
+      error(messageOf(err));
+      process.exit(EXIT.BAD_ARGS);
+    }
+    error(messageOf(err));
+    process.exit(EXIT.API_ERROR);
+  }
+
+  // Build the per-owner Octokit instances. When the read and write tokens are
+  // IDENTICAL, construct exactly ONE instance and use it for both — observable
+  // behavior identical to a one-token run today (VAL-ROUTE-003). When they
+  // differ, source reads use `readOctokit` and destination calls use
+  // `writeOctokit`; neither token ever crosses to the other's operations
+  // (INV-READTOKEN-NOWRITE / INV-WRITETOKEN-PURPOSE).
+  const writeOctokit: Octokit = deps.makeOctokit(runTokens.writeToken);
+  const readOctokit: Octokit = runTokens.twoToken
+    ? deps.makeOctokit(runTokens.readToken)
+    : writeOctokit;
+
   // 3. Fetch the PR and its commits. Any GitHub/API error maps to exit 2.
   let prTitle: string;
   let prAuthor: string;
   let prCommits: Awaited<ReturnType<typeof listPullRequestCommits>>;
   const readTrace = traceOp(`Read PR ${redactedRepoRef(owner, repo)}#${number}`);
   try {
-    const pr = await deps.getPullRequest(octokit, owner, repo, number);
+    const pr = await deps.getPullRequest(readOctokit, owner, repo, number);
     prTitle = pr.title;
     prAuthor = pr.user;
-    prCommits = await deps.listPullRequestCommits(octokit, owner, repo, number);
+    prCommits = await deps.listPullRequestCommits(readOctokit, owner, repo, number);
   } catch (err) {
     readTrace.fail();
     error(messageOf(err));
@@ -297,7 +382,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const target = resolveTarget(opts.commit, prCommits);
     let prefetchedParent: string | null = null;
     if (!target.parents[0]) {
-      prefetchedParent = await deps.getCommitParentSha(octokit, owner, repo, target.sha);
+      prefetchedParent = await deps.getCommitParentSha(readOctokit, owner, repo, target.sha);
     }
     baseSha = resolveBase(target, () => prefetchedParent ?? "");
     targetSha = target.sha;
@@ -316,7 +401,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   let existingUrl: string | null;
   try {
     existingUrl = await deps.findExistingPr(
-      octokit,
+      writeOctokit,
       destOwner,
       destRepo,
       headBranch,
@@ -361,22 +446,31 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
 
   let prUrl: string | null = null;
   try {
-    // The token authenticates via an in-memory credential — never logged.
-    // clone/fetch/push each narrate their own ✓ completion line from git.ts
-    // (via `traceOp`), so index.ts does NOT add a `step("Cloning …")` line here
-    // — that would double-narrate the same operation.
-    const git = await deps.cloneRepo(destOwner, destRepo, token, tmpDir);
+    // Per-owner git credential routing (spec §10):
+    //  - clone (origin = destination) authenticates with the WRITE token;
+    //  - the `source`-remote fetch (sandbox mode) authenticates with the READ
+    //    token, supplied per-op so it never becomes the push credential;
+    //  - push (origin = destination) re-asserts the WRITE token per-op so a
+    //    prior source fetch's read-token override can never authenticate it.
+    // The token reaches git ONLY via the askpass env — never logged, in a URL,
+    // or on the command line. clone/fetch/push each narrate their own ✓ from
+    // git.ts, so index.ts adds no `step("Cloning …")` line of its own.
+    const git = await deps.cloneRepo(destOwner, destRepo, runTokens.writeToken, tmpDir);
 
     // In sandbox mode the commits live in the PR's repo, not the sandbox —
-    // fetch them from a `source` remote. Otherwise origin (the clone) has them.
+    // fetch them from a `source` remote with the READ token. Otherwise origin
+    // (the clone) already has them and authenticates with the write token.
     const commitRemote = isSandbox ? "source" : "origin";
+    // The source fetch uses the READ token; the origin fetch uses the WRITE
+    // token (the clone's baked-in credential, re-asserted for clarity).
+    const fetchToken = isSandbox ? runTokens.readToken : runTokens.writeToken;
     if (isSandbox) {
       await deps.addSourceRemote(git, owner, repo);
     }
 
     try {
-      await deps.fetchCommit(git, baseSha, number, commitRemote);
-      await deps.fetchCommit(git, targetSha, number, commitRemote);
+      await deps.fetchCommit(git, baseSha, number, commitRemote, fetchToken);
+      await deps.fetchCommit(git, targetSha, number, commitRemote, fetchToken);
     } catch (err) {
       if (err instanceof UnfetchableCommitError) {
         error(err.message);
@@ -385,8 +479,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       throw err;
     }
 
-    await deps.pushBranchFromSha(git, baseSha, baseBranch);
-    await deps.pushBranchFromSha(git, targetSha, headBranch);
+    await deps.pushBranchFromSha(git, baseSha, baseBranch, runTokens.writeToken);
+    await deps.pushBranchFromSha(git, targetSha, headBranch, runTokens.writeToken);
 
     // Open-PR has no git-layer trace, so narrate its ✓ completion here.
     const openTrace = traceOp("Opened backtest PR");
@@ -398,7 +492,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     ].join("\n");
     try {
       prUrl = await deps.createPullRequest(
-        octokit,
+        writeOctokit,
         destOwner,
         destRepo,
         headBranch,
@@ -414,7 +508,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       if (isHttpStatus(err, 422)) {
         const existingUrl = await deps
           .findExistingPr(
-            octokit,
+            writeOctokit,
             destOwner,
             destRepo,
             headBranch,

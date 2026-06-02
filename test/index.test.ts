@@ -30,6 +30,7 @@ import {
   type RunBacktestOptions,
 } from "../src/index.js";
 import { UnfetchableCommitError } from "../src/git.js";
+import { NoTokenNonInteractiveError } from "../src/auth.js";
 import { setTtyOverride, setVerbose } from "../src/log.js";
 
 /** An `Error` tagged with the exit code a stubbed `process.exit` was given. */
@@ -440,4 +441,299 @@ test("a primary run never adds a source remote and fetches from origin", async (
     { owner: SOURCE_OWNER, repo: SOURCE_REPO },
     "primary mode clones the source repo (which is the chosen destination)",
   );
+});
+
+// --- git + Octokit routing: per-owner token + per-instance Octokit ---------
+//
+// These tests are the AUTHORITATIVE evidence for VAL-ROUTE-001/002/003 and
+// VAL-INV-001/002/006. They observe (a) WHICH Octokit instance each API call
+// received, and (b) WHICH token authenticated each git op, by injecting a
+// recording `makeOctokit` (distinct instance per token) and a
+// `resolveTokensForRun` that returns chosen read/write tokens.
+
+const READ_TOKEN = "ghp_READ_token_value_must_route_to_source_reads";
+const WRITE_TOKEN = "ghp_WRITE_token_value_must_route_to_dest_writes";
+
+/** A recorded API call: the op label + the token whose Octokit was passed. */
+interface ApiCall {
+  op: string;
+  token: string;
+}
+/** A recorded git op: the op label + the token used to authenticate it. */
+interface GitCall {
+  op: string;
+  token: string | undefined;
+}
+
+/**
+ * Build routing-aware recording deps. `makeOctokit(token)` returns a tagged
+ * instance carrying its token so each API dep can record WHICH token's instance
+ * it received. `resolveTokensForRun` is stubbed to return the given tokens so a
+ * test can force a two-token (distinct) or one-token (identical) run. Each git
+ * dep records the token it was handed (the per-op credential seam).
+ */
+function makeRoutingDeps(opts: {
+  readToken: string;
+  writeToken: string;
+  isSandbox: boolean;
+  overrides?: Partial<RunBacktestDeps>;
+}): {
+  deps: Partial<RunBacktestDeps>;
+  apiCalls: ApiCall[];
+  gitCalls: GitCall[];
+  instances: Map<string, object>;
+} {
+  const apiCalls: ApiCall[] = [];
+  const gitCalls: GitCall[] = [];
+  const instances = new Map<string, object>();
+
+  // A distinct, identity-stable Octokit per token. Re-requesting the same token
+  // returns the SAME object so identity (===) is meaningful in assertions.
+  const makeOctokit = ((token: string): Octokit => {
+    let inst = instances.get(token);
+    if (!inst) {
+      inst = { __token: token } as unknown as object;
+      instances.set(token, inst);
+    }
+    return inst as unknown as Octokit;
+  }) as unknown as RunBacktestDeps["makeOctokit"];
+
+  /** Read the token an Octokit instance was tagged with. */
+  const tokenOf = (octokit: unknown): string =>
+    (octokit as { __token?: string }).__token ?? "<untagged>";
+
+  const twoToken = opts.readToken !== opts.writeToken;
+
+  const { deps: base } = makeDeps({
+    // The default/resolveToken credential is the write token, so a one-token run
+    // (read===write===default) collapses to a single constructed Octokit.
+    resolveToken: async () => ({
+      token: opts.writeToken,
+      username: "octocat",
+      source: "classic",
+    }),
+    makeOctokit,
+    computeTokenNeeds: () => [
+      { kind: "write", owner: "octocat", repo: "sandbox" },
+    ],
+    resolveTokensForRun: async () => ({
+      readToken: opts.readToken,
+      writeToken: opts.writeToken,
+      twoToken,
+    }),
+    resolveDestination: async (source) =>
+      opts.isSandbox
+        ? { owner: SANDBOX_OWNER, repo: SANDBOX_REPO, isSandbox: true }
+        : { owner: source.owner, repo: source.repo, isSandbox: false },
+    // verifyRepo is used by the source-visibility probe (default token) AND by
+    // the destination resolver. Tag-record nothing here; it always succeeds.
+    verifyRepo: async () => ({ exists: true, canPush: true }),
+    getPullRequest: async (octokit) => {
+      apiCalls.push({ op: "getPullRequest", token: tokenOf(octokit) });
+      return { title: "Add retry to fetch", user: "octocat" };
+    },
+    listPullRequestCommits: async (octokit) => {
+      apiCalls.push({ op: "listPullRequestCommits", token: tokenOf(octokit) });
+      return [
+        {
+          sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+          parents: [{ sha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1" }],
+        },
+      ];
+    },
+    getCommitParentSha: async (octokit) => {
+      apiCalls.push({ op: "getCommitParentSha", token: tokenOf(octokit) });
+      return "";
+    },
+    findExistingPr: async (octokit) => {
+      apiCalls.push({ op: "findExistingPr", token: tokenOf(octokit) });
+      return null;
+    },
+    createPullRequest: async (octokit) => {
+      apiCalls.push({ op: "createPullRequest", token: tokenOf(octokit) });
+      return CREATED_URL;
+    },
+    cloneRepo: async (_owner, _repo, token) => {
+      gitCalls.push({ op: "clone", token });
+      return fakeGit;
+    },
+    addSourceRemote: async () => {},
+    fetchCommit: async (_git, _sha, _prNumber, remote, token) => {
+      gitCalls.push({ op: `fetch:${remote}`, token });
+    },
+    pushBranchFromSha: async (_git, _sha, branch, token) => {
+      gitCalls.push({ op: `push:${branch}`, token });
+    },
+    ...opts.overrides,
+  });
+  return { deps: base, apiCalls, gitCalls, instances };
+}
+
+test("VAL-ROUTE-001: two-token run routes source reads to READ Octokit, dest calls to WRITE Octokit", async () => {
+  const { deps, apiCalls } = makeRoutingDeps({
+    readToken: READ_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  const sourceReads = ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"];
+  const destCalls = ["findExistingPr", "createPullRequest"];
+
+  for (const call of apiCalls) {
+    if (sourceReads.includes(call.op)) {
+      assert.equal(call.token, READ_TOKEN, `${call.op} must use the READ Octokit`);
+    }
+    if (destCalls.includes(call.op)) {
+      assert.equal(call.token, WRITE_TOKEN, `${call.op} must use the WRITE Octokit`);
+    }
+  }
+  // Both source reads actually happened on the read instance.
+  assert.ok(apiCalls.some((c) => c.op === "getPullRequest" && c.token === READ_TOKEN));
+  assert.ok(apiCalls.some((c) => c.op === "createPullRequest" && c.token === WRITE_TOKEN));
+});
+
+test("VAL-ROUTE-002: source-remote fetch uses READ token; clone + push use WRITE token", async () => {
+  const { deps, gitCalls } = makeRoutingDeps({
+    readToken: READ_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  const clone = gitCalls.find((c) => c.op === "clone");
+  assert.equal(clone?.token, WRITE_TOKEN, "clone authenticates with the WRITE token");
+
+  for (const c of gitCalls.filter((g) => g.op === "fetch:source")) {
+    assert.equal(c.token, READ_TOKEN, "the source fetch authenticates with the READ token");
+  }
+  for (const c of gitCalls.filter((g) => g.op.startsWith("push:"))) {
+    assert.equal(c.token, WRITE_TOKEN, "every push authenticates with the WRITE token");
+  }
+  assert.ok(gitCalls.some((c) => c.op === "fetch:source"), "the source fetch happened");
+});
+
+test("VAL-ROUTE-003: identical tokens construct exactly one Octokit and one git credential", async () => {
+  const { deps, gitCalls, instances } = makeRoutingDeps({
+    readToken: WRITE_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // Exactly one Octokit instance exists for the single token (the recording
+  // makeOctokit returns the same object per token, so a single map entry proves
+  // one instance covered both read and write).
+  assert.equal(instances.size, 1, "one token → exactly one Octokit instance");
+  // Every git op authenticates with that one token — byte-for-byte one-token.
+  for (const c of gitCalls) {
+    assert.equal(c.token, WRITE_TOKEN, `${c.op} uses the single token`);
+  }
+});
+
+test("VAL-INV-002 + VAL-INV-006: read token never authenticates a write; write token never the source fetch/read", async () => {
+  const { deps, apiCalls, gitCalls } = makeRoutingDeps({
+    readToken: READ_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // INV-002: the READ token is never the clone/push credential, nor the
+  // create/findExistingPr Octokit.
+  const writeGitOps = gitCalls.filter(
+    (c) => c.op === "clone" || c.op.startsWith("push:"),
+  );
+  for (const c of writeGitOps) {
+    assert.notEqual(c.token, READ_TOKEN, `${c.op} must never use the READ token`);
+  }
+  for (const c of apiCalls.filter((a) => a.op === "createPullRequest" || a.op === "findExistingPr")) {
+    assert.notEqual(c.token, READ_TOKEN, `${c.op} must never use the READ Octokit`);
+  }
+
+  // INV-006: the WRITE token never authenticates the source fetch or a source read.
+  for (const c of gitCalls.filter((g) => g.op === "fetch:source")) {
+    assert.notEqual(c.token, WRITE_TOKEN, "the source fetch must never use the WRITE token");
+  }
+  for (const c of apiCalls.filter((a) =>
+    ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"].includes(a.op),
+  )) {
+    assert.notEqual(c.token, WRITE_TOKEN, `${c.op} must never use the WRITE Octokit`);
+  }
+});
+
+test("VAL-INV-001: source owner/repo is never a push or createPullRequest target (cross-owner)", async () => {
+  // Record the owner/repo handed to clone/create + the branch handed to push.
+  const writes: WriteTarget[] = [];
+  const { deps } = makeRoutingDeps({
+    readToken: READ_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+    overrides: {
+      cloneRepo: async (owner, repo) => {
+        writes.push({ op: "clone", owner, repo });
+        return fakeGit;
+      },
+      pushBranchFromSha: async (_git, _sha, branch) => {
+        writes.push({ op: `push:${branch}`, owner: "", repo: "" });
+      },
+      createPullRequest: async (_octokit, owner, repo) => {
+        writes.push({ op: "create", owner, repo });
+        return CREATED_URL;
+      },
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  for (const w of writes) {
+    assert.ok(
+      !(w.owner === SOURCE_OWNER && w.repo === SOURCE_REPO),
+      `the source repo must never be a push/create target (was for ${w.op})`,
+    );
+  }
+  // create targeted the sandbox (destination), not the source.
+  const create = writes.find((w) => w.op === "create");
+  assert.deepEqual(
+    { owner: create?.owner, repo: create?.repo },
+    { owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
+  );
+});
+
+test("a non-interactive missing read token exits 1 before any clone/push/create", async () => {
+  // resolveTokensForRun throws the no-source-token error; the run must map it to
+  // exit 1 and perform NO write side effect.
+  const sideEffects = { clone: 0, push: 0, create: 0 };
+  const { deps } = makeDeps({
+    computeTokenNeeds: () => [
+      { kind: "read", owner: SOURCE_OWNER, repo: SOURCE_REPO },
+      { kind: "write", owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
+    ],
+    resolveTokensForRun: async () => {
+      throw new NoTokenNonInteractiveError();
+    },
+    resolveDestination: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+    }),
+    cloneRepo: async () => {
+      sideEffects.clone += 1;
+      return fakeGit;
+    },
+    pushBranchFromSha: async () => {
+      sideEffects.push += 1;
+    },
+    createPullRequest: async () => {
+      sideEffects.create += 1;
+      return CREATED_URL;
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 1, "a missing read token non-interactively exits 1");
+  assert.deepEqual(sideEffects, { clone: 0, push: 0, create: 0 }, "no write side effect occurred");
 });
