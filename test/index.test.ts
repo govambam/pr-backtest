@@ -163,7 +163,13 @@ function makeDeps(
     readConfig: () => null,
     getPullRequest: async () => {
       order.push("read-pr");
-      return { title: "Add retry to fetch", user: "octocat" };
+      return {
+        title: "Add retry to fetch",
+        user: "octocat",
+        headSha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        baseSha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
+        baseRef: "main",
+      };
     },
     listPullRequestCommits: async () => [
       {
@@ -171,7 +177,7 @@ function makeDeps(
         parents: [{ sha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1" }],
       },
     ],
-    getCommitParentSha: async () => "",
+    getMergeBase: async () => "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
     findExistingPr: async () => null,
     createPullRequest: async () => {
       order.push("open-pr");
@@ -218,7 +224,6 @@ async function run(
       try {
         await runBacktest({
           prUrl: PR_URL,
-          commit: "initial",
           yes: true,
           ...runOpts,
         });
@@ -470,6 +475,76 @@ test("VAL-BRANCH-002: the same PR at two different commits yields two distinct b
     "backtest-pr123-bbbbbbb-head",
   ]);
   assert.notDeepEqual(branchSets[0], branchSets[1], "two commits → two distinct branch sets");
+});
+
+// --- VAL-FULLPR: the default recreates the WHOLE PR, not just one commit -----
+
+// A multi-commit PR fixture whose first commit differs from the head, so a
+// "recreate only the first commit" regression is observable. The base-branch
+// ref is the PR's merge-base; the head-branch ref is the PR head (all commits).
+const FULLPR_MERGE_BASE = "0000000d" + "d".repeat(32);
+const FULLPR_FIRST = "1111111a" + "a".repeat(32);
+const FULLPR_MIDDLE = "2222222b" + "b".repeat(32);
+const FULLPR_HEAD = "3333333c" + "c".repeat(32);
+
+function makeFullPrDeps(pushes: { sha: string; branch: string }[]) {
+  return makeDeps({
+    getPullRequest: async () => ({
+      title: "Multi-commit feature",
+      user: "octocat",
+      headSha: FULLPR_HEAD,
+      // The base ref tip need not equal the merge-base; getMergeBase resolves the
+      // true branch point, and that is what must land on the base branch.
+      baseSha: "e".repeat(40),
+      baseRef: "main",
+    }),
+    listPullRequestCommits: async () => [
+      { sha: FULLPR_FIRST, parents: [{ sha: FULLPR_MERGE_BASE }] },
+      { sha: FULLPR_MIDDLE, parents: [{ sha: FULLPR_FIRST }] },
+      { sha: FULLPR_HEAD, parents: [{ sha: FULLPR_MIDDLE }] },
+    ],
+    getMergeBase: async () => FULLPR_MERGE_BASE,
+    pushBranchFromSha: async (_git, sha, branch) => {
+      pushes.push({ sha, branch });
+    },
+  });
+}
+
+test("VAL-FULLPR-001: the default recreates the whole PR — head = PR head, base = merge-base (every commit), not just the first", async () => {
+  const pushes: { sha: string; branch: string }[] = [];
+  const { deps } = makeFullPrDeps(pushes);
+  const { exit } = await run({ deps }); // no --commit → full PR
+  assert.equal(exit, 0);
+
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  const basePush = pushes.find((p) => p.branch.endsWith("-base"));
+  // The head branch must point at the PR HEAD (so all 3 commits are included),
+  // NOT the first commit — that was the single-commit bug.
+  assert.equal(headPush?.sha, FULLPR_HEAD, "head branch must be the PR head (all commits)");
+  assert.notEqual(headPush?.sha, FULLPR_FIRST, "must NOT recreate only the first commit");
+  // The base branch must be the merge-base (the PR's branch point), so the diff
+  // spans the whole PR.
+  assert.equal(basePush?.sha, FULLPR_MERGE_BASE, "base branch must be the merge-base");
+  // Branch names embed the PR head's short SHA.
+  assert.ok(
+    headPush?.branch.includes(FULLPR_HEAD.slice(0, 7)),
+    "branch names embed the PR head short SHA",
+  );
+});
+
+test("VAL-FULLPR-002: --commit <sha> cuts the head at that commit (all commits up to it); base stays the merge-base", async () => {
+  const pushes: { sha: string; branch: string }[] = [];
+  const { deps } = makeFullPrDeps(pushes);
+  // Cut the backtest at the FIRST commit: head moves to it, base stays the
+  // merge-base, so the backtest is exactly the PR as it stood at that point.
+  const { exit } = await run({ deps, commit: FULLPR_FIRST.slice(0, 10) });
+  assert.equal(exit, 0);
+
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  const basePush = pushes.find((p) => p.branch.endsWith("-base"));
+  assert.equal(headPush?.sha, FULLPR_FIRST, "the cutoff moves the head to the chosen commit");
+  assert.equal(basePush?.sha, FULLPR_MERGE_BASE, "base still points at the merge-base");
+  assert.ok(headPush?.branch.includes(FULLPR_FIRST.slice(0, 7)));
 });
 
 // --- VAL-BRANCH-003: open dedup → exit 4; closed does NOT block -------------
@@ -858,7 +933,13 @@ function makeRoutingDeps(opts: {
     verifyRepo: async () => ({ exists: true, canPush: true }),
     getPullRequest: async (octokit) => {
       apiCalls.push({ op: "getPullRequest", token: tokenOf(octokit) });
-      return { title: "Add retry to fetch", user: "octocat" };
+      return {
+        title: "Add retry to fetch",
+        user: "octocat",
+        headSha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        baseSha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
+        baseRef: "main",
+      };
     },
     listPullRequestCommits: async (octokit) => {
       apiCalls.push({ op: "listPullRequestCommits", token: tokenOf(octokit) });
@@ -869,9 +950,9 @@ function makeRoutingDeps(opts: {
         },
       ];
     },
-    getCommitParentSha: async (octokit) => {
-      apiCalls.push({ op: "getCommitParentSha", token: tokenOf(octokit) });
-      return "";
+    getMergeBase: async (octokit) => {
+      apiCalls.push({ op: "getMergeBase", token: tokenOf(octokit) });
+      return "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1";
     },
     findExistingPr: async (octokit) => {
       apiCalls.push({ op: "findExistingPr", token: tokenOf(octokit) });
@@ -906,7 +987,7 @@ test("VAL-ROUTE-001: two-token run routes source reads to READ Octokit, dest cal
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
 
-  const sourceReads = ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"];
+  const sourceReads = ["getPullRequest", "listPullRequestCommits", "getMergeBase"];
   const destCalls = ["findExistingPr", "createPullRequest"];
 
   for (const call of apiCalls) {
@@ -921,56 +1002,29 @@ test("VAL-ROUTE-001: two-token run routes source reads to READ Octokit, dest cal
   assert.ok(apiCalls.some((c) => c.op === "createPullRequest" && c.token === WRITE_TOKEN));
 });
 
-test("VAL-TEST-017: the getCommitParentSha prefetch fires for a parentless commit and uses the READ Octokit", async () => {
-  // Every other fixture sets parents[0], so index.ts's `if (!target.parents[0])`
-  // prefetch never runs and the routing assertions filter an empty set. Here the
-  // target commit carries NO parent, forcing runBacktest to call
-  // getCommitParentSha. We assert it (a) actually fires and (b) is issued via the
-  // READ Octokit, never the WRITE one. Routing the prefetch to the write token in
+test("VAL-TEST-017: the merge-base lookup fires once and uses the READ Octokit", async () => {
+  // The base is resolved via getMergeBase (a source read), so it must be issued
+  // on the READ Octokit, never the WRITE one. Routing it to the write token in
   // src/index.ts (a source read on the write credential — exactly what the suite
   // forbids) makes this test go red.
-  const PARENT_SHA = "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1";
   const { deps, apiCalls } = makeRoutingDeps({
     readToken: READ_TOKEN,
     writeToken: WRITE_TOKEN,
     isSandbox: true,
-    overrides: {
-      listPullRequestCommits: async (octokit) => {
-        apiCalls.push({
-          op: "listPullRequestCommits",
-          token: (octokit as { __token?: string }).__token ?? "<untagged>",
-        });
-        return [
-          {
-            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-            parents: [], // no parent → resolveBase must prefetch via getCommitParentSha
-          },
-        ];
-      },
-      getCommitParentSha: async (octokit) => {
-        apiCalls.push({
-          op: "getCommitParentSha",
-          token: (octokit as { __token?: string }).__token ?? "<untagged>",
-        });
-        return PARENT_SHA; // non-empty so resolveBase succeeds and the run completes
-      },
-    },
   });
-  // Select the parentless commit explicitly: `--commit initial` only matches a
-  // commit with exactly one parent, so it would never select a root commit.
-  const { exit } = await run({ deps, commit: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" });
-  assert.equal(exit, 0, "the run completes once the parent is prefetched");
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0, "the run completes");
 
-  const prefetch = apiCalls.filter((c) => c.op === "getCommitParentSha");
-  assert.equal(prefetch.length, 1, "the prefetch fired exactly once");
+  const mergeBase = apiCalls.filter((c) => c.op === "getMergeBase");
+  assert.equal(mergeBase.length, 1, "the merge-base lookup fired exactly once");
   assert.equal(
-    prefetch[0]!.token,
+    mergeBase[0]!.token,
     READ_TOKEN,
-    "the parent prefetch must use the READ Octokit",
+    "the merge-base lookup must use the READ Octokit",
   );
   assert.ok(
-    !apiCalls.some((c) => c.op === "getCommitParentSha" && c.token === WRITE_TOKEN),
-    "the parent prefetch must NEVER use the WRITE Octokit",
+    !apiCalls.some((c) => c.op === "getMergeBase" && c.token === WRITE_TOKEN),
+    "the merge-base lookup must NEVER use the WRITE Octokit",
   );
 });
 
@@ -1029,7 +1083,7 @@ test("VAL-TOKEN-008 + VAL-ROUTE-002: read token never authenticates a write; wri
     assert.notEqual(c.token, WRITE_TOKEN, "the source fetch must never use the WRITE token");
   }
   for (const c of apiCalls.filter((a) =>
-    ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"].includes(a.op),
+    ["getPullRequest", "listPullRequestCommits", "getMergeBase"].includes(a.op),
   )) {
     assert.notEqual(c.token, WRITE_TOKEN, `${c.op} must never use the WRITE Octokit`);
   }
@@ -1091,7 +1145,7 @@ test("VAL-TOKEN-002 / VAL-FLOW-001: a sandbox run with a read-only source token 
   }
   for (const c of apiCalls.filter((a) => a.token === READ_TOKEN)) {
     assert.ok(
-      ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"].includes(c.op),
+      ["getPullRequest", "listPullRequestCommits", "getMergeBase"].includes(c.op),
       `the READ token only authenticates source reads (was ${c.op})`,
     );
   }
@@ -1107,7 +1161,7 @@ test("VAL-TOKEN-006: a missing WRITE token non-interactively exits 1 naming GITH
     },
     getPullRequest: async () => {
       sideEffects.readPr += 1;
-      return { title: "x", user: "y" };
+      return { title: "x", user: "y", headSha: "a".repeat(40), baseSha: "b".repeat(40), baseRef: "main" };
     },
     cloneRepo: async () => {
       sideEffects.clone += 1;

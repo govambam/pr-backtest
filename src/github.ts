@@ -14,6 +14,12 @@ export interface PullRequest {
   title: string;
   /** The PR author's login (empty string if GitHub returns no user). */
   user: string;
+  /** The PR head commit SHA — the tip of the PR branch (its last commit). */
+  headSha: string;
+  /** The PR base commit SHA — the tip of the base branch at read time. */
+  baseSha: string;
+  /** The base branch name, e.g. "main". Used only for plan/label wording. */
+  baseRef: string;
 }
 
 /**
@@ -120,6 +126,9 @@ export async function getPullRequest(
     return {
       title: data.title,
       user: data.user?.login ?? "",
+      headSha: data.head.sha,
+      baseSha: data.base.sha,
+      baseRef: data.base.ref,
     };
   } catch (err: unknown) {
     if (isStatus(err, 404)) {
@@ -135,7 +144,7 @@ export async function getPullRequest(
 /**
  * List a PR's commits in API order via `pulls.listCommits`, paginated so PRs
  * with more than one page of commits are fully covered. Shaped as `PrCommit[]`
- * for `resolveTarget`.
+ * for `resolveHead` (and the commit-count for the plan).
  */
 export async function listPullRequestCommits(
   octokit: Octokit,
@@ -156,18 +165,23 @@ export async function listPullRequestCommits(
 }
 
 /**
- * Look up a commit's first-parent SHA via `repos.getCommit`. Used as the
- * `getParentSha` callback for `resolveBase` when a listed commit carries no
- * parent of its own. Returns the empty string for a root commit (no parents).
+ * Resolve the merge-base of two commits via `repos.compareCommits` —
+ * `merge_base_commit.sha`, the commit GitHub computes the PR diff against. This
+ * is the PR's true branch point even when the base branch has advanced since the
+ * PR opened, so the recreated diff matches GitHub's "Files changed" tab exactly.
+ *
+ * Only the merge-base SHA is read from the (possibly large) compare payload; the
+ * commit/file lists it also returns are ignored.
  */
-export async function getCommitParentSha(
+export async function getMergeBase(
   octokit: Octokit,
   owner: string,
   repo: string,
-  sha: string,
+  base: string,
+  head: string,
 ): Promise<string> {
-  const { data } = await octokit.repos.getCommit({ owner, repo, ref: sha });
-  return data.parents[0]?.sha ?? "";
+  const { data } = await octokit.repos.compareCommits({ owner, repo, base, head });
+  return data.merge_base_commit.sha;
 }
 
 /**

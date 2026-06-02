@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { verifyRepo } from "../src/github.js";
+import { getMergeBase, getPullRequest, verifyRepo } from "../src/github.js";
 import type { Octokit } from "@octokit/rest";
 
 /** An HTTP-status-bearing error shaped like an Octokit failure. */
@@ -75,4 +75,81 @@ test("verifyRepo: non-404 error (500) is rethrown", async () => {
     () => verifyRepo(octokit, "me", "broken"),
     (err: unknown) => err instanceof Error && (err as { status: number }).status === 500,
   );
+});
+
+test("getMergeBase: returns merge_base_commit.sha", async () => {
+  const octokit = {
+    repos: {
+      compareCommits: async () => ({
+        data: { merge_base_commit: { sha: "base-sha-123" } },
+      }),
+    },
+  } as unknown as Octokit;
+  const sha = await getMergeBase(octokit, "me", "repo", "main", "feature");
+  assert.equal(sha, "base-sha-123");
+});
+
+test("getMergeBase: passes { owner, repo, base, head } through to compareCommits", async () => {
+  let captured: unknown;
+  const octokit = {
+    repos: {
+      compareCommits: async (args: unknown) => {
+        captured = args;
+        return { data: { merge_base_commit: { sha: "abc" } } };
+      },
+    },
+  } as unknown as Octokit;
+  await getMergeBase(octokit, "acme", "api", "main", "topic");
+  assert.deepEqual(captured, {
+    owner: "acme",
+    repo: "api",
+    base: "main",
+    head: "topic",
+  });
+});
+
+test("getPullRequest: maps pulls.get data to the PullRequest shape", async () => {
+  const octokit = {
+    pulls: {
+      get: async () => ({
+        data: {
+          title: "Add feature",
+          user: { login: "octocat" },
+          head: { sha: "head-sha" },
+          base: { sha: "base-sha", ref: "main" },
+        },
+      }),
+    },
+  } as unknown as Octokit;
+  const result = await getPullRequest(octokit, "me", "repo", 7);
+  assert.deepEqual(result, {
+    title: "Add feature",
+    user: "octocat",
+    headSha: "head-sha",
+    baseSha: "base-sha",
+    baseRef: "main",
+  });
+});
+
+test("getPullRequest: null user falls back to empty string", async () => {
+  const octokit = {
+    pulls: {
+      get: async () => ({
+        data: {
+          title: "No author",
+          user: null,
+          head: { sha: "h" },
+          base: { sha: "b", ref: "main" },
+        },
+      }),
+    },
+  } as unknown as Octokit;
+  const result = await getPullRequest(octokit, "me", "repo", 9);
+  assert.deepEqual(result, {
+    title: "No author",
+    user: "",
+    headSha: "h",
+    baseSha: "b",
+    baseRef: "main",
+  });
 });

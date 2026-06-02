@@ -1,6 +1,6 @@
 # pr-backtest
 
-Recreate a GitHub pull request at a chosen commit, so a PR-review bot can review the code exactly as it existed then. Point it at a PR URL and it opens a fresh PR whose diff matches that commit. Your `main` branch is never touched.
+Recreate a GitHub pull request — all of its commits — so a PR-review bot can review the code exactly as the PR presented it. Point it at a PR URL and it opens a fresh PR whose diff matches the original's, from the PR's merge-base up to its head. Your `main` branch is never touched.
 
 **Why:** backtest a PR-review bot against history. Take a PR whose outcome you already know, replay it at its original commit, and see how your bot does on a "brand new" PR.
 
@@ -55,10 +55,11 @@ A pasted token is saved automatically to `~/.config/pr-backtest/config.json` (mo
 ## Usage
 
 ```bash
-# Recreate at the PR's initial (first non-merge) commit — prints a plan, asks to confirm
+# Recreate the whole PR — all commits, base..head — prints a plan, asks to confirm
 pr-backtest https://github.com/acme/api/pull/123
 
-# Recreate at a specific commit (head at that commit, base at its parent)
+# Recreate the PR only up to a commit (all commits up to it; base stays the merge-base).
+# Useful to replay the PR as it stood before later fix-up commits.
 pr-backtest https://github.com/acme/api/pull/123 --commit a1b2c3d
 
 # Skip the confirmation prompt (for scripting)
@@ -81,7 +82,7 @@ pr-backtest logout
 
 | Command | Description |
 |---|---|
-| `pr-backtest <pr-url> [options]` | Recreate the PR at a chosen commit and open a backtest PR. |
+| `pr-backtest <pr-url> [options]` | Recreate the PR (all commits by default) and open a backtest PR. |
 | `pr-backtest status` | Print the saved source/destination token logins + types and the default destination. Never prints a token value; makes no network call. |
 | `pr-backtest logout` | Delete the saved config (both token slots and any saved default destination). |
 
@@ -102,8 +103,8 @@ Running against a **Primary** destination (the PR's own repo) prints a plan like
 $ pr-backtest https://github.com/acme/api/pull/123 --primary
 
 PR:      acme/api#123 "Add retry logic to webhook handler" by @stevem
-Target:  a1b2c3d (initial commit)
-Base:    f0e9d8c (parent of target)
+Head:    a1b2c3d (PR head — 7 commits)
+Base:    f0e9d8c (merge-base with main)
 
 Plan:
   1. Clone acme/api into a temp directory
@@ -123,8 +124,8 @@ A **Sandbox** destination reads the PR from its own repo but writes everything t
 $ pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox
 
 PR:      acme/api#123 "Add retry logic to webhook handler" by @stevem   (read-only — source is never written)
-Target:  a1b2c3d (initial commit)
-Base:    f0e9d8c (parent of target)
+Head:    a1b2c3d (PR head — 7 commits)
+Base:    f0e9d8c (merge-base with main)
 Into:    myuser/pr-backtest-sandbox (sandbox — branches and PR are created here)
 
 Plan:
@@ -164,14 +165,14 @@ When you run without a destination flag in a terminal, pr-backtest first offers 
 
 ## Branch names and re-runs
 
-Each backtest pushes two branches whose names include the **short SHA of the target commit**:
+Each backtest pushes two branches whose names include the **short SHA of the head commit** (the PR head, or the `--commit` cutoff):
 
 ```
 backtest-pr<N>-<shortSha>-head
 backtest-pr<N>-<shortSha>-base
 ```
 
-So the **(PR, commit)** pair is the backtest's identity: the same PR replayed at two different commits produces distinct branches (no collision), while re-running the same PR at the same commit targets the same branches.
+So the **(PR, head)** pair is the backtest's identity: the same PR replayed at two different cutoffs produces distinct branches (no collision), while re-running the same PR at the same head targets the same branches.
 
 Before pushing, pr-backtest checks for an existing **open** backtest PR for those branches. If one exists, it exits `4` and prints that PR's URL to stdout:
 
@@ -268,9 +269,9 @@ Because exit `4` prints the existing PR's URL to stdout, a re-run is idempotent:
 
 ## Limitations
 
-- **Deleted or unreachable commits.** If the target or base commit can no longer be fetched — the commit was deleted (an old force-push, a repo transfer/delete), the PR came from a fork whose owner deleted their branch, or your token can't read the commit — the run fails (exit `3`) with the two manual `git push` lines you can use to recreate the branches yourself.
-- **No diff between the two commits.** If the target commit and its parent produce no difference, GitHub rejects the empty PR (422) and the tool exits `2` rather than opening a no-op PR.
-- **PRs with more than 250 commits.** The GitHub API lists only the first 250 commits of a PR. For a PR larger than that, `--commit initial` still works (the first commit is always listed), but a `--commit <sha>` pointing at a commit in the unlisted tail is reported as not matching any commit in the PR; push that commit as a branch manually instead.
+- **Deleted or unreachable commits.** If the head or merge-base commit can no longer be fetched — the commit was deleted (an old force-push, a repo transfer/delete), the PR came from a fork whose owner deleted their branch, or your token can't read the commit — the run fails (exit `3`) with the two manual `git push` lines you can use to recreate the branches yourself.
+- **No diff across the PR.** If the head and the merge-base produce no difference, GitHub rejects the empty PR (422) and the tool exits `2` rather than opening a no-op PR.
+- **PRs with more than 250 commits.** The GitHub API lists only the first 250 commits of a PR. The default (full PR) is unaffected — the head comes from the PR itself, not the commit list — but a `--commit <sha>` cutoff pointing at a commit in the unlisted tail is reported as not matching any commit in the PR; push that commit as a branch manually instead.
 
 ## License
 

@@ -31,16 +31,15 @@ const program = new Command();
 program
   .name("pr-backtest")
   .description(
-    "Recreate a GitHub PR at a chosen commit so a PR-review bot can review it.",
+    "Recreate a GitHub PR (all its commits) so a PR-review bot can review it.",
   )
   .version(packageVersion(), "-v, --version", "Print the version and exit");
 
 program
   .argument("<pr-url>", "Full GitHub PR URL, e.g. https://github.com/acme/api/pull/123")
   .option(
-    "--commit <ref>",
-    "'initial' (first non-merge commit) or a commit SHA",
-    "initial",
+    "--commit <sha>",
+    "recreate the PR only up to this commit SHA (default: the full PR, all commits)",
   )
   .option("-y, --yes", "Skip the confirmation prompt (for scripting)", false)
   .option("--primary", "Land the backtest in the PR's own repo (no prompt)")
@@ -90,6 +89,9 @@ program
       "",
       "  Land in a separate repo you control (creating it if missing):",
       "    pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox --create-sandbox",
+      "",
+      "  Recreate the PR only as it stood at an earlier commit (all commits up to it):",
+      "    pr-backtest https://github.com/acme/api/pull/123 --commit a1b2c3d",
       "  To keep the source read with a read-only token, set GITHUB_SOURCE_TOKEN",
       "  (read-only) and GITHUB_TOKEN (write).",
     ].join("\n"),
@@ -98,7 +100,7 @@ program
     async (
       prUrl: string,
       options: {
-        commit: string;
+        commit?: string;
         yes: boolean;
         primary?: boolean;
         sandbox?: string;
