@@ -26,7 +26,7 @@ A backtest needs exactly two capabilities: **read** the source and **write** the
 
 **Two environment variables (owner-agnostic):**
 
-- **`GITHUB_TOKEN`** — the destination/write token. It also reads the source when it covers the source too (the single-PAT case). For a **Primary** destination it is the one read + write token. Set it with `export GITHUB_TOKEN=ghp_...` (or prefix a single run: `GITHUB_TOKEN=ghp_... pr-backtest <pr-url>`). Non-interactive runs require it.
+- **`GITHUB_TOKEN`** — the destination/write token. It also reads the source when it covers the source too (the single-PAT case). For a **Primary** destination it is the one read + write token. Set it with `export GITHUB_TOKEN=github_pat_...` (or prefix a single run: `GITHUB_TOKEN=github_pat_... pr-backtest <pr-url>`). Non-interactive runs require it.
 - **`GITHUB_SOURCE_TOKEN`** — optional read-only source token. When set, it reads the source and `GITHUB_TOKEN` only writes the destination. This is the quarantined two-token setup (the source token can be scoped read-only, so a write to the source is impossible by scope).
 
 Per-capability resolution order (first match that validates wins; no owner logic, no source-visibility probe):

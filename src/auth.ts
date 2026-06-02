@@ -57,9 +57,9 @@ export class NoTokenNonInteractiveError extends Error {
   constructor() {
     super(
       "No GitHub write token configured and stdin is not a TTY. Set GITHUB_TOKEN " +
-        "to a token that can write the destination, run `pr-backtest <pr-url>` in " +
-        "an interactive terminal to configure one, or see the README setup " +
-        "instructions.",
+        "to a token with Contents: Read & write and Pull requests: Read & write on " +
+        "the destination repo, run `pr-backtest <pr-url>` in an interactive terminal " +
+        "to configure one, or see the README setup instructions.",
     );
     this.name = "NoTokenNonInteractiveError";
   }

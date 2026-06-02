@@ -243,11 +243,9 @@ export async function addSourceRemote(
  * call only — leaving the clone's baked-in (write) token untouched for
  * clone/push. This lets a `source`-remote fetch use the READ token while
  * clone/push keep the WRITE token. The token still travels ONLY via the askpass
- * env var — never in the URL, on the command line, or in `.git/config`.
- *
- * An EMPTY string means an anonymous fetch (a public source read over https with
- * no credentials): TOKEN_ENV is set to `""`, so the askpass helper supplies no
- * password and git proceeds unauthenticated.
+ * env var — never in the URL, on the command line, or in `.git/config`. The
+ * token is always a real credential (the read or write token); the two-token
+ * orchestrator never passes an empty/anonymous token.
  */
 export async function fetchCommit(
   git: SimpleGit,
@@ -260,8 +258,8 @@ export async function fetchCommit(
   const start = Date.now();
   // Scope the credential to THIS fetch: `.env(name, value)` returns the same
   // instance with one env var overridden, so we set the per-op token (the read
-  // token for a source fetch, the write token for an origin fetch, or "" for an
-  // anonymous public-source fetch) without depending on the instance's prior env.
+  // token for a source fetch, the write token for an origin fetch) without
+  // depending on the instance's prior env.
   const fetchGit = git.env(TOKEN_ENV, token);
   try {
     await fetchGit.fetch(remote, sha);

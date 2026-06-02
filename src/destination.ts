@@ -96,7 +96,7 @@ export function writePermissionMessage(dest: RepoRef): string {
     "\n" +
     "Fix one of these:\n" +
     "  • Provide a token with Contents:write + Pull requests:write on that repo\n" +
-    "    (run `pr-backtest logout`, then re-run and paste a new token), or\n" +
+    "    (paste one when prompted, or set GITHUB_TOKEN), or\n" +
     "  • Choose a different destination."
   );
 }
@@ -273,7 +273,10 @@ async function resolveInteractiveChoice(
       title: `Sandbox — ${saved.owner}/${saved.repo}      (saved default)`,
       repo: { owner: saved.owner, repo: saved.repo },
     });
-    rows.push({ kind: "sandbox", title: "Sandbox — a different repo" });
+    rows.push({
+      kind: "sandbox",
+      title: "Sandbox — a different repo                (the source is only ever read)",
+    });
   } else {
     rows.push({
       kind: "sandbox",
@@ -412,6 +415,28 @@ export function makeRememberPrompt(
       return true;
     }
     return false;
+  };
+}
+
+/**
+ * Production {@link ConfirmCreate} seam: prompt the user to create a missing
+ * sandbox (spec §4.1/§7 interactive create offer). Guards on the TTY so an
+ * off-TTY call (it should never happen — {@link verifyOrCreateDestination} only
+ * invokes this on the `isTTY` branch) returns false rather than hanging on
+ * stdin.
+ */
+export function makeConfirmCreate(): ConfirmCreate {
+  return async (dest: RepoRef): Promise<boolean> => {
+    if (process.stdin.isTTY !== true) {
+      return false;
+    }
+    const { create } = await prompts({
+      type: "confirm",
+      name: "create",
+      message: `${dest.owner}/${dest.repo} does not exist. Create it as a private sandbox?`,
+      initial: true,
+    });
+    return create === true;
   };
 }
 

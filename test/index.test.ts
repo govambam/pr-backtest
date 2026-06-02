@@ -140,6 +140,7 @@ function makeDeps(
     makeMenuPrompt: () => async (rows) => rows[0]!,
     makeSlugPrompt: () => async () => ({ owner: SANDBOX_OWNER, repo: SANDBOX_REPO }),
     makeRememberPrompt: () => async () => false,
+    makeConfirmCreate: () => async () => false,
     readConfig: () => null,
     getPullRequest: async () => {
       order.push("read-pr");
@@ -234,6 +235,26 @@ test("on success stdout is exactly the PR URL + newline; trace is on stderr", as
   assert.ok(!stdout.includes("Read PR"), "no narration on stdout");
   assert.match(stderr, /Read PR/);
   assert.match(stderr, /✓/);
+});
+
+test("wires a confirmCreate seam into verifyOrCreateDestination (interactive create-offer reachability)", async () => {
+  // Regression: index.ts must pass a confirmCreate seam, otherwise a TTY user
+  // who picks a not-yet-existing sandbox is never offered to create it
+  // (verifyOrCreateDestination's interactive branch defaults confirm=false).
+  let capturedConfirmCreate: unknown;
+  const { deps } = makeDeps({
+    verifyOrCreateDestination: async (dest, opts) => {
+      capturedConfirmCreate = opts.confirmCreate;
+      return dest;
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+  assert.equal(
+    typeof capturedConfirmCreate,
+    "function",
+    "verifyOrCreateDestination must receive a confirmCreate seam",
+  );
 });
 
 test("a default run's stderr shows ✓ completion markers for each operation", async () => {

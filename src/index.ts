@@ -54,6 +54,7 @@ import { readConfig } from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
+  makeConfirmCreate,
   makeMenuPrompt,
   makeRememberPrompt,
   makeSandboxCreator,
@@ -106,6 +107,8 @@ export interface RunBacktestDeps {
   makeMenuPrompt: typeof makeMenuPrompt;
   makeSlugPrompt: typeof makeSlugPrompt;
   makeRememberPrompt: typeof makeRememberPrompt;
+  /** Interactive "create this sandbox?" confirm seam (TTY only) — spec §4.1/§7. */
+  makeConfirmCreate: typeof makeConfirmCreate;
   readConfig: typeof readConfig;
   getPullRequest: typeof getPullRequest;
   listPullRequestCommits: typeof listPullRequestCommits;
@@ -134,6 +137,7 @@ const defaultDeps: RunBacktestDeps = {
   makeMenuPrompt,
   makeSlugPrompt,
   makeRememberPrompt,
+  makeConfirmCreate,
   readConfig,
   getPullRequest,
   listPullRequestCommits,
@@ -268,6 +272,11 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
           createSandbox: deps.makeSandboxCreator(octokit as Octokit),
           createFlag: opts.createSandbox === true,
           isTTY,
+          // Interactive create offer (spec §4.1/§7): without this seam, a TTY
+          // user who picks a not-yet-existing sandbox is never offered to create
+          // it. The seam self-guards off-TTY; verifyOrCreateDestination only
+          // invokes it on the isTTY branch.
+          confirmCreate: deps.makeConfirmCreate(),
         });
         return true;
       } catch (err) {
@@ -309,7 +318,11 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // 5. Resolve the READ token. Reuses the write token IFF it reads the source
   //    (single-PAT); else GITHUB_SOURCE_TOKEN / saved sourceToken / paste. A
   //    missing source-read token non-interactively → exit 1 naming
-  //    GITHUB_SOURCE_TOKEN, BEFORE any write side effect (VAL-TOKEN-005/008).
+  //    GITHUB_SOURCE_TOKEN, BEFORE any branch/PR write to the destination
+  //    (VAL-TOKEN-005/008). NOTE: with `--create-sandbox`, step 4 may already
+  //    have CREATED the destination sandbox (a reusable repo, by design — spec
+  //    §5 "reuse one sandbox forever"); that create is the only write that can
+  //    precede this check, and the source is never written either way.
   let readToken: string;
   try {
     const resolved = await deps.resolveReadToken({
