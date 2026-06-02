@@ -179,12 +179,22 @@ export function writeAskpassHelper(tmpDir: string): string {
 
 /** Build the git child environment that wires up GIT_ASKPASS with the token. */
 export function gitEnv(token: string, askpassPath: string): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_ASKPASS: askpassPath,
     GIT_TERMINAL_PROMPT: "0",
     [TOKEN_ENV]: token,
   };
+  // `simple-git` refuses to run when GIT_EDITOR / GIT_SEQUENCE_EDITOR are
+  // present in the child environment (a mitigation against editor-based RCE
+  // from a malicious repo). This tool never opens an editor — it only clones
+  // `--no-checkout`, fetches by SHA, and pushes by refspec; no commit, rebase,
+  // or interactive op. So strip both, otherwise an ambient `GIT_EDITOR` (set by
+  // VS Code and many shells) makes every clone fail instantly. We never need an
+  // editor, so removing them is purely defensive.
+  delete env.GIT_EDITOR;
+  delete env.GIT_SEQUENCE_EDITOR;
+  return env;
 }
 
 /**
