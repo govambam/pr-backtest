@@ -1,5 +1,5 @@
 /**
- * Reactive two-capability token resolver (spec §5).
+ * Reactive two-capability token resolver.
  *
  * A backtest needs exactly two capabilities — READ the source and WRITE the
  * destination. The tool does not predict the token shape from owners; it derives
@@ -17,7 +17,7 @@
  * A freshly pasted token is additionally validated via users.getAuthenticated to
  * capture its `@login`.
  *
- * SECURITY (spec §9): each token is registered with the secret scrubber the
+ * SECURITY: each token is registered with the secret scrubber the
  * instant it is resolved, BEFORE any network request with it. The token never
  * appears in logs, errors, or output; it reaches GitHub only through an Octokit.
  */
@@ -72,8 +72,8 @@ export class NoTokenNonInteractiveError extends Error {
 
 /**
  * Thrown when no READ token can read the source and stdin is not a TTY (so the
- * tool cannot prompt). The message names `GITHUB_SOURCE_TOKEN` explicitly (spec
- * §4.4 / VAL-TOKEN-005). The caller maps it to exit code 1 BEFORE any write side
+ * tool cannot prompt). The message names `GITHUB_SOURCE_TOKEN` explicitly. The
+ * caller maps it to exit code 1 BEFORE any write side
  * effect occurs. Extends {@link NoTokenNonInteractiveError} so existing exit-1
  * mapping keeps working.
  */
@@ -107,7 +107,7 @@ export type ResolverOctokit = Pick<Octokit, "repos" | "users">;
 export type MakeOctokit = (token: string) => ResolverOctokit;
 
 /**
- * READ capability check (spec §5). `repos.get(source)` succeeding with the
+ * READ capability check. `repos.get(source)` succeeding with the
  * candidate's Octokit means it can read the source. BOTH 403 and 404 are treated
  * as not-readable; any other error is rethrown (it is not a capability signal).
  * Never takes a raw token — the candidate reaches GitHub only via the Octokit.
@@ -128,7 +128,7 @@ export async function canRead(
 }
 
 /**
- * WRITE capability check for an EXISTING destination (spec §5/§7). The token can
+ * WRITE capability check for an EXISTING destination. The token can
  * write iff `repos.get(dest).permissions.push === true`. A 403/404 (repo missing
  * or not visible) is treated as not-writable; any other error is rethrown.
  *
@@ -161,7 +161,7 @@ interface Candidate {
 }
 
 // ---------------------------------------------------------------------------
-// Default interactive paste getters (spec §4.2 / §4.3, VAL-TOKEN-010).
+// Default interactive paste getters.
 // Each prints the precise scope guidance, then a masked paste prompt. None ever
 // echoes the token value. Off-TTY each returns null immediately (one attempt).
 // ---------------------------------------------------------------------------
@@ -216,7 +216,7 @@ async function guidedPaste(copy: GuidedPaste): Promise<string | null> {
   return maskedPaste(copy.promptLabel);
 }
 
-/** Primary prompt: a single token with READ + WRITE on the source (spec §4.2). */
+/** Primary prompt: a single token with READ + WRITE on the source. */
 function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
   return guidedPaste({
     repoLabel: `${source.owner}/${source.repo}`,
@@ -232,7 +232,7 @@ function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
   });
 }
 
-/** Sandbox token #1: a READ-ONLY source token is enough (spec §4.3). */
+/** Sandbox token #1: a READ-ONLY source token is enough. */
 function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
   return guidedPaste({
     repoLabel: `${source.owner}/${source.repo}`,
@@ -249,7 +249,7 @@ function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
   });
 }
 
-/** Sandbox token #2: a WRITE token on the destination (spec §4.3). */
+/** Sandbox token #2: a WRITE token on the destination. */
 function defaultGetSandboxWritePaste(
   destination: RepoRef,
 ): Promise<string | null> {
@@ -408,10 +408,10 @@ export interface ResolveWriteTokenOptions {
 }
 
 /**
- * Resolve a DESTINATION/write token (spec §5) via an injected `accept` predicate.
+ * Resolve a DESTINATION/write token via an injected `accept` predicate.
  *
  * Precedence: `GITHUB_TOKEN` env → saved `destinationToken` → interactive paste
- * (bounded 3 attempts; copy per §4.2 Primary / §4.3 Sandbox-write). Each
+ * (bounded 3 attempts; Primary or Sandbox-write copy). Each
  * candidate is registered with the scrubber before its first request and offered
  * to `accept`; the first accepted wins. A freshly pasted accepted token is
  * validated via `users.getAuthenticated` for its `@login` and persisted to the
@@ -486,12 +486,12 @@ export interface ResolveReadTokenOptions {
 }
 
 /**
- * Resolve a SOURCE/read token (spec §5). `accept` is fixed to {@link canRead} on
+ * Resolve a SOURCE/read token. `accept` is fixed to {@link canRead} on
  * the source — a read token is valid iff `repos.get(source)` succeeds.
  *
  * Precedence: `GITHUB_SOURCE_TOKEN` env → saved `sourceToken` → reuse the
  * already-resolved `writeToken` IFF it reads the source (single-PAT detection) →
- * interactive paste (bounded 3 attempts; read-only copy per §4.3 token #1). Each
+ * interactive paste (bounded 3 attempts; read-only copy). Each
  * candidate is registered with the scrubber before its first request. A freshly
  * pasted accepted token is validated via `users.getAuthenticated` for its
  * `@login` and persisted to the `sourceToken` slot. Throws

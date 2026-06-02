@@ -15,7 +15,7 @@
  * write op; the write token never touches the source; both reach GitHub only via
  * an Octokit or the GIT_ASKPASS env.
  *
- * Orchestration order (spec §4): destination FIRST (a local choice, no network),
+ * Orchestration order: destination FIRST (a local choice, no network),
  * then the WRITE token (verifying/creating the destination), then the READ token
  * (reusing the write token when it can read the source — single-PAT). No owner
  * logic, no source-visibility probe, no anonymous-source read path.
@@ -93,20 +93,20 @@ const EXIT = {
  */
 export interface RunBacktestDeps {
   makeOctokit: typeof makeOctokit;
-  /** Pure destination choice (no token, no network) — spec §4.1. */
+  /** Pure destination choice (no token, no network). */
   resolveDestinationChoice: typeof resolveDestinationChoice;
-  /** Verify push / create-if-missing for the destination — spec §7. */
+  /** Verify push / create-if-missing for the destination. */
   verifyOrCreateDestination: typeof verifyOrCreateDestination;
-  /** Resolve the WRITE token via an injected accept predicate — spec §5. */
+  /** Resolve the WRITE token via an injected accept predicate. */
   resolveWriteToken: typeof resolveWriteToken;
-  /** Resolve the READ token (single-PAT reuse / env / saved / paste) — spec §5. */
+  /** Resolve the READ token (single-PAT reuse / env / saved / paste). */
   resolveReadToken: typeof resolveReadToken;
   verifyRepo: typeof verifyRepo;
   makeSandboxCreator: typeof makeSandboxCreator;
   makeMenuPrompt: typeof makeMenuPrompt;
   makeSlugPrompt: typeof makeSlugPrompt;
   makeRememberPrompt: typeof makeRememberPrompt;
-  /** Interactive "create this sandbox?" confirm seam (TTY only) — spec §4.1/§7. */
+  /** Interactive "create this sandbox?" confirm seam (TTY only). */
   makeConfirmCreate: typeof makeConfirmCreate;
   readConfig: typeof readConfig;
   getPullRequest: typeof getPullRequest;
@@ -203,7 +203,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 2. Both-flags fast-fail BEFORE any network call (VAL-DEST-004). The choice
+  // 2. Both-flags fast-fail BEFORE any network call. The choice
   //    resolver also rejects this, but failing fast here keeps the error a clean
   //    bad-args exit 1 with no token/network work attempted first.
   if (opts.primary === true && typeof opts.sandbox === "string") {
@@ -256,7 +256,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //    through to the next candidate / re-prompt; the first ACCEPTED token both
   //    covers the destination and (in Primary) reads+writes the source. This is
   //    the only place the destination is verified — it runs BEFORE any
-  //    clone/push (VAL-TOKEN-006).
+  //    clone/push.
   //
   //    Exit mapping: a terminal NoTokenNonInteractiveError (names GITHUB_TOKEN)
   //    → exit 1; a terminal DestinationApiError (not-writable / can't-create
@@ -275,7 +275,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
           createSandbox: deps.makeSandboxCreator(octokit as Octokit),
           createFlag: opts.createSandbox === true,
           isTTY,
-          // Interactive create offer (spec §4.1/§7): without this seam, a TTY
+          // Interactive create offer: without this seam, a TTY
           // user who picks a not-yet-existing sandbox is never offered to create
           // it. The seam self-guards off-TTY; verifyOrCreateDestination only
           // invokes it on the isTTY branch.
@@ -349,7 +349,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   const twoToken = readToken !== writeToken;
 
-  // 6. Build the per-owner Octokit instances (VAL-ROUTE-001). When the read and
+  // 6. Build the per-owner Octokit instances. When the read and
   //    write tokens are IDENTICAL, construct exactly ONE instance and use it for
   //    both — observable behavior identical to a one-token run. When they differ,
   //    source reads use `readOctokit` and destination calls use `writeOctokit`;
@@ -397,14 +397,14 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 9. Branch names include the SHORT SHA of the target commit (VAL-BRANCH-001),
+  // 9. Branch names include the SHORT SHA of the target commit,
   //    so the (PR, commit) pair is the backtest identity: the same PR at
   //    different commits produces distinct branches (no collision).
   const sha = shortSha(targetSha);
   const headBranch = `backtest-pr${number}-${sha}-head`;
   const baseBranch = `backtest-pr${number}-${sha}-base`;
 
-  // 10. Open-only dedup pre-flight (VAL-BRANCH-003). Query OPEN PRs only: if an
+  // 10. Open-only dedup pre-flight. Query OPEN PRs only: if an
   //     OPEN backtest PR already exists for these branches, print its bare URL to
   //     stdout, the two-line actionable message to stderr, and exit 4. A CLOSED
   //     prior PR no longer blocks — that is the behavior change.
@@ -458,7 +458,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
 
   // 12. Clone, fetch the two commits, push them as branches, open the PR — with
-  //     per-op token routing (spec §9). The temp clone is always removed via the
+  //     per-op token routing. The temp clone is always removed via the
   //     `finally` block (plus the process-exit safety net registered below).
   const tmpDir = deps.makeTempDir();
   deps.registerCleanup(tmpDir);
@@ -469,7 +469,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //      collapsed into the git-failure exit.
   let prUrl: string | null = null;
   try {
-    // Per-op git credential routing (spec §9):
+    // Per-op git credential routing:
     //  - clone (origin = destination) authenticates with the WRITE token;
     //  - the `source`-remote fetch (sandbox mode) authenticates with the READ
     //    token, supplied per-op so it never becomes the push credential;
@@ -513,7 +513,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.GIT_FAILURE);
   }
 
-  // 12b. Open the PR. A 422 backstop (VAL-BRANCH-004) recovers a raced OPEN PR
+  // 12b. Open the PR. A 422 backstop recovers a raced OPEN PR
   //      (exit 4) or reports a no-diff (exit 2); any other API error → exit 2.
   //      Open-PR has no git-layer trace, so narrate its ✓ completion here.
   const openTrace = traceOp("Opened backtest PR");

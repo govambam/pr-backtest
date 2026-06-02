@@ -51,7 +51,7 @@ export interface TokenSlot {
  * - `defaultDestination` — the saved write destination.
  *
  * Any field may be absent (a config may hold only a `defaultDestination` when a
- * token came from the environment or `gh` and was never persisted).
+ * token came from the environment and was never persisted).
  */
 export interface Config {
   sourceToken?: TokenSlot;

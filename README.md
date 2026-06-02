@@ -4,11 +4,11 @@ Recreate a GitHub pull request at a chosen commit, so a PR-review bot can review
 
 **Why:** backtest a PR-review bot against history. Take a PR whose outcome you already know, replay it at its original commit, and see how your bot does on a "brand new" PR.
 
-**Security:** pr-backtest only ever talks to GitHub — `api.github.com` and `github.com`, nothing else. No telemetry, no analytics, no third-party calls. Your token stays on your machine (read from `GITHUB_TOKEN` / `gh`, or saved locally with `0600` permissions) and is never sent anywhere except GitHub.
+**Security:** pr-backtest only ever talks to GitHub — `api.github.com` and `github.com`, nothing else. No telemetry, no analytics, no third-party calls. Your token stays on your machine (read from `GITHUB_TOKEN` / `GITHUB_SOURCE_TOKEN`, or saved locally with `0600` permissions) and is never sent anywhere except GitHub.
 
 ## Requirements
 
-Node.js `>=18`.
+Node.js `>=18` and a `git` binary on your `PATH` (the tool shells out to `git` for clone/fetch/push).
 
 ## Install
 
@@ -180,8 +180,8 @@ pr-backtest shows you what it is doing as it does it. The whole point is trust: 
 ✓ Adding source remote github.com/acme/api
 ✓ Fetching f0e9d8c from source
 ✓ Fetching a1b2c3d from source
-✓ Pushing f0e9d8c → backtest-pr123-base
-✓ Pushing a1b2c3d → backtest-pr123-head
+✓ Pushing f0e9d8c → backtest-pr123-a1b2c3d-base
+✓ Pushing a1b2c3d → backtest-pr123-a1b2c3d-head
 ✓ Opened backtest PR
 ✓ Backtest PR created.
 ```
@@ -200,8 +200,8 @@ $ git clone --no-checkout https://x-access-token@github.com/octocat/pr-backtest-
 $ git remote add source https://x-access-token@github.com/acme/api.git  18ms
 $ git fetch source f0e9d8c  312ms
 $ git fetch source a1b2c3d  298ms
-$ git push origin f0e9d8c:refs/heads/backtest-pr123-base  640ms
-$ git push origin a1b2c3d:refs/heads/backtest-pr123-head  635ms
+$ git push origin f0e9d8c:refs/heads/backtest-pr123-a1b2c3d-base  640ms
+$ git push origin a1b2c3d:refs/heads/backtest-pr123-a1b2c3d-head  635ms
 → POST  /repos/octocat/pr-backtest-sandbox/pulls  201  301ms
 ```
 

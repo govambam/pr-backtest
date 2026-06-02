@@ -315,8 +315,8 @@ export async function fetchCommit(
  * on the askpass {@link TOKEN_ENV} variable for this call. Passing it explicitly
  * keeps the write credential authoritative for the push even if a prior
  * `source`-remote fetch on the same instance overrode {@link TOKEN_ENV} with the
- * read token — the read token can never authenticate a push
- * (INV-READTOKEN-NOWRITE). The token travels ONLY via the askpass env var.
+ * read token — the read token can never authenticate a push. The token travels
+ * ONLY via the askpass env var.
  */
 export async function pushBranchFromSha(
   git: SimpleGit,

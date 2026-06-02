@@ -9,9 +9,9 @@
  *     verifies push access (or creates the sandbox) before any clone/push.
  *
  * The old model interleaved the menu CHOICE with the destination VERIFY/CREATE
- * in one call and re-presented the menu on a verify failure. The spec
- * (§4.1 "present the destination choice **before resolving any token**") splits
- * them: the choice is a local decision that needs no network, so asking it first
+ * in one call and re-presented the menu on a verify failure. We present the
+ * destination choice **before resolving any token** and split the two:
+ * the choice is a local decision that needs no network, so asking it first
  * lets the token prompt that follows name the exact scope required.
  *
  * The resolver only ever verifies/creates/returns the DESTINATION. It never
@@ -266,7 +266,7 @@ export async function resolveDestinationChoice(
  * (plus a saved-default Sandbox row when a default exists), presents them via
  * the injected seam, then runs the per-row sub-flow. NO network, NO token.
  *
- * Menu shapes (VAL-DEST-001):
+ * Menu shapes:
  *  - No saved default: two rows — Primary, Sandbox (a separate repo you control).
  *  - Saved default: three rows — Primary, Sandbox <saved> (saved default),
  *    Sandbox (a different repo).
@@ -449,7 +449,7 @@ export function makeRememberPrompt(
 
 /**
  * Production {@link ConfirmCreate} seam: prompt the user to create a missing
- * sandbox (spec §4.1/§7 interactive create offer). Guards on the TTY so an
+ * sandbox (interactive create offer). Guards on the TTY so an
  * off-TTY call (it should never happen — {@link verifyOrCreateDestination} only
  * invokes this on the `isTTY` branch) returns false rather than hanging on
  * stdin.
@@ -610,7 +610,7 @@ async function probeCreatedWithRetry(
  * WRITE-token seams. Runs AFTER {@link resolveDestinationChoice} and BEFORE any
  * clone/push. Returns the verified destination unchanged on success.
  *
- * Per spec §7:
+ * Behavior:
  *  - Exists + writable (`permissions.push === true`) → return ok.
  *  - Exists + not writable → throw {@link DestinationApiError} with the
  *    write-permission message (orchestrator: exit 2 non-interactive; an
@@ -693,7 +693,7 @@ async function createSandboxAndReverify(
 }
 
 /**
- * Interactive missing-sandbox flow (VAL-CREATE-001): offer to create. Creation
+ * Interactive missing-sandbox flow: offer to create. Creation
  * only succeeds when the write token can create — on a permission failure
  * surface the explain message and throw {@link DestinationApiError}; do NOT fall
  * back to the source. Declining the offer also throws (the user must pick a

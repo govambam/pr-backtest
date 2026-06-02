@@ -1,5 +1,5 @@
 /**
- * The `status` command — a read-only summary of saved config (spec §4.6).
+ * The `status` command — a read-only summary of saved config.
  *
  * Prints what is saved without ever revealing a token value and WITHOUT making
  * any network call: it reads only stored metadata (each slot's `username` and
@@ -39,7 +39,7 @@ function renderTokenSlot(slot: TokenSlot | undefined): string {
 }
 
 /**
- * Print the saved-config summary (spec §4.6). Read-only: no network, no token
+ * Print the saved-config summary. Read-only: no network, no token
  * value ever printed. Always exits the caller's flow with success (the CLI maps
  * this to exit 0).
  */
