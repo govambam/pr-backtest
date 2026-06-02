@@ -40,6 +40,16 @@ export interface PlanInput {
    * destination is a sandbox: the source is read-only and the writes land here.
    */
   targetRepo?: string;
+  /**
+   * True only when the run uses TWO distinct tokens (a read-only token for the
+   * source owner and a separate write token for the destination owner — a
+   * cross-owner sandbox). When true, the plan notes the trust boundary once:
+   * the source line is tagged `(read-only token)` and the destination line
+   * `(write token)`. Defaults to false; when false the plan renders EXACTLY as a
+   * single-token run (no token annotations). This flag carries NO token value —
+   * only the boolean fact that two tokens are in play.
+   */
+  twoToken?: boolean;
 }
 
 /**
@@ -59,18 +69,31 @@ export function renderPlan(input: PlanInput): string {
   // remote; otherwise they come straight from the clone's origin.
   const fetchFrom = destDiffers ? `source (${input.ownerRepo})` : "origin";
 
+  // Two-token annotation. ONLY when the run uses two distinct tokens (§11) do we
+  // surface the trust boundary: a read-only token reads the source, a separate
+  // write token writes the destination. Gated strictly on the flag so a
+  // one-token run (the common case) renders byte-identical to today — no token
+  // word appears. These annotations name no token value (INV-TOKEN); they only
+  // state which *kind* of token authenticates each side.
+  const twoToken = input.twoToken === true;
+  const sourceTokenTag = twoToken ? " (read-only token)" : "";
+  const destTokenTag = twoToken ? " (write token)" : "";
+
   // The PR identity line carries a `(read-only)` tag ONLY when the destination
-  // differs from the source — that is the visible safety guarantee.
+  // differs from the source — that is the visible safety guarantee. In a
+  // two-token run it additionally names the read-only token reading the source.
   const prLine =
     `PR:      ${input.ownerRepo}#${input.prNumber} "${input.prTitle}" by @${input.prAuthor}` +
-    (destDiffers ? "   (read-only — source is never written)" : "");
+    (destDiffers ? `   (read-only — source is never written${sourceTokenTag})` : "");
   const header = [
     prLine,
     `Target:  ${target} (${input.targetLabel})`,
     `Base:    ${base} (parent of target)`,
   ];
   if (destDiffers) {
-    header.push(`Into:    ${dest} (sandbox — branches and PR are created here)`);
+    header.push(
+      `Into:    ${dest} (sandbox — branches and PR are created here${destTokenTag})`,
+    );
   }
 
   const lines = [

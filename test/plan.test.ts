@@ -75,3 +75,50 @@ test("dest != source: source tagged read-only, destination is the distinct write
     /Open PR in myuser\/sandbox: backtest-pr123-head → backtest-pr123-base/,
   );
 });
+
+// --- Two-token annotations (VAL-PLAN-001/002/003) ---
+
+test("VAL-PLAN-001: two-token run annotates source read-only token + dest write token", () => {
+  const out = renderPlan({
+    ...input,
+    targetRepo: "myuser/sandbox",
+    twoToken: true,
+  });
+  // Source (reading) line names the read-only token.
+  assert.match(out, /acme\/api#123 .* \(read-only — source is never written \(read-only token\)\)/);
+  // Destination (creating) line names the write token.
+  assert.match(out, /Into:\s+myuser\/sandbox \(sandbox — branches and PR are created here \(write token\)\)/);
+});
+
+test("VAL-PLAN-002: one-token plan is byte-identical with twoToken false vs omitted", () => {
+  // The flag defaults to false; an explicit false must not change a single byte.
+  const primary = renderPlan(input);
+  assert.equal(renderPlan({ ...input, twoToken: false }), primary);
+  // And no token annotation leaks into the one-token output.
+  assert.doesNotMatch(primary, /read-only token/);
+  assert.doesNotMatch(primary, /write token/);
+
+  // Same for a one-token SANDBOX run (dest differs, but a single token covers it):
+  // the read-only safety tag is present but NO token annotations are added.
+  const sandbox = renderPlan({ ...input, targetRepo: "myuser/sandbox" });
+  assert.equal(renderPlan({ ...input, targetRepo: "myuser/sandbox", twoToken: false }), sandbox);
+  assert.doesNotMatch(sandbox, /read-only token/);
+  assert.doesNotMatch(sandbox, /write token/);
+});
+
+test("VAL-PLAN-003: the plan never prints a token value", () => {
+  // renderPlan takes no token argument — but assert directly that even when a
+  // run is two-token, no token-shaped string can appear in the output. We render
+  // every plan variant and scan for token-shaped substrings.
+  const variants = [
+    renderPlan(input),
+    renderPlan({ ...input, targetRepo: "myuser/sandbox" }),
+    renderPlan({ ...input, targetRepo: "myuser/sandbox", twoToken: true }),
+  ];
+  // GitHub token shapes: classic `ghp_…`, fine-grained `github_pat_…`,
+  // and the git askpass username `x-access-token`.
+  const tokenShaped = /ghp_[A-Za-z0-9]|github_pat_|gho_|ghs_|x-access-token/;
+  for (const out of variants) {
+    assert.doesNotMatch(out, tokenShaped);
+  }
+});

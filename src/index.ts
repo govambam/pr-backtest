@@ -431,6 +431,10 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     headBranch,
     baseBranch,
     targetRepo: `${destOwner}/${destRepo}`,
+    // Drive the plan's two-token annotation off the run's resolved token count
+    // (spec §11). True only when the read and write tokens are distinct strings;
+    // the boolean is all the plan needs — no token value crosses this boundary.
+    twoToken: runTokens.twoToken,
   };
   const proceed = await deps.confirmPlan(planInput, { yes: opts.yes });
   if (!proceed) {
