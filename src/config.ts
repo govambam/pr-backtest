@@ -1,8 +1,8 @@
 /**
  * XDG-aware config file read/write.
  *
- * The token lives in a JSON file with mode 0600 (owner read/write only).
- * Never log the token; never write it anywhere except this file.
+ * Tokens live in a JSON file with mode 0600 (owner read/write only).
+ * Never log a token; never write one anywhere except this file.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -20,37 +20,33 @@ export interface SavedDestination {
 }
 
 /**
- * An owner-scoped token entry.
- *
- * Used for cross-owner runs (e.g. a read token for a source org that differs
- * from the default write token). The `owner` is the resource owner the token is
- * scoped for; comparison is case-insensitive (GitHub owners are
- * case-insensitive). Like {@link Config.token}, the `token` here is a secret:
- * it lives only in the 0600 file and is never logged.
+ * A named token slot: a `token` secret plus its `username` (@login) and the
+ * `source` it was obtained from. Like the rest of the config, the `token` is a
+ * secret: it lives only in the 0600 file and is never logged.
  */
-export interface OwnerToken {
-  owner: string;
+export interface TokenSlot {
   token: string;
-  source: TokenSource;
   username: string;
+  source: TokenSource;
 }
 
 /**
  * Persisted config shape.
  *
- * `token`/`username`/`source` are optional: a config may hold only a
- * `defaultDestination` when the token came from the environment or `gh` and was
- * never persisted. Token resolution treats an absent token as "no saved token".
+ * Two named token slots plus an optional saved destination, each independent
+ * and optional:
+ * - `sourceToken` — the token used to read the source PR/repo.
+ * - `destinationToken` — the token used to write branches/PRs to the
+ *   destination. In a single-PAT run both slots may hold the same value.
+ * - `defaultDestination` — the saved write destination.
  *
- * `tokens` holds additive owner-scoped tokens; its absence means "no
- * owner-scoped token". Older files (no `tokens` field) parse unchanged.
+ * Any field may be absent (a config may hold only a `defaultDestination` when a
+ * token came from the environment or `gh` and was never persisted).
  */
 export interface Config {
-  token?: string;
-  username?: string;
-  source?: TokenSource;
+  sourceToken?: TokenSlot;
+  destinationToken?: TokenSlot;
   defaultDestination?: SavedDestination;
-  tokens?: OwnerToken[];
 }
 
 /**
@@ -77,8 +73,12 @@ function isTokenSource(value: unknown): value is TokenSource {
   return value === "fine-grained" || value === "classic" || value === "gh-cli";
 }
 
-/** A complete token triple: `token` + `username` + a valid `source`. */
-function hasValidTokenFields(obj: Record<string, unknown>): boolean {
+/** A complete token slot: `token` + `username` (strings) + a valid `source`. */
+function isTokenSlot(value: unknown): value is TokenSlot {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
   return (
     typeof obj.token === "string" &&
     typeof obj.username === "string" &&
@@ -97,24 +97,12 @@ function isSavedDestination(value: unknown): value is SavedDestination {
 }
 
 /**
- * An owner-scoped token entry: `owner` + `token` + `username` + a valid
- * `source`, all strings.
- */
-function isOwnerToken(value: unknown): value is OwnerToken {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const obj = value as Record<string, unknown>;
-  return (
-    typeof obj.owner === "string" &&
-    typeof obj.token === "string" &&
-    typeof obj.username === "string" &&
-    isTokenSource(obj.source)
-  );
-}
-
-/**
- * Read the config file. Returns null if it does not exist.
+ * Read the config file. Returns null if it does not exist, is unparseable, or
+ * holds no recognized field.
+ *
+ * Each slot is validated independently: a present-but-malformed slot (or
+ * `defaultDestination`) is warned about and dropped, while valid sibling fields
+ * in the same file are still returned.
  *
  * Warns (does not throw) if the file's permissions have been loosened so that
  * group or other can read it.
@@ -155,54 +143,58 @@ export function readConfig(): Config | null {
   }
 
   const obj = parsed as Record<string, unknown>;
-  const hasTokenFields = hasValidTokenFields(obj);
-  const hasDestination =
-    obj.defaultDestination !== undefined &&
-    isSavedDestination(obj.defaultDestination);
-  const destinationMalformed =
-    obj.defaultDestination !== undefined && !hasDestination;
+  const cfg: Config = {};
 
-  // `tokens` is additive and optional. When present it must be an array of
-  // valid owner-scoped entries; a present-but-malformed `tokens` is rejected
-  // the same way a malformed `defaultDestination` is.
-  const hasTokens =
-    obj.tokens !== undefined &&
-    Array.isArray(obj.tokens) &&
-    obj.tokens.every(isOwnerToken);
-  const tokensMalformed = obj.tokens !== undefined && !hasTokens;
+  // Each slot is validated independently: a present-but-malformed slot is
+  // warned about and dropped, while a valid sibling slot survives.
+  if (obj.sourceToken !== undefined) {
+    if (isTokenSlot(obj.sourceToken)) {
+      cfg.sourceToken = {
+        token: obj.sourceToken.token,
+        username: obj.sourceToken.username,
+        source: obj.sourceToken.source,
+      };
+    } else {
+      warn(`Config file ${filePath} sourceToken is malformed; ignoring it.`);
+    }
+  }
 
-  // Accept a valid token-config OR a valid destination-config (or both).
-  // A file that is neither — or that carries a malformed defaultDestination or
-  // a malformed tokens array — is rejected (warn, return null).
+  if (obj.destinationToken !== undefined) {
+    if (isTokenSlot(obj.destinationToken)) {
+      cfg.destinationToken = {
+        token: obj.destinationToken.token,
+        username: obj.destinationToken.username,
+        source: obj.destinationToken.source,
+      };
+    } else {
+      warn(
+        `Config file ${filePath} destinationToken is malformed; ignoring it.`,
+      );
+    }
+  }
+
+  if (obj.defaultDestination !== undefined) {
+    if (isSavedDestination(obj.defaultDestination)) {
+      cfg.defaultDestination = {
+        owner: obj.defaultDestination.owner,
+        repo: obj.defaultDestination.repo,
+      };
+    } else {
+      warn(
+        `Config file ${filePath} defaultDestination is malformed; ignoring it.`,
+      );
+    }
+  }
+
+  // A file with zero recognized fields is treated as no config at all.
   if (
-    destinationMalformed ||
-    tokensMalformed ||
-    (!hasTokenFields && !hasDestination)
+    cfg.sourceToken === undefined &&
+    cfg.destinationToken === undefined &&
+    cfg.defaultDestination === undefined
   ) {
-    warn(`Config file ${filePath} is malformed; ignoring it.`);
     return null;
   }
 
-  const cfg: Config = {};
-  if (hasTokenFields) {
-    cfg.token = obj.token as string;
-    cfg.username = obj.username as string;
-    cfg.source = obj.source as TokenSource;
-  }
-  if (hasDestination) {
-    cfg.defaultDestination = {
-      owner: (obj.defaultDestination as SavedDestination).owner,
-      repo: (obj.defaultDestination as SavedDestination).repo,
-    };
-  }
-  if (hasTokens) {
-    cfg.tokens = (obj.tokens as OwnerToken[]).map((t) => ({
-      owner: t.owner,
-      token: t.token,
-      source: t.source,
-      username: t.username,
-    }));
-  }
   return cfg;
 }
 
@@ -222,52 +214,24 @@ export function writeConfig(cfg: Config): void {
 }
 
 /**
- * Add or replace a single owner-scoped token entry, keyed by owner
- * (case-insensitive), within a `tokens[]` array. Other entries are preserved.
- * Pure helper; does no I/O.
- */
-function upsertOwnerToken(
-  existing: OwnerToken[] | undefined,
-  entry: OwnerToken,
-): OwnerToken[] {
-  const others = (existing ?? []).filter(
-    (t) => t.owner.toLowerCase() !== entry.owner.toLowerCase(),
-  );
-  return [...others, entry];
-}
-
-/**
  * Merge a partial update into the existing config (read-modify-write).
  *
  * Unlike {@link writeConfig}, which replaces the whole object, this preserves
- * fields not present in `update`: saving a `defaultDestination` keeps a saved
- * token, and saving a token keeps a saved destination. Re-asserts mode 0600
+ * fields not present in `update`: saving a `destinationToken` keeps a saved
+ * `sourceToken` and `defaultDestination`, and vice versa. Re-asserts mode 0600
  * on every write, exactly as {@link writeConfig} does.
- *
- * `tokens[]` is merged by owner (case-insensitive) rather than clobbered: each
- * entry in `update.tokens` adds-or-replaces the entry for its owner, leaving
- * sibling entries (and the default `token`/`defaultDestination`) intact.
  */
 export function mergeConfig(update: Partial<Config>): void {
   const existing = readConfig() ?? {};
-  const { tokens: updateTokens, ...rest } = update;
-  const merged: Config = { ...existing, ...rest };
-  if (updateTokens !== undefined) {
-    let tokens = existing.tokens;
-    for (const entry of updateTokens) {
-      tokens = upsertOwnerToken(tokens, entry);
-    }
-    merged.tokens = tokens;
-  }
+  const merged: Config = { ...existing, ...update };
   writeConfig(merged);
 }
 
 /**
  * Delete the config file (used by `logout`).
  *
- * Removes the whole file, including any default `token`, `defaultDestination`,
- * and all owner-scoped `tokens[]` entries. Tolerates an already-absent file
- * (ENOENT).
+ * Removes the whole file, including both token slots and the
+ * `defaultDestination`. Tolerates an already-absent file (ENOENT).
  */
 export function deleteConfig(): void {
   const filePath = configPath();
