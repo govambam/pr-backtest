@@ -17,7 +17,7 @@ import {
   type TokenSource,
 } from "./config.js";
 import { makeOctokit } from "./github.js";
-import { info, step, success } from "./log.js";
+import { info, registerSecret, step, success } from "./log.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -219,6 +219,11 @@ export async function resolveToken(
   };
 
   const resolved = await resolveTokenSource(resolvers);
+
+  // Arm the secret scrubber the instant a token is resolved, before any network
+  // request is issued. This keeps the redaction net active for the entire
+  // authenticated lifetime — including the validation request below.
+  registerSecret(resolved.token);
 
   // Validate the token by calling the authenticated-user endpoint. The default
   // path routes through the shared `makeOctokit` factory so the `GET /user`

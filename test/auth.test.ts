@@ -9,7 +9,7 @@ import {
 } from "../src/auth.js";
 import type { Config } from "../src/config.js";
 import { makeOctokit } from "../src/github.js";
-import { setVerbose, setTtyOverride, isVerbose } from "../src/log.js";
+import { setVerbose, setTtyOverride, isVerbose, redact } from "../src/log.js";
 
 const CFG: Config = {
   token: "github_pat_config",
@@ -140,6 +140,48 @@ test("options.makeOctokit injection seam is honored on the default validation pa
   assert.equal(seamUsed, true, "the injected factory must be used");
   assert.equal(seenToken, "ghp_injected_token_value");
   assert.equal(result.token, "ghp_injected_token_value");
+});
+
+test("the token is scrubbed before the validation request is issued", async () => {
+  // Use a long, unique sentinel so redact() can't match it by accident. If the
+  // scrubber is armed before octokit.users.getAuthenticated() runs, redact()
+  // already replaces the sentinel with *** at the moment the validation request
+  // is dispatched. Moving registerSecret to AFTER the request makes this fail.
+  const sentinel = "ghp_ordering_sentinel_0123456789abcdef";
+  let redactedAtRequestTime = "";
+
+  await quiet(() =>
+    resolveToken({
+      resolvers: {
+        getEnvToken: () => sentinel,
+        getConfig: () => null,
+        getGhToken: async () => null,
+        getInteractiveToken: async () => null,
+      },
+      makeOctokit: () =>
+        ({
+          users: {
+            getAuthenticated: async () => {
+              // Captured at the instant the validation request runs.
+              redactedAtRequestTime = redact(`token=${sentinel}`);
+              return { data: { login: "ordering-user" } };
+            },
+          },
+        }) as unknown as ReturnType<
+          NonNullable<Parameters<typeof resolveToken>[0]["makeOctokit"]>
+        >,
+    }),
+  );
+
+  assert.equal(
+    redactedAtRequestTime,
+    "token=***",
+    "the token must be registered with the scrubber before the validation request runs",
+  );
+  assert.ok(
+    !redactedAtRequestTime.includes(sentinel),
+    "the sentinel token must not survive redaction at validation time",
+  );
 });
 
 test("the shared makeOctokit factory traces GET /user (so the default validation call is traced)", async () => {

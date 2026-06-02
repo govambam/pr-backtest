@@ -55,7 +55,6 @@ import {
 import {
   error,
   info,
-  registerSecret,
   setVerbose,
   success,
   traceOp,
@@ -213,8 +212,9 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
   }
-  // Scrub the token from any output for the rest of the run.
-  registerSecret(token);
+  // The token is already registered with the secret scrubber inside
+  // resolveToken (armed before the validation request), so it is scrubbed from
+  // all output for the rest of the run.
   const octokit: Octokit = deps.makeOctokit(token);
 
   // 2b. Resolve where writes go. The source PR is always READ from `owner/repo`;

@@ -4,10 +4,11 @@
  * All progress/info/success/warn/error output goes to stderr so that stdout
  * stays reserved for the final PR URL (pipe-friendly).
  *
- * Callers may {@link registerSecret} the GitHub token. Every line written here —
- * and via {@link redact} for stdout — has registered secrets replaced with `***`
- * before it leaves the process, so a stray git/API error string can never leak
- * the token even if an upstream path forgets to sanitize it.
+ * Callers {@link registerSecret} the GitHub token as soon as it is resolved.
+ * Every line written here — and via {@link redact} for stdout — has the
+ * registered raw token replaced with `***` before it leaves the process, so a
+ * stray git/API error string can never leak the token even if an upstream path
+ * forgets to sanitize it.
  *
  * On top of the basic level helpers, this module also hosts the live activity
  * trace surface ({@link setVerbose}/{@link isVerbose}, {@link traceOp},
