@@ -131,10 +131,10 @@ test("VAL-AUTH-001: gh fallback runs ONLY when fill returns no password=", async
   assert.ok(cred);
   assert.equal(cred!.token, "ghp_from_gh_auth_token_value_98765");
   assert.equal(cred!.source, "classic");
-  // Order: git first, gh second.
+  // Order: git first, gh second. The gh fallback is host-pinned to github.com.
   assert.equal(calls[0]!.command, "git");
   assert.equal(calls[1]!.command, "gh");
-  assert.deepEqual(calls[1]!.args, ["auth", "token"]);
+  assert.deepEqual(calls[1]!.args, ["auth", "token", "--hostname", "github.com"]);
 });
 
 test("VAL-AUTH-001: returns null when NEITHER source yields a token", async () => {
@@ -289,4 +289,139 @@ test("VAL-KEEP-003: a credential that cannot authenticate yields null (no throw)
       }) as unknown as ResolverOctokit,
   });
   assert.equal(cred, null);
+});
+
+// ===========================================================================
+// FIX 1 — defaultExec hardening: TTY-prompt env is wired, stdin EPIPE swallowed,
+// the seam never rejects.
+// ===========================================================================
+
+test("FIX-1: the real defaultExec passes GIT_TERMINAL_PROMPT=0 + GCM_INTERACTIVE=never to the child", async () => {
+  // Drive the REAL exec seam against a node child that prints the two hardening
+  // env vars it inherited. This proves the no-TTY-prompt env is actually wired
+  // through to git's environment (mirroring git.ts's gitEnv hardening), so a
+  // locked keychain / credential helper cannot prompt and hang.
+  const { defaultExec } = await import("../src/inheritedAuth.js");
+  const result = await defaultExec(process.execPath, [
+    "-e",
+    "process.stdout.write(JSON.stringify({" +
+      "t: process.env.GIT_TERMINAL_PROMPT, g: process.env.GCM_INTERACTIVE}))",
+  ]);
+  assert.equal(result.failed, false);
+  const seen = JSON.parse(result.stdout) as { t: string; g: string };
+  assert.equal(seen.t, "0", "GIT_TERMINAL_PROMPT=0 reaches the child");
+  assert.equal(seen.g, "never", "GCM_INTERACTIVE=never reaches the child");
+});
+
+test("FIX-1: a child that exits before reading stdin does NOT crash the process (EPIPE swallowed)", async () => {
+  // The stdin error listener (registered BEFORE end()) swallows the EPIPE from a
+  // git child that exits before draining its stdin. We feed a large stdin to a
+  // child that exits immediately; the seam must still RESOLVE (never reject /
+  // throw), preserving the never-rejects contract.
+  const { defaultExec } = await import("../src/inheritedAuth.js");
+  const big = "x".repeat(1024 * 256);
+  let result: ExecResult | undefined;
+  await assert.doesNotReject(async () => {
+    result = await defaultExec(
+      process.execPath,
+      ["-e", "process.exit(0)"],
+      big,
+    );
+  });
+  assert.ok(result, "the seam resolved");
+});
+
+// ===========================================================================
+// FIX 2 — host validation: fill's password is trusted ONLY when git echoes back
+// host=github.com + protocol=https; gh fallback is host-pinned.
+// ===========================================================================
+
+test("FIX-2: a fill credential for a DIFFERENT host falls through to gh (host mismatch is a miss)", async () => {
+  // git credential fill echoes back host=example.com — a helper with insteadOf /
+  // enterprise config returning a wrong-host credential. The password must NOT be
+  // trusted; detection falls through to the (host-pinned) gh fallback.
+  const { exec, calls } = makeExec({
+    git: () => ({
+      stdout:
+        "protocol=https\nhost=example.com\nusername=x-access-token\npassword=ghp_WRONG_HOST_token_00000\n",
+      failed: false,
+    }),
+    gh: () => ({ stdout: "ghp_from_gh_after_host_mismatch_123\n", failed: false }),
+  });
+  const cred = await detectInheritedCredential({
+    isTTY: () => true,
+    exec,
+    makeOctokit: loginFactory("octocat"),
+  });
+  assert.ok(cred);
+  assert.equal(
+    cred!.token,
+    "ghp_from_gh_after_host_mismatch_123",
+    "the wrong-host fill password was rejected; the gh token won instead",
+  );
+  // gh WAS consulted (the host mismatch made fill a miss) and was host-pinned.
+  const gh = calls.find((c) => c.command === "gh");
+  assert.ok(gh, "gh was consulted after the host mismatch");
+  assert.deepEqual(gh!.args, ["auth", "token", "--hostname", "github.com"]);
+});
+
+test("FIX-2: a fill credential for a GHE host (https) also falls through to gh", async () => {
+  // protocol matches but host is an enterprise instance — still a mismatch.
+  const { exec, calls } = makeExec({
+    git: () => ({
+      stdout:
+        "protocol=https\nhost=ghe.corp.example\nusername=x-access-token\npassword=ghp_GHE_token_99999\n",
+      failed: false,
+    }),
+    gh: () => ({ stdout: "ghp_github_com_token_after_ghe_77\n", failed: false }),
+  });
+  const cred = await detectInheritedCredential({
+    isTTY: () => true,
+    exec,
+    makeOctokit: loginFactory("octocat"),
+  });
+  assert.ok(cred);
+  assert.equal(cred!.token, "ghp_github_com_token_after_ghe_77");
+  assert.ok(calls.some((c) => c.command === "gh"), "gh consulted after GHE host");
+});
+
+test("FIX-2: host=github.com + protocol=https is ACCEPTED (gh never consulted)", async () => {
+  // The exact host/protocol we asked for: the fill password is trusted directly.
+  const { exec, calls } = makeExec({
+    git: () => fillHit("ghp_correct_host_token_abcdef123456"),
+    gh: () => {
+      throw new Error("gh must NOT be consulted when fill host matches");
+    },
+  });
+  const cred = await detectInheritedCredential({
+    isTTY: () => true,
+    exec,
+    makeOctokit: loginFactory("octocat"),
+  });
+  assert.ok(cred);
+  assert.equal(cred!.token, "ghp_correct_host_token_abcdef123456");
+  assert.equal(
+    calls.filter((c) => c.command === "gh").length,
+    0,
+    "gh is never consulted once a host-matching fill credential is accepted",
+  );
+});
+
+test("FIX-2: an EMPTY password= value is a miss even with a matching host", async () => {
+  // host/protocol match but password is empty → miss → fall through to gh.
+  const { exec, calls } = makeExec({
+    git: () => ({
+      stdout: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=\n",
+      failed: false,
+    }),
+    gh: () => ({ stdout: "ghp_from_gh_after_empty_password_55\n", failed: false }),
+  });
+  const cred = await detectInheritedCredential({
+    isTTY: () => true,
+    exec,
+    makeOctokit: loginFactory("octocat"),
+  });
+  assert.ok(cred);
+  assert.equal(cred!.token, "ghp_from_gh_after_empty_password_55");
+  assert.ok(calls.some((c) => c.command === "gh"), "empty password falls through to gh");
 });

@@ -9,11 +9,17 @@
  * This module detects that credential, in a fixed order:
  *   1. `git credential fill` — fed exactly `protocol=https\nhost=github.com\n\n`
  *      on stdin; the `password=<token>` line in its output is the inherited
- *      token. This is the most universal source (it works for anyone whose
- *      `git push` to github.com already works).
- *   2. `gh auth token` — ONLY when (1) yields no password, and ONLY if the GitHub
- *      CLI is installed and authenticated. `gh` is OPTIONAL: its absence, a
- *      non-zero exit, or empty output is NON-FATAL — detection just returns null.
+ *      token, BUT ONLY when git echoes back `host=github.com` + `protocol=https`
+ *      (a helper with insteadOf/enterprise config could return a different host's
+ *      credential — a host mismatch is treated as a miss). This is the most
+ *      universal source (it works for anyone whose `git push` to github.com
+ *      already works).
+ *   2. `gh auth token --hostname github.com` — ONLY when (1) yields no usable
+ *      password, and ONLY if the GitHub CLI is installed and authenticated. The
+ *      `--hostname github.com` pin matches (1) so a user whose `gh` default host
+ *      is a GHE instance still gets the github.com token. `gh` is OPTIONAL: its
+ *      absence, a non-zero exit, or empty output is NON-FATAL — detection just
+ *      returns null.
  *
  * It is INTERACTIVE-ONLY: off a TTY the detector returns null WITHOUT shelling
  * out at all (a non-interactive / CI run never offers inherited auth and never
@@ -99,23 +105,61 @@ export interface DetectInheritedCredentialOptions {
 }
 
 /**
+ * How long (ms) the real exec seam waits for a child before killing it. A
+ * credential helper (Git Credential Manager, a locked keychain) that tries to
+ * prompt on the TTY would otherwise block forever; the timeout turns that hang
+ * into a bounded, non-fatal miss (the kill sets the callback's `err`, which
+ * resolves `{ failed: true }`).
+ */
+const EXEC_TIMEOUT_MS = 10_000;
+
+/**
  * The real exec seam over `node:child_process.execFile`. Resolves (never
- * rejects): a spawn error (e.g. `gh` not installed) or a non-zero exit resolves
- * with `failed: true`, so `gh`'s absence is a clean, non-fatal miss. stdout is
- * captured but never logged here — the token reaches GitHub only via Octokit and
- * git, and is scrubbed before any line leaves the process.
+ * rejects): a spawn error (e.g. `gh` not installed), a non-zero exit, OR a
+ * timeout (a hung credential helper) all resolve with `failed: true`, so each is
+ * a clean, non-fatal miss. stdout is captured but never logged here — the token
+ * reaches GitHub only via Octokit and git, and is scrubbed before any line
+ * leaves the process.
+ *
+ * SECURITY / robustness hardening (mirrors git.ts's `gitEnv`):
+ *  - `GIT_TERMINAL_PROMPT=0` + `GCM_INTERACTIVE=never` forbid `git credential`
+ *    and Git Credential Manager from prompting on the TTY, so a missing/locked
+ *    credential is a fast non-zero exit (a miss) instead of a blocking prompt.
+ *  - A bounded `timeout` (with SIGKILL) caps any helper that still blocks — on
+ *    timeout the child is killed and the callback's `err` resolves `failed: true`.
+ *  - A `stdin` error listener swallows an EPIPE from a git child that exits
+ *    before reading its stdin, so the write never crashes the process (the
+ *    outcome is reported through the exec callback, preserving the never-rejects
+ *    contract).
  */
 export const defaultExec: ExecSeam = (command, args, stdin) =>
   new Promise<ExecResult>((resolve) => {
     const child = execFile(
       command,
       [...args],
-      { windowsHide: true },
+      {
+        windowsHide: true,
+        // Forbid any interactive credential prompt (TTY hang) — a missing or
+        // locked credential becomes a fast non-zero exit (a miss), not a block.
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",
+          GCM_INTERACTIVE: "never",
+        },
+        // Bound a helper that still blocks despite the env above; on timeout the
+        // child is killed and `err` is set → resolves `{ failed: true }` (a miss).
+        timeout: EXEC_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      },
       (err, stdout) => {
         resolve({ stdout: stdout ?? "", failed: err !== null });
       },
     );
     if (stdin !== undefined && child.stdin) {
+      // Swallow an EPIPE from a git child that exits before reading stdin; the
+      // real outcome still arrives via the exec callback. Registered BEFORE the
+      // write so a synchronous error can never escape as an unhandled throw.
+      child.stdin.on("error", () => {});
       child.stdin.end(stdin);
     }
   });
@@ -127,32 +171,63 @@ function inferSource(token: string): TokenSource {
 }
 
 /**
- * Parse the `password=<token>` line out of `git credential fill` output. `git`
- * emits `key=value` lines; we read the first non-empty `password=` value.
- * Returns null when there is no password line (the cue to fall back to `gh`).
+ * Parse the `password=<token>` value out of `git credential fill` output, BUT
+ * ONLY when the credential `git` echoes back is for the host we asked about —
+ * `host=github.com` AND `protocol=https`.
+ *
+ * `git credential fill` echoes the full `key=value` set, including the `host` and
+ * `protocol` the helper resolved. A helper with `insteadOf`/enterprise config (or
+ * a credential store keyed differently) could return a credential for a DIFFERENT
+ * host/account than the github.com https credential we requested. Accepting that
+ * password blind would route a wrong-host token at GitHub. So we parse the WHOLE
+ * key=value set and require host+protocol to match before trusting `password`.
+ *
+ * Returns null (a miss → fall back to `gh`) when there is no non-empty `password`
+ * OR when the echoed host/protocol is not exactly github.com over https. This
+ * makes the module's exact-host contract TRUE rather than aspirational.
  */
 function parseGitCredentialPassword(stdout: string): string | null {
+  let password: string | null = null;
+  let host: string | null = null;
+  let protocol: string | null = null;
   for (const line of stdout.split("\n")) {
     const eq = line.indexOf("=");
     if (eq === -1) {
       continue;
     }
-    if (line.slice(0, eq) === "password") {
-      const value = line.slice(eq + 1).trim();
-      if (value.length > 0) {
-        return value;
+    const key = line.slice(0, eq);
+    const value = line.slice(eq + 1).trim();
+    if (key === "password") {
+      // First non-empty password wins.
+      if (password === null && value.length > 0) {
+        password = value;
       }
+    } else if (key === "host") {
+      host = value;
+    } else if (key === "protocol") {
+      protocol = value;
     }
   }
-  return null;
+  if (password === null) {
+    return null;
+  }
+  // Host-pin: only trust the password when git echoed back the EXACT host and
+  // protocol we asked for. A mismatch (insteadOf / GHE / a re-keyed helper) is a
+  // miss, not an error — fall through to the gh fallback.
+  if (host !== "github.com" || protocol !== "https") {
+    return null;
+  }
+  return password;
 }
 
 /**
  * Detect the terminal's existing GitHub credential.
  *
  * Order: `git credential fill` (feeding exactly
- * {@link GIT_CREDENTIAL_FILL_STDIN}) → parse `password=`. ONLY if that yields no
- * password, fall back to `gh auth token`. Returns null when neither yields a
+ * {@link GIT_CREDENTIAL_FILL_STDIN}) → parse `password=` ONLY when the echoed
+ * `host=github.com` + `protocol=https` match (a wrong-host credential is a miss).
+ * ONLY if that yields no usable password, fall back to
+ * `gh auth token --hostname github.com`. Returns null when neither yields a
  * token, when off a TTY (without running the exec seam), or when `gh` is
  * absent/unauthenticated — never throws on a missing `gh`.
  *
@@ -186,8 +261,11 @@ export async function detectInheritedCredential(
 
   // 2. gh auth token — ONLY when fill yielded no password. gh is OPTIONAL: a
   // missing/unauthenticated gh (failed) or empty output is a non-fatal miss.
+  // Host-pinned to github.com so a user whose `gh` default host is a GHE instance
+  // still yields the github.com token (matching the host-pinned git-credential
+  // probe above) rather than an enterprise token.
   if (token === null) {
-    const gh = await exec("gh", ["auth", "token"]);
+    const gh = await exec("gh", ["auth", "token", "--hostname", "github.com"]);
     if (!gh.failed) {
       const trimmed = gh.stdout.trim();
       if (trimmed.length > 0) {

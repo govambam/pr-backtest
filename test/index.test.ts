@@ -1517,6 +1517,104 @@ test("VAL-FLOW-003: scoped + no → guidance, slug re-prompt (bad→good), read 
   assert.deepEqual(events, ["land-in-source", "paste:read", "paste:write"]);
 });
 
+// --- FIX 3: eager-paste replay does NOT defeat the bounded re-prompt ----------
+
+test("FIX-3: scoped-sandbox first eager write paste rejected → live re-prompt succeeds (recovery not defeated)", async () => {
+  // The scoped Sandbox fork eagerly collects a write paste. If that FIRST token
+  // is rejected by `accept` (cannot write the destination), the resolver's bounded
+  // re-prompt must fall back to the LIVE default getter (which re-prompts the
+  // user) — a constant thunk would hand back the same rejected token 3× and
+  // hard-fail. Here the eager write token is BAD; the live re-prompt (driven via
+  // prompts.inject) supplies the GOOD write token, and the run succeeds.
+  const BAD_WRITE = "ghp_BAD_eager_write_token_cannot_write_dest";
+  const events: string[] = [];
+
+  // The live default write paste uses prompts({type:"password"}). Inject the GOOD
+  // write token so the SECOND getPaste call (the live re-prompt) recovers.
+  const prompts = (await import("prompts")).default;
+  prompts.inject([WRITE_TOKEN]);
+
+  // Source readable only by READ_TOKEN; dest writable only by WRITE_TOKEN. The
+  // BAD eager write token can neither read the source nor write the dest, so the
+  // write `accept` (verify-or-create) rejects it.
+  const factory = (token: string) =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource = args.owner === SOURCE_OWNER && args.repo === SOURCE_REPO;
+          if (isSource) {
+            if (token !== READ_TOKEN) throw httpError(404);
+            return { data: {} };
+          }
+          return { data: { permissions: { push: token === WRITE_TOKEN } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { deps } = makeDeps(
+    {
+      resolveAuthFirstChoice,
+      detectInheritedCredential: async () => null, // scoped fork
+      makeAuthOfferPrompt: () => async () => false,
+      makeLandingChoicePrompt: () => async () => "primary",
+      makeLandInSourcePrompt: () => async () => false, // → scoped sandbox
+      // Slug fixed to a real sandbox so dest != source (a genuine sandbox run).
+      makeSlugPrompt: () => async () => ({ owner: "you", repo: "sandbox" }),
+      // §3b eager pastes: read is GOOD; write is BAD (forces the re-prompt).
+      sandboxReadPaste: async () => {
+        events.push("eager:read");
+        return READ_TOKEN;
+      },
+      sandboxWritePaste: async () => {
+        events.push("eager:write-bad");
+        return BAD_WRITE;
+      },
+      addSourceRemote: async () => {},
+      verifyRepo: async (octokit, owner, repo) => {
+        const { data } = await (octokit as unknown as ResolverOctokit).repos.get({
+          owner,
+          repo,
+        });
+        return { exists: true, canPush: data.permissions?.push === true };
+      },
+      // REAL verify-or-create so the write `accept` genuinely REJECTS the BAD
+      // eager token (it cannot push the dest → DestinationApiError), forcing the
+      // resolver's bounded re-prompt. (makeDeps' default just returns dest without
+      // checking, which would wrongly accept the BAD token.)
+      verifyOrCreateDestination,
+      // REAL resolvers: the orchestrator supplies getPaste via its replay-then-live
+      // wrapper, so we deliberately do NOT override getPaste here. The first call
+      // yields the eager BAD token; the second delegates to the LIVE default write
+      // paste, which prompts.inject feeds the GOOD WRITE_TOKEN.
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+
+  const { exit } = await withTty(() => run({ deps }));
+  // The run SUCCEEDS: the bounded re-prompt recovered via the live getter. With a
+  // constant thunk the BAD token would be returned 3× and the write resolver
+  // would hard-fail (exit 1/2) instead of reaching exit 0.
+  assert.equal(exit, 0, "the live re-prompt recovered the run (recovery not defeated)");
+  assert.deepEqual(events, ["eager:read", "eager:write-bad"]);
+});
+
 // --- VAL-AUTH-002: accepting a both-capability inherited credential ----------
 
 test("VAL-AUTH-002: inherited both-cap → no paste, no saveConfig, single-PAT (twoToken false), reaches clone+push", async () => {

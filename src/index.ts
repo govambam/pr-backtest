@@ -23,6 +23,8 @@
 import type { Octokit } from "@octokit/rest";
 
 import {
+  defaultGetSandboxReadPaste,
+  defaultGetSandboxWritePaste,
   NoSourceTokenNonInteractiveError,
   NoTokenNonInteractiveError,
   resolveReadToken,
@@ -227,6 +229,36 @@ function messageOf(err: unknown): string {
 }
 
 /**
+ * Wrap an eagerly-collected paste so the resolver's bounded re-prompt is NOT
+ * defeated.
+ *
+ * The scoped-Sandbox fork collects its pastes eagerly in §3b user-facing order
+ * (read-then-write) and the orchestrator replays them into the resolvers. But a
+ * resolver's `getPaste` is called up to {@link PASTE_MAX_ATTEMPTS} times to
+ * re-prompt when a pasted token is rejected. A CONSTANT thunk would hand back the
+ * SAME (already-rejected) token on every attempt and hard-fail, defeating
+ * recovery. So: return the eagerly-collected `eager` value ONCE on the first
+ * call, then DELEGATE every subsequent call to the LIVE default getter, which
+ * re-prompts the user (TTY) for a fresh token. A null eager value falls straight
+ * through to the live getter on the first call too (nothing was collected).
+ */
+function makeReplayThenLivePaste<A extends unknown[]>(
+  eager: string | null,
+  live: (...args: A) => Promise<string | null>,
+): (...args: A) => Promise<string | null> {
+  let used = false;
+  return async (...args: A): Promise<string | null> => {
+    if (!used) {
+      used = true;
+      if (eager !== null) {
+        return eager;
+      }
+    }
+    return live(...args);
+  };
+}
+
+/**
  * Run a full backtest: choose the destination, resolve the write + read tokens,
  * read the PR, resolve the commit pair, confirm the plan, then clone/fetch/push
  * and open the simulated PR. Owns all exit codes.
@@ -425,10 +457,19 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
             )
         : undefined,
       // Scoped-sandbox fork only: the destination write paste was already
-      // collected (after the read paste) in §3b order; replay it here so the
-      // resolver does not re-prompt. Null entries fall back to the default paste.
+      // collected (after the read paste) in §3b order; replay it here. The eager
+      // value is returned ONCE on the FIRST call; subsequent calls (the
+      // resolver's bounded re-prompt, when the first token is rejected) delegate
+      // to the LIVE default write paste so the user is genuinely re-prompted —
+      // a constant thunk would hand back the same rejected token 3× and defeat
+      // recovery. A null entry falls straight through to the live getter.
       ...(scopedSandboxPastes
-        ? { getPaste: async () => scopedSandboxPastes.write }
+        ? {
+            getPaste: makeReplayThenLivePaste(
+              scopedSandboxPastes.write,
+              (dest: RepoRef) => defaultGetSandboxWritePaste(dest),
+            ),
+          }
         : {}),
     });
     writeToken = resolved.token;
@@ -501,9 +542,18 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         : undefined,
       // Scoped-sandbox fork only: replay the source read paste collected in §3b
       // order. Single-PAT reuse still runs first, so a write token that also reads
-      // the source short-circuits before this is consulted.
+      // the source short-circuits before this is consulted. The eager value is
+      // returned ONCE on the FIRST call; subsequent calls (the resolver's bounded
+      // re-prompt, when the first token is rejected) delegate to the LIVE default
+      // read paste so the user is genuinely re-prompted — a constant thunk would
+      // defeat recovery. A null entry falls straight through to the live getter.
       ...(scopedSandboxPastes
-        ? { getPaste: async () => scopedSandboxPastes.read }
+        ? {
+            getPaste: makeReplayThenLivePaste(
+              scopedSandboxPastes.read,
+              (src: RepoRef) => defaultGetSandboxReadPaste(src),
+            ),
+          }
         : {}),
     });
     readToken = resolved.token;
