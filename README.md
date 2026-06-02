@@ -162,7 +162,9 @@ pr-backtest https://github.com/acme/api/pull/123 --verbose
 $ git clone --no-checkout https://x-access-token@github.com/octocat/pr-backtest-sandbox.git <tmp>/repo  1100ms
 $ git remote add source https://x-access-token@github.com/acme/api.git  18ms
 $ git fetch source f0e9d8c  312ms
+$ git fetch source a1b2c3d  298ms
 $ git push origin f0e9d8c:refs/heads/backtest-pr123-base  640ms
+$ git push origin a1b2c3d:refs/heads/backtest-pr123-head  635ms
 → POST  /repos/octocat/pr-backtest-sandbox/pulls  201  301ms
 ```
 
