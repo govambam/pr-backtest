@@ -267,31 +267,26 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   const destTrace = traceOp("Verified destination");
   try {
     const accept: AcceptToken = async (octokit) => {
-      try {
-        verifiedDest = await deps.verifyOrCreateDestination(dest, {
-          isSandbox,
-          verifyDestination: (vOwner, vRepo) =>
-            deps.verifyRepo(octokit as Octokit, vOwner, vRepo),
-          createSandbox: deps.makeSandboxCreator(octokit as Octokit),
-          createFlag: opts.createSandbox === true,
-          isTTY,
-          // Interactive create offer: without this seam, a TTY
-          // user who picks a not-yet-existing sandbox is never offered to create
-          // it. The seam self-guards off-TTY; verifyOrCreateDestination only
-          // invokes it on the isTTY branch.
-          confirmCreate: deps.makeConfirmCreate(),
-        });
-        return true;
-      } catch (err) {
-        // A DestinationApiError means this candidate cannot write/create the
-        // destination — reject it so the next candidate / paste is tried. Any
-        // other error (e.g. a genuine API/network failure) is rethrown so it is
-        // not silently swallowed as "wrong token".
-        if (err instanceof DestinationApiError) {
-          return false;
-        }
-        throw err;
-      }
+      // verifyOrCreateDestination throws a DestinationApiError when THIS token
+      // cannot write or create the destination. resolveWriteToken treats that
+      // throw as a candidate rejection (try the next source / paste) and, if
+      // every source is rejected, surfaces the destination error itself rather
+      // than a misleading "no write token configured" error. A non-rejection
+      // failure (genuine API/network error) propagates from here unchanged.
+      verifiedDest = await deps.verifyOrCreateDestination(dest, {
+        isSandbox,
+        verifyDestination: (vOwner, vRepo) =>
+          deps.verifyRepo(octokit as Octokit, vOwner, vRepo),
+        createSandbox: deps.makeSandboxCreator(octokit as Octokit),
+        createFlag: opts.createSandbox === true,
+        isTTY,
+        // Interactive create offer: without this seam, a TTY
+        // user who picks a not-yet-existing sandbox is never offered to create
+        // it. The seam self-guards off-TTY; verifyOrCreateDestination only
+        // invokes it on the isTTY branch.
+        confirmCreate: deps.makeConfirmCreate(),
+      });
+      return true;
     };
     const resolved = await deps.resolveWriteToken({
       destination: dest,

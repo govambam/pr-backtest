@@ -32,6 +32,7 @@ import {
   type TokenSlot,
   type TokenSource,
 } from "./config.js";
+import { DestinationApiError } from "./destination.js";
 import { isStatus, makeOctokit } from "./github.js";
 import { info, registerSecret, success } from "./log.js";
 
@@ -321,10 +322,13 @@ export interface ResolvedToken {
 }
 
 /**
- * Whether a candidate token is acceptable. The caller wraps its real check (e.g.
- * verify-or-create the destination) so a thrown rejection just means "not
- * accepted". Receives the candidate's Octokit and the raw token (the token is
- * only used to key per-token caller state — it must never be logged).
+ * Whether a candidate token is acceptable. May reject either by returning false
+ * or by throwing a {@link DestinationApiError} (the write path lets its
+ * verify-or-create check throw); {@link resolveWithAccept} treats both as "not
+ * accepted, try the next source" but remembers a thrown DestinationApiError to
+ * surface it if every source is rejected. Any other throw propagates. Receives
+ * the candidate's Octokit and the raw token (the token is only used to key
+ * per-token caller state — it must never be logged).
  */
 export type AcceptToken = (
   octokit: ResolverOctokit,
@@ -340,8 +344,14 @@ export type AcceptToken = (
  * `@login` — the caller captures it for a fresh paste).
  *
  * `onPasteReject` renders the per-attempt scope hint between failed pastes.
- * Throws `notInteractiveError()` when nothing is accepted and there is no
- * interactive path.
+ *
+ * `accept` rejects a candidate either by returning false (the read path's
+ * `canRead`) or by throwing a {@link DestinationApiError} (the write path, when
+ * the token cannot write/create the destination); any other throw is a genuine
+ * failure and propagates. On exhaustion: if at least one candidate was rejected
+ * by a thrown DestinationApiError, that (last) error is the real, actionable
+ * failure — re-thrown so the caller maps it to a destination error rather than
+ * a misleading "no token" one. Otherwise `notInteractiveError()` is thrown.
  */
 async function resolveWithAccept(
   candidates: Array<Candidate | null>,
@@ -351,12 +361,32 @@ async function resolveWithAccept(
   onPasteReject: () => void,
   notInteractiveError: () => NoTokenNonInteractiveError,
 ): Promise<Candidate> {
+  // The last DestinationApiError a candidate was rejected with, if any. When
+  // every source is rejected for the SAME destination reason (e.g. the repo
+  // does not exist and --create-sandbox was not passed), this is what the user
+  // actually needs to see — not "no write token configured".
+  let lastDestinationReject: DestinationApiError | null = null;
+  const tryAccept = async (
+    octokit: ResolverOctokit,
+    token: string,
+  ): Promise<boolean> => {
+    try {
+      return await accept(octokit, token);
+    } catch (err) {
+      if (err instanceof DestinationApiError) {
+        lastDestinationReject = err;
+        return false;
+      }
+      throw err;
+    }
+  };
+
   for (const candidate of candidates) {
     if (!candidate || candidate.token.length === 0) {
       continue;
     }
     registerSecret(candidate.token);
-    if (await accept(make(candidate.token), candidate.token)) {
+    if (await tryAccept(make(candidate.token), candidate.token)) {
       return candidate;
     }
   }
@@ -367,7 +397,7 @@ async function resolveWithAccept(
       break;
     }
     registerSecret(pasted);
-    if (await accept(make(pasted), pasted)) {
+    if (await tryAccept(make(pasted), pasted)) {
       return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
     }
     if (attempt < PASTE_MAX_ATTEMPTS - 1) {
@@ -375,6 +405,13 @@ async function resolveWithAccept(
     }
   }
 
+  // A remembered destination rejection is the real failure: re-throw it (the
+  // caller maps DestinationApiError → exit 2) instead of the generic
+  // non-interactive "no token" error, which would misreport a destination
+  // problem AND falsely claim stdin is not a TTY after interactive attempts.
+  if (lastDestinationReject) {
+    throw lastDestinationReject;
+  }
   throw notInteractiveError();
 }
 
@@ -399,10 +436,12 @@ export interface ResolveWriteTokenOptions {
   /** Interactive paste getter. Defaults to the Primary/Sandbox-write copy per `isPrimary`. */
   getPaste?: (destination: RepoRef, isPrimary: boolean) => Promise<string | null>;
   /**
-   * Accept a candidate write token. The caller wraps its verify-or-create check
-   * so a thrown rejection means "not accepted" — this lets a token that can
-   * CREATE a missing destination be accepted even though `canWrite` (existing
-   * repo) would reject it.
+   * Accept a candidate write token via the caller's verify-or-create check —
+   * this lets a token that can CREATE a missing destination be accepted even
+   * though `canWrite` (existing repo) would reject it. A candidate that cannot
+   * write/create rejects by throwing a {@link DestinationApiError}; when every
+   * source is rejected that error is surfaced (exit 2) rather than the generic
+   * no-token error.
    */
   accept: AcceptToken;
 }
@@ -415,8 +454,11 @@ export interface ResolveWriteTokenOptions {
  * candidate is registered with the scrubber before its first request and offered
  * to `accept`; the first accepted wins. A freshly pasted accepted token is
  * validated via `users.getAuthenticated` for its `@login` and persisted to the
- * `destinationToken` slot. Throws {@link NoTokenNonInteractiveError} (names
- * `GITHUB_TOKEN`) when nothing is accepted and there is no interactive path.
+ * `destinationToken` slot. When nothing is accepted: throws the underlying
+ * {@link DestinationApiError} if every source was rejected by one (the real
+ * destination problem, mapped to exit 2), otherwise throws
+ * {@link NoTokenNonInteractiveError} (names `GITHUB_TOKEN`, exit 1) when there
+ * is genuinely no token and no interactive path.
  */
 export async function resolveWriteToken(
   options: ResolveWriteTokenOptions,

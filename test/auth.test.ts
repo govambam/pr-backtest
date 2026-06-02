@@ -15,6 +15,7 @@ import {
   type RepoRef,
 } from "../src/auth.js";
 import type { Config } from "../src/config.js";
+import { DestinationApiError } from "../src/destination.js";
 import { setVerbose, setTtyOverride, redact } from "../src/log.js";
 
 const SOURCE: RepoRef = { owner: "acme", repo: "api" };
@@ -326,10 +327,10 @@ test("resolveReadToken: an env/saved read token makes NO users.getAuthenticated 
   assert.deepEqual(authCalls, [], "no getAuthenticated for env/saved read tokens");
 });
 
-test("resolveWriteToken: a caller's wrapped accept (false on rejection) falls through to the next candidate", async () => {
-  // Contract: the CALLER wraps its verify-or-create check so a rejected candidate
-  // returns false (not throws). Here the wrapped accept returns false for the env
-  // token and true for the saved one, so resolution falls through correctly.
+test("resolveWriteToken: an accept that returns false on rejection falls through to the next candidate", async () => {
+  // An accept may reject by returning false (in addition to throwing a
+  // DestinationApiError). Here it returns false for the env token and true for
+  // the saved one, so resolution falls through correctly.
   const result = await resolveWriteToken(
     writeOptions({
       getEnvToken: () => "bad-token",
@@ -400,6 +401,102 @@ test("resolveWriteToken: non-interactive (paste returns null) throws immediately
       e instanceof NoTokenNonInteractiveError &&
       /GITHUB_TOKEN/.test((e as Error).message),
   );
+});
+
+test("resolveWriteToken: every source rejected by a DestinationApiError surfaces THAT error, not NoTokenNonInteractiveError (non-interactive)", async () => {
+  // The real bug: a destination problem (e.g. `--sandbox foo/bar` without
+  // --create-sandbox when the repo does not exist) makes the accept check throw
+  // a DestinationApiError for every candidate. Off-TTY there is no paste, so on
+  // exhaustion the actionable destination error must surface — NOT a misleading
+  // "no write token configured" error.
+  const destErr = new DestinationApiError(
+    "Sandbox alice/sandbox was not found. Pass --create-sandbox to create it.",
+  );
+  await assert.rejects(
+    () =>
+      resolveWriteToken(
+        writeOptions({
+          getEnvToken: () => "env-token",
+          getConfig: () => ({
+            destinationToken: { token: "saved", username: "u", source: "classic" },
+          }),
+          getPaste: async () => null,
+          accept: async () => { throw destErr; },
+          saveConfig: () => {},
+        }),
+      ),
+    (e: unknown) =>
+      e instanceof DestinationApiError &&
+      !(e instanceof NoTokenNonInteractiveError) &&
+      e === destErr,
+  );
+});
+
+test("resolveWriteToken: 3 paste attempts all rejected by DestinationApiError surface THAT error, not the misleading non-TTY error", async () => {
+  // Bug #2: after exhausting the interactive paste attempts with tokens that
+  // cannot write the destination, the user IS on a TTY — claiming "stdin is not
+  // a TTY" is wrong. The write-permission DestinationApiError surfaces instead.
+  let pasteCalls = 0;
+  const destErr = new DestinationApiError(
+    "That token cannot write alice/sandbox (no write access).",
+  );
+  await assert.rejects(
+    () =>
+      quiet(() =>
+        resolveWriteToken(
+          writeOptions({
+            getPaste: async () => { pasteCalls += 1; return "cant-write"; },
+            accept: async () => { throw destErr; },
+            saveConfig: () => {},
+          }),
+        ),
+      ),
+    (e: unknown) =>
+      e instanceof DestinationApiError &&
+      !(e instanceof NoTokenNonInteractiveError) &&
+      e === destErr,
+  );
+  assert.equal(pasteCalls, 3, "all 3 interactive attempts were exhausted first");
+});
+
+test("resolveWriteToken: a non-DestinationApiError thrown by accept propagates immediately (not swallowed as a rejection)", async () => {
+  // A genuine API/network failure during the accept probe must NOT be treated
+  // as a candidate rejection — it propagates as-is, never reaching the paste
+  // loop or the no-token error.
+  const boom = new Error("network down");
+  let pasteCalls = 0;
+  await assert.rejects(
+    () =>
+      resolveWriteToken(
+        writeOptions({
+          getEnvToken: () => "env-token",
+          getPaste: async () => { pasteCalls += 1; return "x"; },
+          accept: async () => { throw boom; },
+          saveConfig: () => {},
+        }),
+      ),
+    (e: unknown) => e === boom,
+  );
+  assert.equal(pasteCalls, 0, "a real failure short-circuits before any paste");
+});
+
+test("resolveWriteToken: an accepted candidate after a DestinationApiError rejection still wins (rejection is not terminal)", async () => {
+  // A DestinationApiError rejecting one candidate must still let a later
+  // candidate be accepted — the remembered error is only surfaced on full
+  // exhaustion.
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "bad-token",
+      getConfig: () => ({
+        destinationToken: { token: "good-token", username: "u", source: "fine-grained" },
+      }),
+      accept: async (_o, token) => {
+        if (token === "good-token") return true;
+        throw new DestinationApiError("cannot write with bad-token");
+      },
+    }),
+  );
+  assert.equal(result.token, "good-token");
 });
 
 /** One recorded `repos.get` probe: which token's Octokit issued it, against what repo. */
