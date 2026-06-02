@@ -18,6 +18,22 @@ npm install -g pr-backtest
 npx pr-backtest <pr-url>
 ```
 
+### Updating a source install
+
+If you installed from a local clone (`npm install -g .`), the global copy is a
+snapshot — a `git pull` alone does not update it. From the repo root:
+
+```bash
+npm run update     # git pull --ff-only, install deps, rebuild, reinstall globally
+```
+
+Or, when you already have the changes locally and only need to rebuild and
+reinstall the global copy:
+
+```bash
+npm run reinstall  # rebuild dist/ and reinstall globally
+```
+
 ## Setup
 
 There is no separate setup step. **In a terminal the tool asks about your GitHub login first**, then asks where the backtest PR lands — see [Guided setup](#guided-setup-auth-first) below. Only then does it resolve the exact token(s) the chosen destination needs. The source is only ever *read* for a Sandbox; see [Destination](#destination).
