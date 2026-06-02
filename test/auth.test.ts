@@ -402,12 +402,28 @@ test("resolveWriteToken: non-interactive (paste returns null) throws immediately
   );
 });
 
-/** A factory keyed on canRead(source): tokens in `readable` read the source. */
-function readFactory(readable: Set<string>, login?: (t: string) => string) {
+/** One recorded `repos.get` probe: which token's Octokit issued it, against what repo. */
+interface ReadProbe {
+  token: string;
+  owner: string;
+  repo: string;
+}
+
+/**
+ * A factory keyed on canRead(source): tokens in `readable` read the source.
+ * If a `built` array is passed, every `repos.get` is recorded into it (token +
+ * target repo), so a test can assert WHICH token probed the source.
+ */
+function readFactory(
+  readable: Set<string>,
+  login?: (t: string) => string,
+  built?: ReadProbe[],
+) {
   return (token: string): ResolverOctokit =>
     ({
       repos: {
         get: async (args: { owner: string; repo: string }) => {
+          built?.push({ token, owner: args.owner, repo: args.repo });
           const isSource = args.owner === SOURCE.owner && args.repo === SOURCE.repo;
           if (isSource && readable.has(token)) {
             return { data: { permissions: { push: false } } };
@@ -470,16 +486,25 @@ test("resolveReadToken: saved sourceToken used over write-reuse when env absent"
 });
 
 test("resolveReadToken: reuses the write token iff it reads the source (single-PAT)", async () => {
+  const built: ReadProbe[] = [];
   const result = await resolveReadToken(
     readOptions({
       writeToken: "one-pat",
-      makeOctokit: readFactory(new Set(["one-pat"]), () => "owner"),
+      makeOctokit: readFactory(new Set(["one-pat"]), () => "owner", built),
     }),
   );
   assert.equal(result.token, "one-pat");
   assert.equal(result.fromPaste, false);
   // Reused write token is non-paste: no getAuthenticated, so no @login captured.
   assert.equal(result.login, "");
+  // The reuse is EARNED: `one-pat`'s Octokit actually probed the SOURCE repo.
+  // This fails if resolveReadToken were changed to return writeToken blindly
+  // (without a source read), which is the whole point of the single-PAT rule.
+  assert.deepEqual(
+    built,
+    [{ token: "one-pat", owner: SOURCE.owner, repo: SOURCE.repo }],
+    "the reused write token issued a repos.get against the source",
+  );
 });
 
 test("resolveReadToken: a fresh accepted paste persists to sourceToken with @login", async () => {

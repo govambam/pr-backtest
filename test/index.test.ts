@@ -900,6 +900,59 @@ test("VAL-ROUTE-001: two-token run routes source reads to READ Octokit, dest cal
   assert.ok(apiCalls.some((c) => c.op === "createPullRequest" && c.token === WRITE_TOKEN));
 });
 
+test("VAL-TEST-017: the getCommitParentSha prefetch fires for a parentless commit and uses the READ Octokit", async () => {
+  // Every other fixture sets parents[0], so index.ts's `if (!target.parents[0])`
+  // prefetch never runs and the routing assertions filter an empty set. Here the
+  // target commit carries NO parent, forcing runBacktest to call
+  // getCommitParentSha. We assert it (a) actually fires and (b) is issued via the
+  // READ Octokit, never the WRITE one. Routing the prefetch to the write token in
+  // src/index.ts (a source read on the write credential — exactly what the suite
+  // forbids) makes this test go red.
+  const PARENT_SHA = "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1";
+  const { deps, apiCalls } = makeRoutingDeps({
+    readToken: READ_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+    overrides: {
+      listPullRequestCommits: async (octokit) => {
+        apiCalls.push({
+          op: "listPullRequestCommits",
+          token: (octokit as { __token?: string }).__token ?? "<untagged>",
+        });
+        return [
+          {
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            parents: [], // no parent → resolveBase must prefetch via getCommitParentSha
+          },
+        ];
+      },
+      getCommitParentSha: async (octokit) => {
+        apiCalls.push({
+          op: "getCommitParentSha",
+          token: (octokit as { __token?: string }).__token ?? "<untagged>",
+        });
+        return PARENT_SHA; // non-empty so resolveBase succeeds and the run completes
+      },
+    },
+  });
+  // Select the parentless commit explicitly: `--commit initial` only matches a
+  // commit with exactly one parent, so it would never select a root commit.
+  const { exit } = await run({ deps, commit: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" });
+  assert.equal(exit, 0, "the run completes once the parent is prefetched");
+
+  const prefetch = apiCalls.filter((c) => c.op === "getCommitParentSha");
+  assert.equal(prefetch.length, 1, "the prefetch fired exactly once");
+  assert.equal(
+    prefetch[0]!.token,
+    READ_TOKEN,
+    "the parent prefetch must use the READ Octokit",
+  );
+  assert.ok(
+    !apiCalls.some((c) => c.op === "getCommitParentSha" && c.token === WRITE_TOKEN),
+    "the parent prefetch must NEVER use the WRITE Octokit",
+  );
+});
+
 test("VAL-ROUTE-002: source-remote fetch uses READ token; clone + push use WRITE token", async () => {
   const { deps, gitCalls } = makeRoutingDeps({
     readToken: READ_TOKEN,

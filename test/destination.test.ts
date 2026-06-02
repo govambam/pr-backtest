@@ -39,8 +39,6 @@ interface ChoiceHarness {
   resolvers: ChoiceResolvers;
   /** Rows the menu seam was handed (null until prompted). */
   rows: () => MenuRow[] | null;
-  /** Logins/getAuthenticated must NEVER be invoked by the choice flow. */
-  loginInvoked: () => boolean;
   promptCount: () => number;
 }
 
@@ -55,7 +53,6 @@ function makeChoiceHarness(opts: {
 }): ChoiceHarness {
   let rows: MenuRow[] | null = null;
   let promptCount = 0;
-  const loginInvoked = false;
   const resolvers: ChoiceResolvers = {
     getFlags: () => opts.flags ?? {},
     getDefaultDestination: () => {
@@ -80,7 +77,6 @@ function makeChoiceHarness(opts: {
   return {
     resolvers,
     rows: () => rows,
-    loginInvoked: () => loginInvoked,
     promptCount: () => promptCount,
   };
 }
@@ -335,8 +331,11 @@ test("VAL-DEST-006: the choice flow performs no owner classification / login loo
     pick: "saved-sandbox",
   });
   await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.equal(h.loginInvoked(), false);
-  // The resolvers object exposes no authenticated-login key.
+  // The genuine, falsifiable guarantee: the resolvers object exposes no
+  // authenticated-login seam at all. This assertion WOULD fail if a
+  // `getAuthenticatedLogin` key were ever added to ChoiceResolvers — unlike the
+  // removed `loginInvoked()` flag, which was hardwired to `false` and could
+  // never fail under any implementation.
   assert.ok(!(loginSeamName in h.resolvers));
 });
 
@@ -636,6 +635,11 @@ test("VAL-CREATE-002: post-create re-verify stays not-writable through retries �
     },
   );
   assert.ok(probes >= 4, "retries were exhausted");
+  // The exhaustion path backs off BETWEEN the bounded attempts: 4 post-create
+  // probes ⇒ 3 inter-attempt sleeps (no sleep after the final attempt). This
+  // covers the inter-attempt backoff on the exhaustion path, which the
+  // probe-count assertion alone does not exercise.
+  assert.equal(sleeps.length, 3, "three backoffs between the four bounded attempts");
   // The source repo was never a create/verify target other than the named sandbox.
   assert.ok(!calls.some((c) => c.args[0] === SOURCE.owner && c.args[1] === SOURCE.repo));
 });
