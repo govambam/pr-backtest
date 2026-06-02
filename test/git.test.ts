@@ -135,18 +135,25 @@ function fakeGit(
     addRemote: SimpleGit["addRemote"];
   }>,
 ): SimpleGit {
-  return {
+  // Real simple-git `.env()` mutates in place and returns the SAME instance.
+  // Model that here (return `this`) so a per-op token override does not produce
+  // a fresh fake that silently drops the recorded fetch/push.
+  const git = {
+    env(): SimpleGit {
+      return git as unknown as SimpleGit;
+    },
     fetch: overrides.fetch ?? (async () => ({}) as never),
     push: overrides.push ?? (async () => ({}) as never),
     addRemote: overrides.addRemote ?? (async () => "" as never),
-  } as unknown as SimpleGit;
+  };
+  return git as unknown as SimpleGit;
 }
 
 test("verbose fetch line is the real `$ git fetch …` command", async () => {
   setVerbose(true);
   const git = fakeGit({});
   const out = await captureStderr(async () => {
-    await fetchCommit(git, "9f3c1a2", 123, "source");
+    await fetchCommit(git, "9f3c1a2", 123, "source", READ_TOK);
   });
   assert.match(out, /\$ git fetch source 9f3c1a2/);
   assert.match(out, /\d+ms/);
@@ -156,7 +163,7 @@ test("verbose push line is the real `$ git push …` command", async () => {
   setVerbose(true);
   const git = fakeGit({});
   const out = await captureStderr(async () => {
-    await pushBranchFromSha(git, "a1b2c3d", "backtest-pr123-head");
+    await pushBranchFromSha(git, "a1b2c3d", "backtest-pr123-head", WRITE_TOK);
   });
   assert.match(out, /\$ git push origin a1b2c3d:refs\/heads\/backtest-pr123-head/);
 });
@@ -199,7 +206,7 @@ test("a fetch failure surfaces only the domain error; the stderr sentinel never 
   let thrown: unknown;
   const out = await captureStderr(async () => {
     try {
-      await fetchCommit(git, "9f3c1a2", 123, "source");
+      await fetchCommit(git, "9f3c1a2", 123, "source", READ_TOK);
     } catch (err) {
       thrown = err;
     }
@@ -228,7 +235,7 @@ test("a push failure surfaces only the generic error; the stderr sentinel never 
   let thrown: unknown;
   const out = await captureStderr(async () => {
     try {
-      await pushBranchFromSha(git, "a1b2c3d", "backtest-pr123-head");
+      await pushBranchFromSha(git, "a1b2c3d", "backtest-pr123-head", WRITE_TOK);
     } catch (err) {
       thrown = err;
     }
@@ -375,6 +382,97 @@ test("the askpass helper emits the token for a password prompt, empty for a user
   } finally {
     cleanup(dir);
   }
+});
+
+// --- per-operation token selector: the askpass env var is set per git op ----
+//
+// VAL-ROUTE-002 (secondary evidence): the per-operation credential seam sets the
+// askpass TOKEN_ENV for THAT op via `git.env(TOKEN_ENV, token)`. We unit-test the
+// selector here — a fake SimpleGit records the (name, value) passed to `.env()`
+// and that the op ran on the returned instance. The authoritative routing
+// evidence is test/index.test.ts; this proves the git-layer mechanism.
+
+const READ_TOK = "ghp_READ_token_for_selector_unit_test";
+const WRITE_TOK = "ghp_WRITE_token_for_selector_unit_test";
+
+/**
+ * A fake SimpleGit modeling real simple-git: `.env(name, value)` MUTATES the
+ * instance's current token-env in place and returns the SAME instance (not a new
+ * one). Each fetch/push records the token-env value that was live at the moment
+ * it ran, so a test can see which token actually authenticated the op — and prove
+ * a later op's `.env()` override is what the op runs under.
+ *
+ * Modeling `.env()` as mutate-and-return-`this` is the point of F1: a per-op
+ * token override re-asserts the credential on the shared instance, so a push that
+ * re-asserts the WRITE token can never inherit a prior source fetch's READ token.
+ */
+function envRecordingGit(): {
+  git: SimpleGit;
+  envSets: Array<{ name: string; value: string }>;
+  ran: Array<{ op: string; tokenEnv: string | undefined }>;
+} {
+  const envSets: Array<{ name: string; value: string }> = [];
+  const ran: Array<{ op: string; tokenEnv: string | undefined }> = [];
+  let tokenEnv: string | undefined;
+  const git = {
+    env(name: string, value: string): SimpleGit {
+      envSets.push({ name, value });
+      tokenEnv = value; // mutate in place
+      return git as unknown as SimpleGit;
+    },
+    fetch: async () => {
+      ran.push({ op: "fetch", tokenEnv });
+      return {} as never;
+    },
+    push: async () => {
+      ran.push({ op: "push", tokenEnv });
+      return {} as never;
+    },
+  };
+  return { git: git as unknown as SimpleGit, envSets, ran };
+}
+
+test("fetchCommit with a token sets TOKEN_ENV to that token for the fetch", async () => {
+  const { git, envSets, ran } = envRecordingGit();
+  await fetchCommit(git, "9f3c1a2", 123, "source", READ_TOK);
+  assert.deepEqual(envSets, [{ name: TOKEN_ENV, value: READ_TOK }], "the read token is set on TOKEN_ENV");
+  assert.deepEqual(ran, [{ op: "fetch", tokenEnv: READ_TOK }], "the fetch ran on the read-token env");
+});
+
+test("pushBranchFromSha with a token sets TOKEN_ENV to that token for the push", async () => {
+  const { git, envSets, ran } = envRecordingGit();
+  await pushBranchFromSha(git, "a1b2c3d", "backtest-pr123-head", WRITE_TOK);
+  assert.deepEqual(envSets, [{ name: TOKEN_ENV, value: WRITE_TOK }], "the write token is set on TOKEN_ENV");
+  assert.deepEqual(ran, [{ op: "push", tokenEnv: WRITE_TOK }], "the push ran on the write-token env");
+});
+
+test("a source fetch then a push never lets the read token authenticate the push", async () => {
+  // Same instance, two ops: the source fetch overrides TOKEN_ENV to the read
+  // token, then the push re-asserts the write token. The push must run under the
+  // write token, never the read token (INV-READTOKEN-NOWRITE).
+  const { git, ran } = envRecordingGit();
+  await fetchCommit(git, "9f3c1a2", 123, "source", READ_TOK);
+  await pushBranchFromSha(git, "a1b2c3d", "backtest-pr123-head", WRITE_TOK);
+  const push = ran.find((r) => r.op === "push");
+  assert.equal(push?.tokenEnv, WRITE_TOK, "the push must authenticate with the WRITE token");
+  assert.notEqual(push?.tokenEnv, READ_TOK, "the READ token must never authenticate a push");
+});
+
+test("fetchCommit with an empty token authenticates anonymously (public source read)", async () => {
+  // A public cross-owner source is fetched with NO credential: the token is the
+  // empty string, set on TOKEN_ENV so the askpass helper supplies no password.
+  const { git, envSets, ran } = envRecordingGit();
+  await fetchCommit(git, "9f3c1a2", 123, "source", "");
+  assert.deepEqual(
+    envSets,
+    [{ name: TOKEN_ENV, value: "" }],
+    "an empty token is set on TOKEN_ENV for an anonymous fetch",
+  );
+  assert.deepEqual(
+    ran,
+    [{ op: "fetch", tokenEnv: "" }],
+    "the fetch ran anonymously (empty TOKEN_ENV)",
+  );
 });
 
 test("the askpass helper is written mode 0700", () => {

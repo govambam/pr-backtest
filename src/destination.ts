@@ -111,13 +111,22 @@ export function writePermissionMessage(
 export type DestinationChoiceKind =
   | "primary"
   | "saved-sandbox"
-  | "create-sandbox"
+  | "org-sandbox"
+  | "personal-sandbox"
   | "different-repo";
 
 /** A single menu choice the prompt seam presents. */
 export interface DestinationChoice {
   kind: DestinationChoiceKind;
-  /** The repo a `primary` or `saved-sandbox` choice resolves to. */
+  /**
+   * The repo a choice resolves to.
+   *
+   * - `primary` / `saved-sandbox` carry the concrete destination repo.
+   * - `org-sandbox` carries the FIXED source owner + the default sandbox name;
+   *   the prompt lets the user edit only the name (owner is fixed).
+   * - `personal-sandbox` carries the FIXED authenticated login + the default
+   *   sandbox name; the prompt lets the user edit only the name (owner fixed).
+   */
   repo?: RepoRef;
 }
 
@@ -127,8 +136,9 @@ export interface DestinationChoice {
  * - `primary` / `saved-sandbox` carry the chosen repo.
  * - `different-repo` carries the user-entered `owner/repo` slug (already parsed
  *   into a {@link RepoRef}).
- * - `create-sandbox` requests the creation sub-flow; `repo` carries the
- *   user-edited owner/name the resolver passes to the creator.
+ * - `org-sandbox` / `personal-sandbox` request the creation sub-flow; `repo`
+ *   carries the FIXED owner (source owner / authenticated login, respectively)
+ *   and the user-edited name the resolver passes to the creator.
  *
  * Remembering a non-primary destination as the default is a side effect of the
  * prompt seam (it persists directly); it is not carried back on the selection.
@@ -175,6 +185,26 @@ export interface DestinationResolvers {
   prompt: DestinationPrompt;
   /** Sandbox-creation seam. */
   createSandbox: SandboxCreator;
+  /**
+   * The authenticated login (the user the resolved token belongs to), backed by
+   * `users.getAuthenticated` in production wiring. Used to offer the
+   * "New sandbox in your account — @<login>" (personal-sandbox) menu row and to
+   * route that option's create-call owner.
+   *
+   * Graceful degradation: if this seam is absent, or it throws/returns empty,
+   * the personal-sandbox row is OMITTED from the interactive menu (the other
+   * kinds remain). It is optional so the LATER token-routing feature can finalize
+   * the production wiring; non-interactive paths never need it.
+   */
+  getAuthenticatedLogin?: () => Promise<string>;
+  /**
+   * Injectable delay between post-create write-probe retries (eventual
+   * consistency, see {@link reprobeCreatedOrThrow}). Defaults to a small real
+   * sleep ({@link DEFAULT_REPROBE_DELAY_MS}); tests pass a no-op so they never
+   * actually sleep. ONLY the post-create reprobe uses it — the pre-existing-repo
+   * verify is unaffected.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -237,6 +267,56 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
 /** The default name a fresh sandbox is created under (matches the resolver). */
 const DEFAULT_SANDBOX_NAME = "pr-backtest-sandbox";
 
+/**
+ * How many times the POST-CREATE write probe checks `permissions.push` before
+ * concluding a just-created sandbox is not writable. GitHub may not report
+ * `push: true` on the very first read of a freshly created repo (or while a
+ * fine-grained PAT's scoped grant propagates), so a spurious first
+ * `push: false` should not block a legitimately-writable sandbox. The
+ * pre-existing-repo verify does NOT retry.
+ */
+const REPROBE_MAX_ATTEMPTS = 4;
+
+/** Default real backoff between post-create write-probe attempts (ms). */
+const DEFAULT_REPROBE_DELAY_MS = 500;
+
+/** Real sleep used when no `sleep` seam is injected. */
+function realSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Run the POST-CREATE write probe with a BOUNDED retry for eventual
+ * consistency. Returns the first verification whose `exists && canPush` is true,
+ * or — if every attempt (up to {@link REPROBE_MAX_ATTEMPTS}) reports
+ * not-writable — the LAST verification (the caller turns that into the
+ * write-permission failure). A short, injectable delay separates attempts; the
+ * clearly-writable case returns on the first probe with NO delay. ONLY the
+ * post-create reprobe uses this; the pre-existing verify is unchanged.
+ */
+async function probeCreatedWithRetry(
+  created: RepoRef,
+  resolvers: DestinationResolvers,
+): Promise<RepoVerification> {
+  const sleep = resolvers.sleep ?? realSleep;
+  let last: RepoVerification = { exists: false, canPush: false };
+  for (let attempt = 0; attempt < REPROBE_MAX_ATTEMPTS; attempt += 1) {
+    last = await verifyDestination(
+      resolvers.verifyDestination,
+      created.owner,
+      created.repo,
+    );
+    if (last.exists && last.canPush) {
+      return last; // clearly writable → proceed immediately, no delay.
+    }
+    // Not (yet) writable. Back off and retry unless this was the last attempt.
+    if (attempt < REPROBE_MAX_ATTEMPTS - 1) {
+      await sleep(DEFAULT_REPROBE_DELAY_MS);
+    }
+  }
+  return last; // retries exhausted → caller surfaces the write-permission failure.
+}
+
 /** A human-readable label for a single menu choice. */
 function choiceTitle(choice: DestinationChoice): string {
   switch (choice.kind) {
@@ -248,8 +328,14 @@ function choiceTitle(choice: DestinationChoice): string {
       return choice.repo
         ? `Sandbox — ${choice.repo.owner}/${choice.repo.repo}   (saved default)`
         : "Sandbox (saved default)";
-    case "create-sandbox":
-      return "Create a sandbox repo";
+    case "org-sandbox":
+      return choice.repo
+        ? `Sandbox in ${choice.repo.owner} (same org as the PR)`
+        : "Sandbox in the PR's owner (same org as the PR)";
+    case "personal-sandbox":
+      return choice.repo
+        ? `New sandbox in your account — @${choice.repo.owner}/${choice.repo.repo}  (may need a read-only source token)`
+        : "New sandbox in your account  (may need a read-only source token)";
     case "different-repo":
       return "A different repo…";
   }
@@ -273,19 +359,19 @@ export interface InteractivePromptOptions {
  * - `different-repo` → prompt for an `owner/repo` slug, parse it with
  *   {@link parseRepoSlug}, re-prompting on a parse error; return it in `repo`.
  *   Verification stays in the resolver.
- * - `create-sandbox` → let the user edit the owner (default = source owner) and
- *   name (default `pr-backtest-sandbox`). The edited owner/name are returned in
- *   `repo`, and the resolver's `create-sandbox` branch reads `selection.repo`
- *   and passes those values to the creator (falling back to the source owner and
- *   the default name only when the selection carries no repo).
+ * - `org-sandbox` / `personal-sandbox` → the owner is FIXED (carried on the
+ *   choice's `repo.owner`: the source owner for org, the authenticated login for
+ *   personal). Only the NAME is editable (default `pr-backtest-sandbox`). The
+ *   fixed owner + edited name are returned in `repo`, and the resolver passes
+ *   those to the creator.
  *
  * Remember-as-default: persistence lives HERE, as a side effect — the selection
  * carries no remember flag. After the user selects a concrete non-primary
  * destination (`different-repo`) that is not already the saved default, we ask
  * once and, on yes, persist via the injected `saveDefault` (defaulting to
  * {@link mergeConfig}). `saved-sandbox` is already the default, so it is never
- * re-offered; `create-sandbox`'s final name is only known after creation in the
- * resolver, so its remember-prompt is out of this seam's reach (documented
+ * re-offered; a created sandbox's final name is only known after creation in
+ * the resolver, so its remember-prompt is out of this seam's reach (documented
  * limitation).
  *
  * Mirrors `auth.ts`'s `prompts` usage and its non-TTY guards: with no TTY there
@@ -342,17 +428,21 @@ export function makeInteractivePrompt(
       return { kind: chosen.kind, repo };
     }
 
-    // create-sandbox: collect an editable owner/name (advisory — see the doc
-    // comment; the resolver currently ignores these and uses its own defaults).
-    const sourceOwner = primaryOwner(choices);
-    const edited = await promptForCreateTarget(sourceOwner);
-    return { kind: chosen.kind, repo: edited };
+    // org-sandbox / personal-sandbox: the owner is FIXED on the choice's repo
+    // (source owner for org, authenticated login for personal). Only the NAME is
+    // editable. A choice with no fixed owner is a builder bug — never prompt for
+    // an owner here (that is what the legacy create-sandbox did, and what this
+    // feature removes).
+    const fixedOwner = chosen.repo?.owner;
+    if (typeof fixedOwner !== "string" || fixedOwner.length === 0) {
+      throw new DestinationArgsError(
+        `Cannot create a ${chosen.kind}: no owner was provided for it.`,
+      );
+    }
+    const defaultName = chosen.repo?.repo ?? DEFAULT_SANDBOX_NAME;
+    const editedName = await promptForSandboxName(defaultName);
+    return { kind: chosen.kind, repo: { owner: fixedOwner, repo: editedName } };
   };
-}
-
-/** The owner of the `primary` choice, used as the create-owner default. */
-function primaryOwner(choices: DestinationChoice[]): string | undefined {
-  return choices.find((c) => c.kind === "primary")?.repo?.owner;
 }
 
 /**
@@ -381,47 +471,25 @@ async function promptForSlug(): Promise<RepoRef> {
 }
 
 /**
- * Prompt for the create target's owner (default = source owner) and name
- * (default `pr-backtest-sandbox`). Returns the edited {@link RepoRef}.
+ * Prompt for the new sandbox's NAME only (the owner is fixed by the chosen menu
+ * option — source owner for org-sandbox, authenticated login for
+ * personal-sandbox — and is never prompted for here). Returns the edited name.
  */
-async function promptForCreateTarget(
-  defaultOwner: string | undefined,
-): Promise<RepoRef> {
-  // No `initial` on these prompts: with an initial, `prompts` returns that value
-  // on Ctrl-C, making an abort indistinguishable from accepting the default. We
-  // instead surface the default in the message, so a blank Enter falls back to
-  // it (below) while a true abort yields `undefined` and is honored — matching
-  // promptForSlug. The default owner is the source owner.
-  const ownerMessage = defaultOwner
-    ? `Owner for the new sandbox (blank for ${defaultOwner}):`
-    : "Owner for the new sandbox:";
-  const { owner } = await prompts({
-    type: "text",
-    name: "owner",
-    message: ownerMessage,
-  });
-  if (typeof owner !== "string") {
-    throw new DestinationArgsError("No owner entered.");
-  }
+async function promptForSandboxName(defaultName: string): Promise<string> {
+  // No `initial`: with an initial, `prompts` returns that value on Ctrl-C, making
+  // an abort indistinguishable from accepting the default. We instead surface the
+  // default in the message, so a blank Enter falls back to it (below) while a true
+  // abort yields `undefined` and is honored — matching promptForSlug.
   const { name } = await prompts({
     type: "text",
     name: "name",
-    message: `Name for the new sandbox (blank for ${DEFAULT_SANDBOX_NAME}):`,
+    message: `Name for the new sandbox (blank for ${defaultName}):`,
   });
   if (typeof name !== "string") {
     throw new DestinationArgsError("No sandbox name entered.");
   }
   // A blank submission accepts the default; a non-blank one overrides it.
-  const resolvedOwner =
-    owner.trim().length > 0 ? owner.trim() : defaultOwner ?? "";
-  // Guard the latent empty-owner case: never create a repo under an empty owner
-  // (reachable only when there is no default owner and the user submits blank).
-  if (resolvedOwner.length === 0) {
-    throw new DestinationArgsError("No owner for the new sandbox.");
-  }
-  const resolvedName =
-    name.trim().length > 0 ? name.trim() : DEFAULT_SANDBOX_NAME;
-  return { owner: resolvedOwner, repo: resolvedName };
+  return name.trim().length > 0 ? name.trim() : defaultName;
 }
 
 /**
@@ -603,12 +671,18 @@ async function resolveSandboxFlag(
   if (!verification.exists) {
     // Missing → create only with --create-sandbox, else exit 2.
     if (flags.createSandbox === true) {
-      // Defaults the owner to the requested slug owner (which itself defaults to
-      // the source owner upstream); the create seam owns the real logic.
+      // The create seam owns personal-vs-org routing; owner is the requested
+      // slug owner.
       const created = await resolvers.createSandbox({
         owner: slug.owner,
         name: slug.repo,
       });
+      // Post-create write re-probe (VAL-PROBE-003): a token that can CREATE may
+      // still lack push (e.g. a fine-grained token scoped to select repos that
+      // does not cover the new one). Re-probe before returning; a non-writable
+      // result throws (caller maps to exit 2) rather than surfacing a cryptic git
+      // push failure later. Never falls through to writing the source.
+      await reprobeCreatedOrThrow(created, resolvers);
       return created;
     }
     throw new DestinationApiError(
@@ -661,6 +735,78 @@ async function verifyResolved(
 }
 
 /**
+ * Re-probe a freshly created sandbox for write permission and THROW a
+ * {@link DestinationApiError} (caller maps to exit 2 / non-interactive) when it
+ * is not writable. This closes the gap where a successful create returned a repo
+ * without verifying push: a token that can create but not push would otherwise
+ * surface as a cryptic git failure after an orphan repo already exists.
+ *
+ * Used by the NON-INTERACTIVE `--sandbox X --create-sandbox` path. The
+ * interactive path uses {@link reprobeCreatedOrReprompt} (re-present the menu
+ * instead of throwing). Both share the same probe + message text. Returns void on
+ * success; the created repo is the verified destination.
+ */
+async function reprobeCreatedOrThrow(
+  created: RepoRef,
+  resolvers: DestinationResolvers,
+): Promise<void> {
+  // Bounded retry for eventual consistency (a fresh repo / propagating grant may
+  // not report push:true on the first read). A clearly-writable first probe
+  // returns immediately with no delay.
+  const ver = await probeCreatedWithRetry(created, resolvers);
+  // A just-created repo should exist; treat a missing/not-writable re-probe the
+  // same — not writable → surface the write-permission message, never push.
+  if (!ver.exists || !ver.canPush) {
+    throw new DestinationApiError(writePermissionMessage(created, null));
+  }
+}
+
+/**
+ * Re-probe a freshly created sandbox for write permission on the INTERACTIVE
+ * path. On success returns true (the created repo is the verified destination);
+ * on a not-writable result it surfaces the write-permission message and returns
+ * false, signalling the caller to re-present the menu (the interactive analogue
+ * of {@link reprobeCreatedOrThrow}'s exit-2 throw). NEVER falls back to the
+ * source. Same probe + message text as the non-interactive path.
+ */
+async function reprobeCreatedOrReprompt(
+  created: RepoRef,
+  resolvers: DestinationResolvers,
+): Promise<boolean> {
+  // Same bounded retry as the non-interactive path (eventual consistency).
+  const ver = await probeCreatedWithRetry(created, resolvers);
+  if (!ver.exists || !ver.canPush) {
+    warn(writePermissionMessage(created, null));
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Resolve the authenticated login via the optional seam, degrading gracefully:
+ * a missing seam, a throw, or an empty/whitespace login all yield `undefined`,
+ * which omits the personal-sandbox row from the menu. We never let a failed
+ * `users.getAuthenticated` (e.g. unfinished wiring or a transient error) break
+ * the whole menu — the other destination kinds still work.
+ */
+async function resolveAuthenticatedLogin(
+  resolvers: DestinationResolvers,
+): Promise<string | undefined> {
+  if (!resolvers.getAuthenticatedLogin) {
+    return undefined;
+  }
+  try {
+    const login = await resolvers.getAuthenticatedLogin();
+    return typeof login === "string" && login.trim().length > 0
+      ? login.trim()
+      : undefined;
+  } catch {
+    // Degrade: omit the personal-sandbox row, keep the rest of the menu.
+    return undefined;
+  }
+}
+
+/**
  * The saved sandbox, if it is a candidate writable alternative for the
  * write-permission message when the PRIMARY destination fails. We only name it
  * as a suggested alternative; the resolver does not pre-verify it (that would be
@@ -692,8 +838,18 @@ async function resolveInteractive(
 ): Promise<ResolvedDestination> {
   const saved = resolvers.getDefaultDestination();
 
-  // Build the choice set: a saved-sandbox row when a default exists, otherwise a
-  // create-sandbox row; always primary + different-repo.
+  // Resolve the authenticated login for the personal-sandbox row. The seam is
+  // optional and may throw (e.g. the wiring is not finalized, or the network call
+  // failed); in that case we DEGRADE GRACEFULLY by omitting the personal-sandbox
+  // row — the other kinds remain (VAL-MENU-001's other entries still hold).
+  const login = await resolveAuthenticatedLogin(resolvers);
+
+  // Build the choice set in the spec's order (§5.1 / VAL-MENU-001..002):
+  //   primary, [saved-sandbox], org-sandbox, [personal-sandbox], different-repo.
+  // org-sandbox's owner is FIXED to the source owner; personal-sandbox's owner is
+  // FIXED to the authenticated login. Each carries the default sandbox name; the
+  // prompt edits only the name. The saved-sandbox row (when present) sits directly
+  // below primary.
   const choices: DestinationChoice[] = [
     { kind: "primary", repo: { owner: source.owner, repo: source.repo } },
   ];
@@ -702,8 +858,16 @@ async function resolveInteractive(
       kind: "saved-sandbox",
       repo: { owner: saved.owner, repo: saved.repo },
     });
-  } else {
-    choices.push({ kind: "create-sandbox" });
+  }
+  choices.push({
+    kind: "org-sandbox",
+    repo: { owner: source.owner, repo: DEFAULT_SANDBOX_NAME },
+  });
+  if (login) {
+    choices.push({
+      kind: "personal-sandbox",
+      repo: { owner: login, repo: DEFAULT_SANDBOX_NAME },
+    });
   }
   choices.push({ kind: "different-repo" });
 
@@ -748,18 +912,30 @@ async function resolveInteractive(
       return resolved;
     }
 
-    if (selection.kind === "create-sandbox") {
-      // The creator owns name/owner prompting; default owner is the source. A
-      // creation failure (e.g. a 403 because the source owner is an org the
+    if (
+      selection.kind === "org-sandbox" ||
+      selection.kind === "personal-sandbox"
+    ) {
+      // The create-call OWNER comes from the chosen option (VAL-CREATE-001):
+      // org-sandbox → the source owner; personal-sandbox → the authenticated
+      // login. Both are carried FIXED on selection.repo.owner by the prompt; the
+      // legacy "default owner = source owner for every create" behavior is gone.
+      // A creation failure (e.g. a 403 because the source owner is an org the
       // token cannot create repos in) surfaces its message and re-presents the
-      // menu — it NEVER falls through to writing the source repo.
+      // menu — it NEVER falls through to writing the source repo (VAL-CREATE-004).
+      const target = selection.repo;
+      if (!target || target.owner.length === 0) {
+        // A prompt that returns no fixed owner for a create kind is a bug, not a
+        // reason to fall back to the source.
+        throw new DestinationApiError(
+          "Interactive selection returned no owner for the new sandbox.",
+        );
+      }
       let created: RepoRef;
       try {
-        // Honor an edited owner/name from the prompt; fall back to the source
-        // owner + default name when the selection carries no repo.
         created = await resolvers.createSandbox({
-          owner: selection.repo?.owner ?? source.owner,
-          name: selection.repo?.repo ?? DEFAULT_SANDBOX_NAME,
+          owner: target.owner,
+          name: target.repo,
         });
       } catch (err: unknown) {
         if (err instanceof DestinationApiError) {
@@ -768,6 +944,12 @@ async function resolveInteractive(
         }
         throw err;
       }
+      // Post-create write re-probe (VAL-PROBE-003): a token that can CREATE may
+      // still lack push. Re-probe before returning; a non-writable result
+      // surfaces the write-permission message and re-presents the menu — it does
+      // NOT clone/push and NEVER writes the source.
+      const reprobe = await reprobeCreatedOrReprompt(created, resolvers);
+      if (!reprobe) continue;
       if (sameRepo(created, source)) {
         return { owner: created.owner, repo: created.repo, isSandbox: false };
       }

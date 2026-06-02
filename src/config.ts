@@ -20,17 +20,37 @@ export interface SavedDestination {
 }
 
 /**
+ * An owner-scoped token entry.
+ *
+ * Used for cross-owner runs (e.g. a read token for a source org that differs
+ * from the default write token). The `owner` is the resource owner the token is
+ * scoped for; comparison is case-insensitive (GitHub owners are
+ * case-insensitive). Like {@link Config.token}, the `token` here is a secret:
+ * it lives only in the 0600 file and is never logged.
+ */
+export interface OwnerToken {
+  owner: string;
+  token: string;
+  source: TokenSource;
+  username: string;
+}
+
+/**
  * Persisted config shape.
  *
  * `token`/`username`/`source` are optional: a config may hold only a
  * `defaultDestination` when the token came from the environment or `gh` and was
  * never persisted. Token resolution treats an absent token as "no saved token".
+ *
+ * `tokens` holds additive owner-scoped tokens; its absence means "no
+ * owner-scoped token". Older files (no `tokens` field) parse unchanged.
  */
 export interface Config {
   token?: string;
   username?: string;
   source?: TokenSource;
   defaultDestination?: SavedDestination;
+  tokens?: OwnerToken[];
 }
 
 /**
@@ -73,6 +93,23 @@ function isSavedDestination(value: unknown): value is SavedDestination {
     value !== null &&
     typeof (value as Record<string, unknown>).owner === "string" &&
     typeof (value as Record<string, unknown>).repo === "string"
+  );
+}
+
+/**
+ * An owner-scoped token entry: `owner` + `token` + `username` + a valid
+ * `source`, all strings.
+ */
+function isOwnerToken(value: unknown): value is OwnerToken {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj.owner === "string" &&
+    typeof obj.token === "string" &&
+    typeof obj.username === "string" &&
+    isTokenSource(obj.source)
   );
 }
 
@@ -125,10 +162,23 @@ export function readConfig(): Config | null {
   const destinationMalformed =
     obj.defaultDestination !== undefined && !hasDestination;
 
+  // `tokens` is additive and optional. When present it must be an array of
+  // valid owner-scoped entries; a present-but-malformed `tokens` is rejected
+  // the same way a malformed `defaultDestination` is.
+  const hasTokens =
+    obj.tokens !== undefined &&
+    Array.isArray(obj.tokens) &&
+    obj.tokens.every(isOwnerToken);
+  const tokensMalformed = obj.tokens !== undefined && !hasTokens;
+
   // Accept a valid token-config OR a valid destination-config (or both).
-  // A file that is neither — or that carries a malformed defaultDestination —
-  // is rejected (warn, return null).
-  if (destinationMalformed || (!hasTokenFields && !hasDestination)) {
+  // A file that is neither — or that carries a malformed defaultDestination or
+  // a malformed tokens array — is rejected (warn, return null).
+  if (
+    destinationMalformed ||
+    tokensMalformed ||
+    (!hasTokenFields && !hasDestination)
+  ) {
     warn(`Config file ${filePath} is malformed; ignoring it.`);
     return null;
   }
@@ -144,6 +194,14 @@ export function readConfig(): Config | null {
       owner: (obj.defaultDestination as SavedDestination).owner,
       repo: (obj.defaultDestination as SavedDestination).repo,
     };
+  }
+  if (hasTokens) {
+    cfg.tokens = (obj.tokens as OwnerToken[]).map((t) => ({
+      owner: t.owner,
+      token: t.token,
+      source: t.source,
+      username: t.username,
+    }));
   }
   return cfg;
 }
@@ -164,22 +222,52 @@ export function writeConfig(cfg: Config): void {
 }
 
 /**
+ * Add or replace a single owner-scoped token entry, keyed by owner
+ * (case-insensitive), within a `tokens[]` array. Other entries are preserved.
+ * Pure helper; does no I/O.
+ */
+function upsertOwnerToken(
+  existing: OwnerToken[] | undefined,
+  entry: OwnerToken,
+): OwnerToken[] {
+  const others = (existing ?? []).filter(
+    (t) => t.owner.toLowerCase() !== entry.owner.toLowerCase(),
+  );
+  return [...others, entry];
+}
+
+/**
  * Merge a partial update into the existing config (read-modify-write).
  *
  * Unlike {@link writeConfig}, which replaces the whole object, this preserves
  * fields not present in `update`: saving a `defaultDestination` keeps a saved
  * token, and saving a token keeps a saved destination. Re-asserts mode 0600
  * on every write, exactly as {@link writeConfig} does.
+ *
+ * `tokens[]` is merged by owner (case-insensitive) rather than clobbered: each
+ * entry in `update.tokens` adds-or-replaces the entry for its owner, leaving
+ * sibling entries (and the default `token`/`defaultDestination`) intact.
  */
 export function mergeConfig(update: Partial<Config>): void {
   const existing = readConfig() ?? {};
-  const merged: Config = { ...existing, ...update };
+  const { tokens: updateTokens, ...rest } = update;
+  const merged: Config = { ...existing, ...rest };
+  if (updateTokens !== undefined) {
+    let tokens = existing.tokens;
+    for (const entry of updateTokens) {
+      tokens = upsertOwnerToken(tokens, entry);
+    }
+    merged.tokens = tokens;
+  }
   writeConfig(merged);
 }
 
 /**
  * Delete the config file (used by `logout`).
- * Tolerates an already-absent file (ENOENT).
+ *
+ * Removes the whole file, including any default `token`, `defaultDestination`,
+ * and all owner-scoped `tokens[]` entries. Tolerates an already-absent file
+ * (ENOENT).
  */
 export function deleteConfig(): void {
   const filePath = configPath();

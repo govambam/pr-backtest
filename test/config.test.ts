@@ -237,3 +237,148 @@ test("mergeConfig keeps mode 0600 after a destination-only save", { skip: proces
   mergeConfig({ defaultDestination: { owner: "octocat", repo: "sandbox" } });
   assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
 });
+
+// === Owner-scoped tokens[] (two-token-sandbox §8) ===
+
+// VAL-CONFIG-001: adding an owner-scoped token preserves the default token,
+// the defaultDestination, and any sibling tokens[] entries.
+test("mergeConfig adds a tokens[] entry without dropping token/destination/siblings", () => {
+  useTempConfigHome();
+  writeConfig({
+    token: "writetoken",
+    username: "stevem",
+    source: "classic",
+    defaultDestination: { owner: "octocat", repo: "sandbox" },
+    tokens: [
+      { owner: "acme", token: "acmetoken", source: "fine-grained", username: "acmebot" },
+    ],
+  });
+  mergeConfig({
+    tokens: [
+      { owner: "globex", token: "globextoken", source: "fine-grained", username: "globexbot" },
+    ],
+  });
+  const result = readConfig();
+  assert.equal(result?.token, "writetoken");
+  assert.equal(result?.username, "stevem");
+  assert.equal(result?.source, "classic");
+  assert.deepEqual(result?.defaultDestination, { owner: "octocat", repo: "sandbox" });
+  assert.deepEqual(result?.tokens, [
+    { owner: "acme", token: "acmetoken", source: "fine-grained", username: "acmebot" },
+    { owner: "globex", token: "globextoken", source: "fine-grained", username: "globexbot" },
+  ]);
+});
+
+// VAL-CONFIG-001: a save for an owner that already has an entry replaces it
+// (case-insensitive owner match) rather than appending a duplicate.
+test("mergeConfig replaces a tokens[] entry by owner (case-insensitive)", () => {
+  useTempConfigHome();
+  writeConfig({
+    token: "writetoken",
+    username: "stevem",
+    source: "classic",
+    tokens: [
+      { owner: "Acme", token: "old", source: "classic", username: "olduser" },
+    ],
+  });
+  mergeConfig({
+    tokens: [
+      { owner: "acme", token: "new", source: "fine-grained", username: "newuser" },
+    ],
+  });
+  const result = readConfig();
+  assert.equal(result?.tokens?.length, 1);
+  assert.deepEqual(result?.tokens?.[0], {
+    owner: "acme",
+    token: "new",
+    source: "fine-grained",
+    username: "newuser",
+  });
+});
+
+// VAL-CONFIG-002: a file with no tokens field still parses (prior shapes hold).
+test("readConfig tolerates a file with no tokens field", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(
+    p,
+    JSON.stringify({ token: "t0kenvalue", username: "stevem", source: "classic" }),
+    { mode: 0o600 },
+  );
+  const result = readConfig();
+  assert.notEqual(result, null);
+  assert.equal(result?.tokens, undefined);
+});
+
+// VAL-CONFIG-002: a file carrying a valid tokens array reads it back.
+test("readConfig reads back a valid tokens[] array", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(
+    p,
+    JSON.stringify({
+      defaultDestination: { owner: "octocat", repo: "sandbox" },
+      tokens: [
+        { owner: "acme", token: "acmetoken", source: "gh-cli", username: "acmebot" },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  const result = readConfig();
+  assert.deepEqual(result?.tokens, [
+    { owner: "acme", token: "acmetoken", source: "gh-cli", username: "acmebot" },
+  ]);
+});
+
+// VAL-CONFIG-002: a present-but-malformed tokens array is rejected (warn+null),
+// the same way a malformed defaultDestination is.
+test("readConfig rejects a malformed tokens[] entry", () => {
+  useTempConfigHome();
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(
+    p,
+    JSON.stringify({
+      token: "t",
+      username: "u",
+      source: "classic",
+      // missing `username` on the entry → malformed
+      tokens: [{ owner: "acme", token: "x", source: "classic" }],
+    }),
+    { mode: 0o600 },
+  );
+  const err = captureStderr(() => {
+    assert.equal(readConfig(), null);
+  });
+  assert.match(err, /malformed/);
+});
+
+// VAL-CONFIG-004: the file stays mode 0600 after a tokens[] save.
+test("mergeConfig keeps mode 0600 after a tokens[] save", { skip: process.platform === "win32" }, () => {
+  useTempConfigHome();
+  mergeConfig({
+    tokens: [
+      { owner: "acme", token: "acmetoken", source: "fine-grained", username: "acmebot" },
+    ],
+  });
+  assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
+});
+
+// VAL-CONFIG-005: logout (deleteConfig) removes the whole file, tokens[] and all.
+test("deleteConfig removes the whole file including tokens[]", () => {
+  useTempConfigHome();
+  writeConfig({
+    token: "writetoken",
+    username: "stevem",
+    source: "classic",
+    tokens: [
+      { owner: "acme", token: "acmetoken", source: "fine-grained", username: "acmebot" },
+    ],
+  });
+  assert.equal(fs.existsSync(configPath()), true);
+  deleteConfig();
+  assert.equal(fs.existsSync(configPath()), false);
+  assert.equal(readConfig(), null);
+});

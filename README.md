@@ -193,6 +193,17 @@ A token like this can't reach your other repos or touch org settings. For `--cre
 
 A token scoped to only the sandbox can't read a private source PR; a token scoped to only the source can't write the sandbox. If the source repo is **public**, read access is implicit and a token with write on the sandbox is enough. For a **Primary** destination, one repo's worth of access (read + write on the source) is all you need.
 
+**When you need a second token (the two-token model).** A GitHub *fine-grained* token is bound to exactly one resource owner. So when the source and the sandbox sit under **different owners** — the common case for testing a private company PR in a sandbox under your own account — **no single fine-grained token can cover both**. That is when pr-backtest splits the work across two tokens:
+
+- a **read-only** token for the **source** owner — reads the PR and fetches its commits, and needs **no write access anywhere**, and
+- a **write** token for the **destination** owner — Contents + Pull requests write on the sandbox (plus repo-creation rights for `--create-sandbox`).
+
+The source is *only ever read* with the read-only token, and the write token *only ever writes* the destination — the read/write split is the trust boundary. A single token still covers both when it happens to span both owners (a classic PAT, or a fine-grained token scoped to all the repos involved); pr-backtest detects this and never asks for a second token it doesn't need. When the run does use two distinct tokens, the confirmation plan notes it: the source line is tagged `(read-only token)` and the `Into:` line `(write token)`.
+
+To run a cross-owner `--sandbox <owner/repo>` non-interactively, set **`GITHUB_SOURCE_TOKEN`** to the read-only source token; `GITHUB_TOKEN` is then used for the write/destination and `GITHUB_SOURCE_TOKEN` for reading the source. In a terminal, pr-backtest instead prompts for the missing token in-flow with the exact scope it needs.
+
+**Personal vs org sandbox — a trade-off.** A sandbox under **your personal account** is the lowest-fuss path (you can always create repos there), but the company's code lands in a repo under your personal account — an egress consideration to weigh. A sandbox **inside the org** keeps the code within the org boundary, but you need org repo-creation rights to make the sandbox there. Pick whichever matches your compliance posture; cross-owner (personal) sandboxes are the case that triggers the two-token split above.
+
 ## Exit codes
 
 The tool exits with a stable code so it can be wired into CI:
