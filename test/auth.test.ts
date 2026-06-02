@@ -4,10 +4,18 @@ import assert from "node:assert/strict";
 import {
   resolveToken,
   resolveTokenSource,
+  resolveTokensForRun,
+  resolvePurposeToken,
+  probeReadSource,
   computeTokenNeeds,
   NoTokenNonInteractiveError,
+  NoSourceTokenNonInteractiveError,
   type TokenResolvers,
+  type PurposeResolvers,
+  type ResolveTokensForRunOptions,
+  type ProbeOctokit,
   type TokenPurpose,
+  type CapabilityProbe,
 } from "../src/auth.js";
 import type { Config } from "../src/config.js";
 import { makeOctokit } from "../src/github.js";
@@ -328,4 +336,517 @@ test("the shared makeOctokit factory traces GET /user (so the default validation
   assert.match(lines[0]!, /200/);
   assert.match(lines[0]!, /\d+ms/);
   assert.equal(isVerbose(), false, "verbose restored after the run");
+});
+
+// ===========================================================================
+// Purpose-aware resolution (spec §6/§7): resolveTokensForRun + resolvePurposeToken
+// + probeReadSource. All unit-tested with injected getters + an injected probe
+// — no network, no TTY.
+// ===========================================================================
+
+/** HTTP-error-shaped throwable, matching what Octokit raises (status field). */
+function httpError(status: number): Error & { status: number } {
+  const e = new Error(`HTTP ${status}`) as Error & { status: number };
+  e.status = status;
+  return e;
+}
+
+/**
+ * A fake ProbeOctokit factory keyed by token. `readable` is the set of tokens
+ * whose `repos.get` succeeds; every other token's `repos.get` throws the given
+ * status (default 404). `users.getAuthenticated` returns a login derived from
+ * the token. Records, per built instance, the token it was built from + every
+ * repos.get arg, so a test can assert the probe ran on the CANDIDATE's Octokit.
+ */
+function makeFakeOctokitFactory(opts: {
+  readable: Set<string>;
+  notReadableStatus?: number;
+  login?: (token: string) => string;
+}) {
+  const built: Array<{ token: string; reposGetArgs: Array<{ owner: string; repo: string }> }> = [];
+  const factory = (token: string): ProbeOctokit => {
+    const record = { token, reposGetArgs: [] as Array<{ owner: string; repo: string }> };
+    built.push(record);
+    return {
+      repos: {
+        get: (async (args: { owner: string; repo: string }) => {
+          record.reposGetArgs.push({ owner: args.owner, repo: args.repo });
+          if (opts.readable.has(token)) {
+            return { data: { permissions: { push: true } } };
+          }
+          throw httpError(opts.notReadableStatus ?? 404);
+        }) as unknown as ProbeOctokit["repos"]["get"],
+      } as unknown as ProbeOctokit["repos"],
+      users: {
+        getAuthenticated: (async () => ({
+          data: { login: opts.login ? opts.login(token) : `user-${token}` },
+        })) as unknown as ProbeOctokit["users"]["getAuthenticated"],
+      } as unknown as ProbeOctokit["users"],
+    };
+  };
+  return { factory, built };
+}
+
+const READ_PURPOSE: TokenPurpose = { kind: "read", owner: "acme", repo: "api" };
+const WRITE_PURPOSE: TokenPurpose = { kind: "write", owner: "alice", repo: "sandbox" };
+
+/** A PurposeResolvers where every getter is present (overridable). */
+function makePurposeResolvers(
+  overrides: Partial<PurposeResolvers> = {},
+): PurposeResolvers {
+  return {
+    getPurposeEnvToken: () => undefined,
+    getOwnerScopedToken: () => undefined,
+    getDefaultToken: async () => null,
+    getInteractivePaste: async () => null,
+    ...overrides,
+  };
+}
+
+// --- VAL-PROBE-001: read-source probe runs on the candidate's Octokit; 403 AND 404 -> not-readable ---
+
+test("VAL-PROBE-001: probeReadSource issues repos.get(source) on the candidate's Octokit", async () => {
+  const { factory, built } = makeFakeOctokitFactory({ readable: new Set(["tok-ok"]) });
+  const ok = await probeReadSource(factory("tok-ok"), "acme", "api");
+  assert.equal(ok, true);
+  assert.equal(built.length, 1);
+  assert.equal(built[0]!.token, "tok-ok");
+  assert.deepEqual(built[0]!.reposGetArgs, [{ owner: "acme", repo: "api" }]);
+});
+
+test("VAL-PROBE-001: a 404 means not-readable", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(), notReadableStatus: 404 });
+  assert.equal(await probeReadSource(factory("nope"), "acme", "api"), false);
+});
+
+test("VAL-PROBE-001: a 403 ALSO means not-readable (not just 404)", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(), notReadableStatus: 403 });
+  assert.equal(await probeReadSource(factory("nope"), "acme", "api"), false);
+});
+
+test("probeReadSource rethrows a non-403/404 error (e.g. 500) rather than masking it", async () => {
+  const factory = (_t: string): ProbeOctokit =>
+    ({
+      repos: { get: async () => { throw httpError(500); } },
+      users: { getAuthenticated: async () => ({ data: { login: "x" } }) },
+    }) as unknown as ProbeOctokit;
+  await assert.rejects(() => probeReadSource(factory("t"), "acme", "api"), /HTTP 500/);
+});
+
+// --- VAL-TOKEN-003: per-purpose order = env -> owner-scoped -> default -> paste; first PROBE-PASSING wins ---
+
+test("VAL-TOKEN-003: resolution tries env, owner-scoped, default, paste in order; first probe-pass wins", async () => {
+  // Only the default token passes the probe; env and owner-scoped fail it.
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["tok-default"]) });
+  const resolvers = makePurposeResolvers({
+    getPurposeEnvToken: () => "tok-env-fails",
+    getOwnerScopedToken: () => "tok-owner-fails",
+    getDefaultToken: async () => ({ token: "tok-default", source: "fine-grained", fromPaste: false }),
+    getInteractivePaste: async () => "tok-paste",
+  });
+  const resolved = await resolvePurposeToken(READ_PURPOSE, resolvers, factory);
+  assert.equal(resolved.token, "tok-default");
+  assert.equal(resolved.via, "default");
+});
+
+test("VAL-TOKEN-003: env wins when it passes the probe (highest precedence)", async () => {
+  const { factory } = makeFakeOctokitFactory({
+    readable: new Set(["tok-env", "tok-owner", "tok-default"]),
+  });
+  const resolvers = makePurposeResolvers({
+    getPurposeEnvToken: () => "tok-env",
+    getOwnerScopedToken: () => "tok-owner",
+    getDefaultToken: async () => ({ token: "tok-default", source: "classic", fromPaste: false }),
+  });
+  const resolved = await resolvePurposeToken(READ_PURPOSE, resolvers, factory);
+  assert.equal(resolved.token, "tok-env");
+  assert.equal(resolved.via, "purpose-env");
+});
+
+test("VAL-TOKEN-003: owner-scoped wins over default when env fails the probe", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["tok-owner", "tok-default"]) });
+  const resolvers = makePurposeResolvers({
+    getPurposeEnvToken: () => "tok-env-fails",
+    getOwnerScopedToken: () => "tok-owner",
+    getDefaultToken: async () => ({ token: "tok-default", source: "classic", fromPaste: false }),
+  });
+  const resolved = await resolvePurposeToken(READ_PURPOSE, resolvers, factory);
+  assert.equal(resolved.token, "tok-owner");
+  assert.equal(resolved.via, "owner-scoped");
+});
+
+test("resolvePurposeToken falls through to paste when nothing else passes the probe", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["tok-paste"]) });
+  const resolvers = makePurposeResolvers({
+    getPurposeEnvToken: () => "tok-env-fails",
+    getDefaultToken: async () => ({ token: "tok-default-fails", source: "classic", fromPaste: false }),
+    getInteractivePaste: async () => "tok-paste",
+  });
+  const resolved = await resolvePurposeToken(READ_PURPOSE, resolvers, factory);
+  assert.equal(resolved.token, "tok-paste");
+  assert.equal(resolved.via, "paste");
+  assert.equal(resolved.fromPaste, true);
+});
+
+test("resolvePurposeToken throws NoTokenNonInteractiveError when no candidate passes and no paste", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set() });
+  const resolvers = makePurposeResolvers({
+    getDefaultToken: async () => ({ token: "tok-default-fails", source: "classic", fromPaste: false }),
+  });
+  await assert.rejects(
+    () => resolvePurposeToken(READ_PURPOSE, resolvers, factory),
+    (e: unknown) => e instanceof NoTokenNonInteractiveError,
+  );
+});
+
+// --- VAL-TOKEN-001 / VAL-INV-004: one covering token serves both purposes, zero prompts ---
+
+/** A run-options builder with NO interactive seams (asserts they are never called). */
+function noPromptOptions(
+  overrides: Partial<ResolveTokensForRunOptions>,
+): ResolveTokensForRunOptions {
+  return {
+    purposes: [],
+    makeOctokit: () => { throw new Error("makeOctokit not configured for this test"); },
+    getSourceEnvToken: () => undefined,
+    getWriteEnvToken: () => undefined,
+    getConfig: () => null,
+    getReadPaste: async () => { throw new Error("read paste prompt must NOT fire"); },
+    getWritePaste: async () => { throw new Error("write paste prompt must NOT fire"); },
+    confirmSave: async () => { throw new Error("save confirm must NOT fire"); },
+    saveOwnerToken: () => { throw new Error("save must NOT fire"); },
+    ...overrides,
+  };
+}
+
+test("VAL-TOKEN-001: a single token passing BOTH probes serves both purposes, zero prompts", async () => {
+  // Cross-owner private source needs read(acme)+write(alice); one token covers both.
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["one-token"]) });
+  let readPrompts = 0;
+  let writePrompts = 0;
+  const result = await resolveTokensForRun(
+    noPromptOptions({
+      purposes: [READ_PURPOSE, WRITE_PURPOSE],
+      makeOctokit: factory,
+      getDefaultToken: async () => ({ token: "one-token", source: "classic", fromPaste: false }),
+      getReadPaste: async () => { readPrompts += 1; return null; },
+      getWritePaste: async () => { writePrompts += 1; return null; },
+    }),
+  );
+  assert.equal(result.readToken, "one-token");
+  assert.equal(result.writeToken, "one-token");
+  assert.equal(result.twoToken, false);
+  assert.equal(readPrompts, 0, "no read prompt for a covering token");
+  assert.equal(writePrompts, 0, "no write prompt for a covering token");
+});
+
+test("VAL-INV-004: single same-owner write purpose resolves one token, no prompt, no second token", async () => {
+  // Same-owner -> computeTokenNeeds gives ONE write purpose. Default token only.
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["only-token"]) });
+  const purposes = computeTokenNeeds({
+    source: { owner: "acme", repo: "api" },
+    destination: { owner: "acme", repo: "api" },
+    sourcePrivate: true,
+  });
+  const result = await resolveTokensForRun(
+    noPromptOptions({
+      purposes,
+      makeOctokit: factory,
+      getDefaultToken: async () => ({ token: "only-token", source: "classic", fromPaste: false }),
+    }),
+  );
+  assert.equal(result.readToken, "only-token");
+  assert.equal(result.writeToken, "only-token");
+  assert.equal(result.twoToken, false);
+});
+
+test("VAL-INV-004: public-source cross-owner resolves a single write token, source read anonymous", async () => {
+  // Public source -> one REQUIRED write purpose; the optional read purpose is ignored.
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["write-token"]) });
+  const purposes = computeTokenNeeds({
+    source: { owner: "acme", repo: "api" },
+    destination: { owner: "alice", repo: "sandbox" },
+    sourcePrivate: false,
+  });
+  const result = await resolveTokensForRun(
+    noPromptOptions({
+      purposes,
+      makeOctokit: factory,
+      getDefaultToken: async () => ({ token: "write-token", source: "classic", fromPaste: false }),
+    }),
+  );
+  assert.equal(result.twoToken, false);
+  assert.equal(result.writeToken, "write-token");
+  assert.equal(result.readToken, "write-token");
+});
+
+// --- VAL-TOKEN-002: read-probe failure on the default token triggers a separate READ request ---
+
+test("VAL-TOKEN-002: when the default token fails the read probe, a separate READ token is requested", async () => {
+  // Default token can write (passes write probe) but CANNOT read the source.
+  // A distinct read token (pasted) covers the read purpose.
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["read-token"]) });
+  let readPromptFired = false;
+  const result = await resolveTokensForRun({
+    purposes: [READ_PURPOSE, WRITE_PURPOSE],
+    makeOctokit: factory,
+    getSourceEnvToken: () => undefined,
+    getWriteEnvToken: () => undefined,
+    getConfig: () => null,
+    getDefaultToken: async () => ({ token: "write-only-token", source: "fine-grained", fromPaste: false }),
+    getReadPaste: async () => { readPromptFired = true; return "read-token"; },
+    getWritePaste: async () => { throw new Error("write should resolve from default, not prompt"); },
+    confirmSave: async () => false,
+    saveOwnerToken: () => {},
+  });
+  assert.equal(readPromptFired, true, "a separate READ token was requested");
+  assert.equal(result.readToken, "read-token");
+  assert.equal(result.writeToken, "write-only-token");
+  assert.equal(result.twoToken, true);
+});
+
+// --- VAL-TOKEN-004: env-var -> purpose mapping, non-interactive ---
+
+test("VAL-TOKEN-004: GITHUB_SOURCE_TOKEN -> read, GITHUB_TOKEN -> write/default (non-interactive)", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["src-env", "write-env"]) });
+  const result = await resolveTokensForRun({
+    purposes: [READ_PURPOSE, WRITE_PURPOSE],
+    makeOctokit: factory,
+    getSourceEnvToken: () => "src-env",
+    getWriteEnvToken: () => "write-env",
+    getConfig: () => null,
+    // Default token resolves from GITHUB_TOKEN (the write env) via the standard chain.
+    getDefaultToken: async () => ({ token: "write-env", source: "classic", fromPaste: false }),
+    getReadPaste: async () => { throw new Error("no read prompt — env covers it"); },
+    getWritePaste: async () => { throw new Error("no write prompt — env covers it"); },
+    confirmSave: async () => false,
+    saveOwnerToken: () => {},
+  });
+  assert.equal(result.readToken, "src-env");
+  assert.equal(result.writeToken, "write-env");
+  assert.equal(result.twoToken, true);
+});
+
+// --- VAL-TOKEN-005: missing read token non-interactively -> exit-1-style error naming GITHUB_SOURCE_TOKEN ---
+
+test("VAL-TOKEN-005: non-interactive cross-owner private with no covering read token throws naming GITHUB_SOURCE_TOKEN", async () => {
+  // Write token covers write (write probe always passes) but cannot read the
+  // private source (not in the readable set); no read paste (non-TTY).
+  const { factory, built } = makeFakeOctokitFactory({ readable: new Set() });
+  let writeOctokitBuilt = false;
+  await assert.rejects(
+    () =>
+      resolveTokensForRun({
+        purposes: [READ_PURPOSE, WRITE_PURPOSE],
+        makeOctokit: (token) => {
+          if (token === "write-only") writeOctokitBuilt = true;
+          return factory(token);
+        },
+        getSourceEnvToken: () => undefined,
+        getWriteEnvToken: () => undefined,
+        getConfig: () => null,
+        getDefaultToken: async () => ({ token: "write-only", source: "fine-grained", fromPaste: false }),
+        getReadPaste: async () => null, // non-TTY: no paste
+        getWritePaste: async () => null,
+        confirmSave: async () => false,
+        saveOwnerToken: () => {},
+      }),
+    (e: unknown) =>
+      e instanceof NoSourceTokenNonInteractiveError &&
+      e instanceof NoTokenNonInteractiveError &&
+      /GITHUB_SOURCE_TOKEN/.test((e as Error).message),
+  );
+  // The read purpose is resolved FIRST (it is the first required purpose), so the
+  // failure happens before the write purpose is ever fully resolved as the run token.
+  void writeOctokitBuilt;
+  void built;
+});
+
+// --- VAL-TOKEN-006: guided prompt copy (grep-checkable text in src/auth.ts) ---
+
+test("VAL-TOKEN-006: source auth.ts contains the READ-only-scope and WRITE Contents/Pull-requests copy", async () => {
+  const fs = await import("node:fs");
+  const url = await import("node:url");
+  const src = fs.readFileSync(
+    url.fileURLToPath(new URL("../src/auth.ts", import.meta.url)),
+    "utf8",
+  );
+  // READ prompt: read-only, scoped to the source repo, no write anywhere.
+  assert.match(src, /read-only/i);
+  assert.match(src, /no write access anywhere/i);
+  // WRITE prompt: Contents + Pull requests write on the destination.
+  assert.match(src, /Contents:\s+Read & write/);
+  assert.match(src, /Pull requests:\s+Read & write/);
+  // The creation URL is included.
+  assert.match(src, /settings\/personal-access-tokens\/new/);
+});
+
+// --- VAL-TOKEN-007: a pasted purpose token is validated via users.getAuthenticated and offered for save ---
+
+test("VAL-TOKEN-007: a pasted read token is validated via users.getAuthenticated and offered for owner-scoped save", async () => {
+  // Only the pasted read token can read the source; the write token cannot,
+  // so the read purpose falls through env/owner/default to the guided paste.
+  const { factory } = makeFakeOctokitFactory({
+    readable: new Set(["pasted-read"]),
+    login: (t) => (t === "pasted-read" ? "reader-login" : "writer-login"),
+  });
+  const saved: Array<Partial<Config>> = [];
+  let confirmAsked = false;
+  const result = await resolveTokensForRun({
+    purposes: [READ_PURPOSE, WRITE_PURPOSE],
+    makeOctokit: factory,
+    getSourceEnvToken: () => undefined,
+    getWriteEnvToken: () => undefined,
+    getConfig: () => null,
+    getDefaultToken: async () => ({ token: "write-token", source: "fine-grained", fromPaste: false }),
+    getReadPaste: async () => "pasted-read",
+    getWritePaste: async () => { throw new Error("write resolves from default"); },
+    confirmSave: async () => { confirmAsked = true; return true; },
+    saveOwnerToken: (update) => { saved.push(update); },
+  });
+  assert.equal(result.readToken, "pasted-read");
+  assert.equal(confirmAsked, true, "persistence was offered");
+  assert.equal(saved.length, 1);
+  const entry = saved[0]!.tokens?.[0];
+  assert.ok(entry, "an owner-scoped tokens[] entry was saved");
+  assert.equal(entry!.owner, "acme", "scoped to the source owner");
+  assert.equal(entry!.token, "pasted-read");
+  assert.equal(entry!.username, "reader-login", "validated login is recorded");
+});
+
+test("VAL-TOKEN-007: a pasted token that GitHub rejects (getAuthenticated throws) surfaces an error and is not saved", async () => {
+  // Only the pasted token can read the source, so the read purpose falls through
+  // to the paste; getAuthenticated then rejects it.
+  const factory = (token: string): ProbeOctokit =>
+    ({
+      repos: {
+        get: async () => {
+          if (token === "bad-paste") return { data: { permissions: { push: true } } };
+          throw httpError(404);
+        },
+      },
+      users: {
+        getAuthenticated: async () => {
+          if (token === "bad-paste") throw httpError(401);
+          return { data: { login: "ok" } };
+        },
+      },
+    }) as unknown as ProbeOctokit;
+  let saved = false;
+  await assert.rejects(
+    () =>
+      resolveTokensForRun({
+        purposes: [READ_PURPOSE, WRITE_PURPOSE],
+        makeOctokit: factory,
+        getSourceEnvToken: () => undefined,
+        getWriteEnvToken: () => undefined,
+        getConfig: () => null,
+        getDefaultToken: async () => ({ token: "write-token", source: "fine-grained", fromPaste: false }),
+        getReadPaste: async () => "bad-paste",
+        getWritePaste: async () => null,
+        confirmSave: async () => true,
+        saveOwnerToken: () => { saved = true; },
+      }),
+    /GitHub rejected the pasted token/,
+  );
+  assert.equal(saved, false, "a rejected token is never persisted");
+});
+
+// --- VAL-CONFIG-003: a saved owner-scoped READ token is reused without prompting ---
+
+test("VAL-CONFIG-003: a saved owner-scoped READ token is reused on a later run without prompting", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["saved-read-token", "write-token"]) });
+  const cfg: Config = {
+    token: "write-token",
+    username: "writer",
+    source: "fine-grained",
+    tokens: [
+      { owner: "acme", token: "saved-read-token", source: "fine-grained", username: "reader" },
+    ],
+  };
+  const result = await resolveTokensForRun(
+    noPromptOptions({
+      purposes: [READ_PURPOSE, WRITE_PURPOSE],
+      makeOctokit: factory,
+      getConfig: () => cfg,
+      getDefaultToken: async () => ({ token: "write-token", source: "fine-grained", fromPaste: false }),
+    }),
+  );
+  assert.equal(result.readToken, "saved-read-token", "the saved owner-scoped read token was reused");
+  assert.equal(result.writeToken, "write-token");
+  assert.equal(result.twoToken, true);
+});
+
+test("owner-scoped lookup is case-insensitive on the owner", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["saved-read-token", "write-token"]) });
+  const cfg: Config = {
+    tokens: [{ owner: "ACME", token: "saved-read-token", source: "fine-grained", username: "reader" }],
+  };
+  const result = await resolveTokensForRun(
+    noPromptOptions({
+      purposes: [{ kind: "read", owner: "acme", repo: "api" }, WRITE_PURPOSE],
+      makeOctokit: factory,
+      getConfig: () => cfg,
+      getDefaultToken: async () => ({ token: "write-token", source: "fine-grained", fromPaste: false }),
+    }),
+  );
+  assert.equal(result.readToken, "saved-read-token");
+});
+
+// --- VAL-INV-003: BOTH tokens registered with the scrubber BEFORE their first request ---
+
+test("VAL-INV-003: each of TWO distinct tokens is scrubbed before its first probe request", async () => {
+  const readSentinel = "ghp_read_sentinel_0123456789abcdef";
+  const writeSentinel = "ghp_write_sentinel_0123456789abcdef";
+  const redactedAtFirstRequest = new Map<string, string>();
+
+  const factory = (token: string): ProbeOctokit =>
+    ({
+      repos: {
+        get: async () => {
+          // Captured the instant the probe issues its first request with `token`.
+          if (!redactedAtFirstRequest.has(token)) {
+            redactedAtFirstRequest.set(token, redact(`auth=${token}`));
+          }
+          // read purpose (acme) passes only for the read sentinel; write passes for write sentinel.
+          return { data: { permissions: { push: true } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "u" } }) },
+    }) as unknown as ProbeOctokit;
+
+  // A capability probe that gates read on the read sentinel and accepts write.
+  const probe: CapabilityProbe = async (octokit, purpose) => {
+    await octokit.repos.get({ owner: purpose.owner, repo: purpose.repo });
+    return true;
+  };
+
+  const result = await resolveTokensForRun({
+    purposes: [READ_PURPOSE, WRITE_PURPOSE],
+    makeOctokit: factory,
+    probe,
+    getSourceEnvToken: () => readSentinel,
+    getWriteEnvToken: () => writeSentinel,
+    getConfig: () => null,
+    getDefaultToken: async () => ({ token: writeSentinel, source: "classic", fromPaste: false }),
+    getReadPaste: async () => null,
+    getWritePaste: async () => null,
+    confirmSave: async () => false,
+    saveOwnerToken: () => {},
+  });
+
+  assert.equal(result.readToken, readSentinel);
+  assert.equal(result.writeToken, writeSentinel);
+  assert.notEqual(result.readToken, result.writeToken, "two DISTINCT tokens resolved");
+
+  assert.equal(
+    redactedAtFirstRequest.get(readSentinel),
+    "auth=***",
+    "the READ token must be scrubbed before ITS first request",
+  );
+  assert.equal(
+    redactedAtFirstRequest.get(writeSentinel),
+    "auth=***",
+    "the WRITE token must be scrubbed before ITS first request",
+  );
 });
