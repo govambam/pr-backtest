@@ -18,6 +18,7 @@ import type { SimpleGit } from "simple-git";
 import { makeOctokit } from "../src/github.js";
 import { fetchCommit } from "../src/git.js";
 import {
+  redact,
   registerSecret,
   setVerbose,
   setTtyOverride,
@@ -247,6 +248,20 @@ test("redact() is the proven net — a sentinel passed INTO a trace line is scru
 
   assert.ok(!out.includes(SENTINEL), "the secret must be scrubbed from the line");
   assert.match(out, /token=\*\*\*/, "the secret is replaced with ***");
+});
+
+test("the top-level error formatter scrubs a registered secret from an unexpected throw", () => {
+  // cli.ts's last-resort catch writes redact(err.message) to stderr so a token
+  // can never escape via an unexpected error. This pins that contract: an error
+  // message that happens to carry a registered secret comes out scrubbed.
+  const SENTINEL = "ghp_SENTINEL_toplevel_catch_proof_0003";
+  registerSecret(SENTINEL);
+
+  const err = new Error("unexpected failure with " + SENTINEL);
+  const formatted = redact(err instanceof Error ? err.message : String(err));
+
+  assert.ok(!formatted.includes(SENTINEL), "the secret must not survive the formatter");
+  assert.match(formatted, /unexpected failure with \*\*\*/, "the secret is replaced with ***");
 });
 
 test("a request to a non-api.github.com host is a hard error (throws)", async () => {
