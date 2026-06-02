@@ -12,6 +12,7 @@ import { Command } from "commander";
 import { deleteConfig } from "./config.js";
 import { runBacktest } from "./index.js";
 import { redact, success } from "./log.js";
+import { runStatus } from "./status.js";
 
 /** Read the package version from package.json (single source of truth). */
 function packageVersion(): string {
@@ -98,6 +99,16 @@ program
       });
     },
   );
+
+program
+  .command("status")
+  .description(
+    "Print what is saved (token logins + types and the default destination). Reads only stored metadata — no network call, no token value.",
+  )
+  .action(() => {
+    runStatus();
+    process.exit(0);
+  });
 
 program
   .command("logout")
