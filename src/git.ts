@@ -27,7 +27,7 @@ import * as log from "./log.js";
 import { shortSha } from "./util.js";
 
 /** Env var name the askpass helper reads the token from. */
-const TOKEN_ENV = "PR_BACKTEST_GIT_TOKEN";
+export const TOKEN_ENV = "PR_BACKTEST_GIT_TOKEN";
 
 /**
  * Thrown when a specific commit SHA cannot be fetched from origin.
@@ -139,7 +139,7 @@ export function pushDisplayCommand(sha: string, branch: string): string {
  * {@link TOKEN_ENV} environment variable (which we set, owner-readable, on the
  * git child). git invokes it for the HTTPS password prompt.
  */
-function writeAskpassHelper(tmpDir: string): string {
+export function writeAskpassHelper(tmpDir: string): string {
   const helperPath = join(tmpDir, "askpass.sh");
   // Echo the token for a password prompt; empty for a username prompt (the URL
   // already carries the username).
@@ -153,7 +153,7 @@ function writeAskpassHelper(tmpDir: string): string {
 }
 
 /** Build the git child environment that wires up GIT_ASKPASS with the token. */
-function gitEnv(token: string, askpassPath: string): NodeJS.ProcessEnv {
+export function gitEnv(token: string, askpassPath: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     GIT_ASKPASS: askpassPath,

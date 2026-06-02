@@ -307,3 +307,137 @@ test("a verbose run is observation-only — same order, same exit", async () => 
     "verbose does not change the operation order",
   );
 });
+
+// --- writes target the destination, never the read-only source --
+
+/** A single git/API call that wrote somewhere, tagged with its target repo. */
+interface WriteTarget {
+  op: string;
+  owner: string;
+  repo: string;
+}
+
+/**
+ * Build deps whose clone/push/create/add-source-remote fakes RECORD the
+ * owner/repo they were handed (the base `makeDeps` fakes discard them). Returns
+ * the deps plus the captured write targets and the source remote target.
+ */
+function makeRecordingDeps(overrides: Partial<RunBacktestDeps> = {}): {
+  deps: Partial<RunBacktestDeps>;
+  writes: WriteTarget[];
+  sourceRemote: WriteTarget[];
+  fetchRemotes: string[];
+} {
+  const writes: WriteTarget[] = [];
+  const sourceRemote: WriteTarget[] = [];
+  const fetchRemotes: string[] = [];
+  const { deps: base } = makeDeps({
+    cloneRepo: async (owner, repo) => {
+      writes.push({ op: "clone", owner, repo });
+      return fakeGit;
+    },
+    addSourceRemote: async (_git, owner, repo) => {
+      sourceRemote.push({ op: "add-source-remote", owner, repo });
+    },
+    fetchCommit: async (_git, _sha, _prNumber, remote = "origin") => {
+      fetchRemotes.push(remote);
+    },
+    pushBranchFromSha: async (_git, _sha, branch) => {
+      // The push fake cannot see owner/repo (pushBranchFromSha pushes to the
+      // clone's `origin`, which cloneRepo set to the destination). The clone
+      // target is therefore the write target asserted for push; record the
+      // branch so the call is observable.
+      writes.push({ op: `push:${branch}`, owner: "", repo: "" });
+    },
+    createPullRequest: async (_octokit, owner, repo) => {
+      writes.push({ op: "create", owner, repo });
+      return CREATED_URL;
+    },
+    ...overrides,
+  });
+  return { deps: base, writes, sourceRemote, fetchRemotes };
+}
+
+const SOURCE_OWNER = "acme";
+const SOURCE_REPO = "api";
+const SANDBOX_OWNER = "octocat";
+const SANDBOX_REPO = "pr-backtest-sandbox";
+
+test("a sandbox run clones and opens the PR against the destination, never the source", async () => {
+  const { deps, writes } = makeRecordingDeps({
+    resolveDestination: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+    }),
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // clone and create target the destination.
+  const clone = writes.find((w) => w.op === "clone");
+  const create = writes.find((w) => w.op === "create");
+  assert.deepEqual(
+    { owner: clone?.owner, repo: clone?.repo },
+    { owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
+    "clone targets the destination",
+  );
+  assert.deepEqual(
+    { owner: create?.owner, repo: create?.repo },
+    { owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
+    "createPullRequest targets the destination",
+  );
+
+  // push happened (the branches were pushed to the clone's origin = destination).
+  assert.ok(
+    writes.some((w) => w.op === "push:backtest-pr123-head"),
+    "the head branch was pushed",
+  );
+
+  // The source owner/repo is NEVER a clone/push/create target.
+  for (const w of writes) {
+    assert.ok(
+      !(w.owner === SOURCE_OWNER && w.repo === SOURCE_REPO),
+      `the source repo must never be a write target (was for ${w.op})`,
+    );
+  }
+});
+
+test("a sandbox run adds the source remote for the source repo and fetches from it", async () => {
+  const { deps, sourceRemote, fetchRemotes } = makeRecordingDeps({
+    resolveDestination: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+    }),
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // addSourceRemote is called exactly for the SOURCE owner/repo.
+  assert.deepEqual(sourceRemote, [
+    { op: "add-source-remote", owner: SOURCE_OWNER, repo: SOURCE_REPO },
+  ]);
+  // Both commits are fetched from the `source` remote, not origin.
+  assert.deepEqual(fetchRemotes, ["source", "source"]);
+});
+
+test("a primary run never adds a source remote and fetches from origin", async () => {
+  // Default resolveDestination returns the source repo with isSandbox:false.
+  const { deps, writes, sourceRemote, fetchRemotes } = makeRecordingDeps();
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // No source remote in primary mode; fetch uses origin.
+  assert.deepEqual(sourceRemote, [], "primary mode never adds a source remote");
+  assert.deepEqual(fetchRemotes, ["origin", "origin"], "primary mode fetches from origin");
+
+  // In primary mode destination == source, so clone/create DO target the source
+  // repo (by design — the user opted in). That is the destination here.
+  const clone = writes.find((w) => w.op === "clone");
+  assert.deepEqual(
+    { owner: clone?.owner, repo: clone?.repo },
+    { owner: SOURCE_OWNER, repo: SOURCE_REPO },
+    "primary mode clones the source repo (which is the chosen destination)",
+  );
+});

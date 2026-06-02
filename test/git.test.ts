@@ -1,5 +1,15 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { SimpleGit } from "simple-git";
 
@@ -7,14 +17,19 @@ import {
   addRemoteDisplayCommand,
   addSourceRemote,
   buildUnfetchableMessage,
+  cleanup,
   cloneDisplayCommand,
   fetchCommit,
   fetchDisplayCommand,
+  gitEnv,
+  makeTempDir,
   pushBranchFromSha,
   pushDisplayCommand,
   redactedRepoRef,
   repoHttpsUrl,
+  TOKEN_ENV,
   UnfetchableCommitError,
+  writeAskpassHelper,
 } from "../src/git.js";
 import { setTtyOverride, setVerbose } from "../src/log.js";
 
@@ -225,4 +240,157 @@ test("a push failure surfaces only the generic error; the stderr sentinel never 
     "generic push error must not carry raw git stderr",
   );
   assert.ok(!out.includes(STDERR_SENTINEL), "raw git stderr must never reach stderr output");
+});
+
+// --- the token reaches git only via GIT_ASKPASS + env -----------
+
+// A distinctive secret used throughout the token-placement tests. If any of the
+// constructed commands/URLs/files contained it, the assertions below would catch
+// it; only the child env is allowed to carry it.
+const TOKEN = "ghp_SECRET_token_value_must_never_leak_0123456789";
+
+test("the token lives only in the child env, never in the URL, argv, or display lines", () => {
+  const askpassPath = "/tmp/pr-backtest-xyz/askpass.sh";
+  const env = gitEnv(TOKEN, askpassPath);
+
+  // Present only under PR_BACKTEST_GIT_TOKEN in the child env.
+  assert.equal(env[TOKEN_ENV], TOKEN, "the token must be carried in the child env");
+  for (const [key, value] of Object.entries(env)) {
+    if (key === TOKEN_ENV) continue;
+    assert.ok(
+      typeof value !== "string" || !value.includes(TOKEN),
+      `no other env value may carry the token (leaked via ${key})`,
+    );
+  }
+  // The askpass helper path is not the token.
+  assert.ok(!askpassPath.includes(TOKEN), "the askpass path is not the token");
+
+  // Absent from the remote URL and every constructed display line.
+  const url = repoHttpsUrl("acme", "api");
+  assert.ok(!url.includes(TOKEN), "the token must not be in the remote URL");
+  assert.match(url, /x-access-token@/, "the URL carries the x-access-token username");
+
+  const displayLines = [
+    cloneDisplayCommand("acme", "api", "/tmp/pr-backtest-xyz/repo"),
+    addRemoteDisplayCommand("acme", "api"),
+    fetchDisplayCommand("source", "9f3c1a2"),
+    pushDisplayCommand("a1b2c3d", "backtest-pr123-head"),
+  ];
+  for (const line of displayLines) {
+    assert.ok(!line.includes(TOKEN), `display line must not carry the token: ${line}`);
+  }
+});
+
+test("repoHttpsUrl carries the x-access-token username and never the token", () => {
+  const url = repoHttpsUrl("acme", "api");
+  assert.match(url, /^https:\/\/x-access-token@github\.com\/acme\/api\.git$/);
+  assert.ok(!url.includes(TOKEN), "the token must never appear in the remote URL");
+});
+
+test("a real clone driven through the askpass seam never writes the token into any file under .git", () => {
+  // Build a local bare repo with one commit, then drive a real `git clone`
+  // through the exported askpass + env seams (the same wiring cloneRepo uses)
+  // and grep every file under the clone's .git/ for the token.
+  const workDir = mkdtempSync(join(tmpdir(), "pr-backtest-clonetest-"));
+  try {
+    const sourceDir = join(workDir, "source");
+    const bareDir = join(workDir, "origin.git");
+    const cloneTarget = join(workDir, "clone");
+
+    // A working repo with one commit.
+    const run = (args: string[], cwd: string): void => {
+      execFileSync("git", args, { cwd, stdio: "ignore" });
+    };
+    execFileSync("git", ["init", "-q", sourceDir], { stdio: "ignore" });
+    run(["config", "user.email", "test@example.com"], sourceDir);
+    run(["config", "user.name", "Test"], sourceDir);
+    execFileSync("git", ["-C", sourceDir, "commit", "--allow-empty", "-q", "-m", "init"], {
+      stdio: "ignore",
+    });
+    // A bare clone to serve as the clone source.
+    execFileSync("git", ["clone", "-q", "--bare", sourceDir, bareDir], { stdio: "ignore" });
+
+    // Drive the clone with the askpass helper + env exactly as cloneRepo does.
+    const askpassPath = writeAskpassHelper(workDir);
+    const env = gitEnv(TOKEN, askpassPath) as Record<string, string>;
+    // A local path source never prompts for credentials, but the env still
+    // carries the token — the property under test is that it does NOT end up in
+    // any cloned file (notably .git/config, which records the remote URL).
+    execFileSync("git", ["clone", "--no-checkout", bareDir, cloneTarget], {
+      env,
+      stdio: "ignore",
+    });
+
+    // Recursively read every file under the clone's .git/ and assert the token
+    // appears in none of them.
+    const gitDir = join(cloneTarget, ".git");
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (entry.isFile()) {
+          let contents = "";
+          try {
+            contents = readFileSync(full, "utf8");
+          } catch {
+            contents = "";
+          }
+          if (contents.includes(TOKEN)) offenders.push(full);
+        }
+      }
+    };
+    walk(gitDir);
+    assert.deepEqual(offenders, [], "no file under .git/ may contain the token");
+
+    // .git/config in particular records the remote URL — assert it explicitly.
+    const config = readFileSync(join(gitDir, "config"), "utf8");
+    assert.ok(!config.includes(TOKEN), ".git/config must not contain the token");
+  } finally {
+    cleanup(workDir);
+  }
+});
+
+// --- the askpass helper: password-only, mode 0700, cleaned up ---
+
+test("the askpass helper emits the token for a password prompt, empty for a username prompt", () => {
+  const dir = makeTempDir();
+  try {
+    const helperPath = writeAskpassHelper(dir);
+    const env = { ...process.env, [TOKEN_ENV]: TOKEN } as Record<string, string>;
+
+    // git invokes the helper with the prompt string as argv[1]. The password
+    // prompt yields the token; the username prompt yields nothing.
+    const onPassword = execFileSync(helperPath, ["Password for 'https://x-access-token@github.com':"], {
+      env,
+      encoding: "utf8",
+    });
+    const onUsername = execFileSync(helperPath, ["Username for 'https://github.com':"], {
+      env,
+      encoding: "utf8",
+    });
+    assert.equal(onPassword, TOKEN, "the helper emits the token for a password prompt");
+    assert.equal(onUsername, "", "the helper emits nothing for a username prompt");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("the askpass helper is written mode 0700", () => {
+  const dir = makeTempDir();
+  try {
+    const helperPath = writeAskpassHelper(dir);
+    assert.equal(statSync(helperPath).mode & 0o777, 0o700, "the helper must be mode 0700");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("cleanup removes the askpass helper file", () => {
+  const dir = makeTempDir();
+  const helperPath = writeAskpassHelper(dir);
+  assert.ok(existsSync(helperPath), "the helper exists before cleanup");
+  cleanup(dir);
+  assert.ok(!existsSync(helperPath), "the helper no longer exists after cleanup");
 });
