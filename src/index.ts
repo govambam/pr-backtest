@@ -805,9 +805,16 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //     the run has actually succeeded. This is the single place
   //     `defaultDestination` may be persisted, so no non-success exit path (verify
   //     /create failure, read-token exit 1, git failure, decline, dup exit 4) can
-  //     save a destination the run never proved usable. Gated on a non-default
-  //     interactively-chosen Sandbox (`offerRemember`).
-  if (offerRemember) {
+  //     save a destination the run never proved usable.
+  //
+  //     BOTH guards are load-bearing — do not drop `&& isSandbox`. `offerRemember`
+  //     is fixed at the choice stage (a non-default interactively-chosen Sandbox),
+  //     but `isSandbox` is recomputed above after destination resolution: a 403 →
+  //     Primary fallback settles the destination to the SOURCE and flips
+  //     `isSandbox` to false while `offerRemember` stays true. Without `&& isSandbox`
+  //     the fallback would prompt "remember <source> as your default sandbox" for
+  //     the Primary repo — wrong: the source is never a sandbox to remember.
+  if (offerRemember && isSandbox) {
     await deps.makeRememberPrompt()({ owner: destOwner, repo: destRepo });
   }
 

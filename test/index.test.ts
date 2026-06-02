@@ -2161,6 +2161,31 @@ test("VAL-CREATE-004: 403 + ACCEPT → destination becomes the source; confirmPl
   assert.equal(creates.length, 1, "the creator was attempted exactly once");
 });
 
+test("VAL-CREATE-004: 403 + ACCEPT (Primary fallback) does NOT offer remember-as-default for the source repo", async () => {
+  // Regression for the Macroscope finding: a 403 → Primary fallback recomputes
+  // `isSandbox` to false (dest === source) while `offerRemember` stays true from
+  // the choice stage. The remember prompt is gated on BOTH, so a Primary
+  // destination must NEVER be offered as a "default sandbox". Dropping the
+  // `&& isSandbox` guard at the success path makes this fail.
+  const remembered: RepoRef[] = [];
+  const { deps } = makeInheritedSandboxDeps({
+    createOutcome: "403",
+    fallback: "accept",
+    overrides: {
+      makeRememberPrompt: () => async (dest: RepoRef): Promise<void> => {
+        remembered.push(dest);
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "the run proceeds to success after the Primary fallback");
+  assert.deepEqual(
+    remembered,
+    [],
+    "the source (Primary) repo is never offered as a default sandbox after a 403 fallback",
+  );
+});
+
 test("VAL-CREATE-004: 403 + DECLINE → exit 0, zero clone/push, creator called exactly once, no other-owner retry", async () => {
   const writes = { clone: 0, push: 0 };
   const { deps, order, creates } = makeInheritedSandboxDeps({
