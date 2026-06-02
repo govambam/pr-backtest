@@ -6,6 +6,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-01
+
 ### Added
 - Live activity trace: every operation now shows a friendly `✓` completion
   marker as it finishes (on a terminal, a slow clone/fetch/push shows an
@@ -14,19 +16,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `--verbose`: also print one dim line per **GitHub API request** (method,
   path+query, status, elapsed) and per **git command** (the real argv, elapsed),
   in real time. Off by default; no short alias (`-v` is `--version`).
-
-### Security
-- Every GitHub API request is traced through a single hook that asserts the host
-  is `api.github.com` — any other host is a hard error, enforcing the
-  "only GitHub" guarantee at runtime.
-- The displayed git commands are the real ones and carry no token: the token is
-  supplied via `GIT_ASKPASS`, never in the URL or argv, so the clone URL shows
-  only the non-secret `x-access-token@` username. Every trace line (API or git,
-  default or verbose) is passed through the redaction filter as a final net.
-
-## [0.2.0] - 2026-06-01
-
-### Added
 - Sandbox destinations: choose where the backtest branches and PR are created.
   - `--primary`: land them in the PR's own repo (no prompt).
   - `--sandbox <owner/repo>`: land them in a separate repo you control. The PR is
@@ -41,7 +30,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     destination and can remember it as the default. `--primary` and `--sandbox`
     are mutually exclusive.
 
-## [0.1.0] - 2026-06-01
+### Security
+- Every GitHub API request is traced through a single hook that asserts the host
+  is `api.github.com` — any other host is a hard error, enforcing the
+  "only GitHub" guarantee at runtime.
+- The displayed git commands are the real ones and carry no token: the token is
+  supplied via `GIT_ASKPASS`, never in the URL or argv, so the clone URL shows
+  only the non-secret `x-access-token@` username. Every trace line (API or git,
+  default or verbose) is passed through the redaction filter as a final net.
+
+## [0.1.0] - 2026-05-15
 
 Initial release.
 
