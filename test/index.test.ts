@@ -2,21 +2,25 @@
  * Full-flow tests for `runBacktest` (`src/index.ts`), driving the real
  * orchestration through an injected `deps` fake so no network or git runs.
  *
- * Coverage:
- *  - On a successful run stdout is EXACTLY the PR URL + "\n", and every trace
- *    line the run emits is on stderr (stdout carries nothing else).
- *  - The captured stderr shows `✓` completion markers for the user-facing
- *    operations (authenticated, read PR, verified destination, cloned, fetched,
- *    pushed base, pushed head, opened PR).
- *  - The recorded operation order matches the base sequence (read PR → verify
- *    destination → clone → fetch base → fetch head → push base → push head →
- *    open PR), AND a failure path keeps its exit code (an unfetchable commit →
- *    exit 3). Because `deps` defaults to production and is only substituted here,
- *    this exercises the real ordering in `runBacktest` — not a hardcoded copy.
+ * The new orchestration order (spec §4): destination FIRST (a local choice, no
+ * network), then the WRITE token (verifying/creating the destination), then the
+ * READ token (single-PAT reuse / env / saved / paste). No owner logic, no
+ * source-visibility probe, no anonymous-source read path.
+ *
+ * Coverage (the assertions this feature owns):
+ *  - VAL-DEST-004 (both flags → exit 1 pre-network)
+ *  - VAL-TOKEN-002/005/006/008 (quarantine completes; missing read/write tokens
+ *    → exit 1 naming the right env var before any write; read token never reaches
+ *    a write op)
+ *  - VAL-BRANCH-001/002/003/004 (SHA branch names; two commits → two PRs; open PR
+ *    → exit 4 + stdout URL + stderr message, closed does NOT block; 422 backstop)
+ *  - VAL-ROUTE-001/002/003 (read vs write Octokit; two-token never crosses;
+ *    sandbox never writes the source; no anonymous path)
+ *  - VAL-EXIT-001/002 (success + declined → 0; git failure → 3)
+ *  - VAL-FLOW-001 (end-to-end sandbox quarantine)
  *
  * `process.exit` is stubbed to throw a tagged error so the test can assert the
- * code without killing the test process (mirrors the cli.test.ts intent of
- * asserting the documented exit-code mapping).
+ * code without killing the test process.
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -30,7 +34,10 @@ import {
   type RunBacktestOptions,
 } from "../src/index.js";
 import { UnfetchableCommitError } from "../src/git.js";
-import { NoTokenNonInteractiveError } from "../src/auth.js";
+import {
+  NoSourceTokenNonInteractiveError,
+  NoTokenNonInteractiveError,
+} from "../src/auth.js";
 import { setTtyOverride, setVerbose } from "../src/log.js";
 
 /** An `Error` tagged with the exit code a stubbed `process.exit` was given. */
@@ -71,6 +78,16 @@ async function capture(
 const PR_URL = "https://github.com/acme/api/pull/123";
 const CREATED_URL = "https://github.com/acme/api/pull/451";
 
+const SOURCE_OWNER = "acme";
+const SOURCE_REPO = "api";
+const SANDBOX_OWNER = "octocat";
+const SANDBOX_REPO = "pr-backtest-sandbox";
+
+/** The single token used by single-token runs (write covers read). */
+const ONE_TOKEN = "ghp_one_token_value_covers_read_and_write_01";
+const READ_TOKEN = "ghp_READ_token_value_must_route_to_source_reads";
+const WRITE_TOKEN = "ghp_WRITE_token_value_must_route_to_dest_writes";
+
 /** A fake `Octokit` — the deps never touch it, so an empty object is enough. */
 const fakeOctokit = {} as unknown as Octokit;
 /** A fake `SimpleGit` — likewise inert; the git deps are stubbed. */
@@ -79,35 +96,54 @@ const fakeGit = {} as unknown as SimpleGit;
 /**
  * Build a complete `deps` fake plus a shared `order` log. Each git/API
  * collaborator records a stable label so the test can assert the exact
- * orchestration sequence. `overrides` lets a single test swap one collaborator
- * (e.g. make `fetchCommit` throw `UnfetchableCommitError`).
+ * orchestration sequence. `overrides` lets a single test swap one collaborator.
+ *
+ * Defaults model a PRIMARY single-token run: the destination resolves to the
+ * source, the write token (`ONE_TOKEN`) both writes the destination and reads
+ * the source (single-PAT), so `twoToken` is false.
  */
-function makeDeps(overrides: Partial<RunBacktestDeps> = {}): {
+function makeDeps(
+  overrides: Partial<RunBacktestDeps> = {},
+  tokenOpts: { writeToken?: string; readToken?: string } = {},
+): {
   deps: Partial<RunBacktestDeps>;
   order: string[];
 } {
+  const writeToken = tokenOpts.writeToken ?? ONE_TOKEN;
+  const readToken = tokenOpts.readToken ?? writeToken;
   const order: string[] = [];
   const base: RunBacktestDeps = {
-    resolveToken: async () => ({
-      token: "ghp_fake_token_value_123456",
-      username: "octocat",
-      source: "classic",
-    }),
     makeOctokit: () => fakeOctokit,
-    resolveDestination: async (source) => {
+    resolveDestinationChoice: async (source) => ({
+      owner: source.owner,
+      repo: source.repo,
+      isSandbox: false,
+    }),
+    verifyOrCreateDestination: async (dest) => {
       order.push("verify-destination");
-      return { owner: source.owner, repo: source.repo, isSandbox: false };
+      return dest;
     },
+    resolveWriteToken: async (opts) => {
+      // Drive the accept predicate so verifyOrCreateDestination actually runs
+      // (it records "verify-destination" in `order`).
+      await opts.accept(fakeOctokit, writeToken);
+      return { token: writeToken, source: "classic", login: "octocat", fromPaste: false };
+    },
+    resolveReadToken: async () => ({
+      token: readToken,
+      source: "classic",
+      login: "octocat",
+      fromPaste: false,
+    }),
     verifyRepo: async () => ({ exists: true, canPush: true }),
     makeSandboxCreator: () => async () => ({ owner: "x", repo: "y" }),
-    makeInteractivePrompt: () => async () => ({ kind: "primary" }),
+    makeMenuPrompt: () => async (rows) => rows[0]!,
+    makeSlugPrompt: () => async () => ({ owner: SANDBOX_OWNER, repo: SANDBOX_REPO }),
+    makeRememberPrompt: () => async () => false,
     readConfig: () => null,
     getPullRequest: async () => {
       order.push("read-pr");
-      return {
-        title: "Add retry to fetch",
-        user: "octocat",
-      };
+      return { title: "Add retry to fetch", user: "octocat" };
     },
     listPullRequestCommits: async () => [
       {
@@ -124,7 +160,7 @@ function makeDeps(overrides: Partial<RunBacktestDeps> = {}): {
     confirmPlan: async () => true,
     makeTempDir: () => "/tmp/pr-backtest-fake",
     registerCleanup: () => {},
-    cleanup: async () => {},
+    cleanup: () => {},
     cloneRepo: async () => {
       order.push("clone");
       return fakeGit;
@@ -148,7 +184,6 @@ async function run(
     Partial<Pick<RunBacktestOptions, "prUrl" | "commit" | "yes">>,
 ): Promise<{ stdout: string; stderr: string; exit: number }> {
   const realExit = process.exit;
-  // Stub process.exit to throw, so the run unwinds at the first exit call.
   (process as { exit: unknown }).exit = (code?: number): never => {
     throw new ExitError(code ?? 0);
   };
@@ -187,16 +222,16 @@ afterEach(() => {
   setTtyOverride(null);
 });
 
+// --- VAL-EXIT-001: success + ordering ---------------------------------------
+
 test("on success stdout is exactly the PR URL + newline; trace is on stderr", async () => {
   const { deps } = makeDeps();
   const { stdout, stderr, exit } = await run({ deps });
 
   assert.equal(exit, 0, "a clean success exits 0");
   assert.equal(stdout, CREATED_URL + "\n", "stdout is exactly the PR URL + \\n");
-  // The created URL is the ONLY thing on stdout — no trace bled across.
   assert.ok(!stdout.includes("✓"), "no completion marker on stdout");
   assert.ok(!stdout.includes("Read PR"), "no narration on stdout");
-  // The narration that proves the run happened is on stderr.
   assert.match(stderr, /Read PR/);
   assert.match(stderr, /✓/);
 });
@@ -205,32 +240,13 @@ test("a default run's stderr shows ✓ completion markers for each operation", a
   const { deps } = makeDeps();
   const { stderr } = await run({ deps });
 
-  // The index-level step sites narrate read-PR, verify-destination, open-PR.
   assert.match(stderr, /✓ Read PR github\.com\/acme\/api#123/);
   assert.match(stderr, /✓ Verified destination/);
   assert.match(stderr, /✓ Opened backtest PR/);
-  // success("Backtest PR created.") is the final ✓.
   assert.match(stderr, /✓ Backtest PR created/);
 });
 
-test("git-layer ops (clone/fetch/push) narrate their own ✓ — no duplicate index-level line", async () => {
-  // Drive through the REAL git ops (not the deps stubs) by injecting a fake
-  // SimpleGit so clone/fetch/push render their `traceOp` ✓ lines. Here we let
-  // the default deps git stubs stand and instead assert the index layer does
-  // NOT emit a `Cloning …`/`Pushing …` step line of its own (it delegates to
-  // the git layer), so there is no double narration.
-  const { deps } = makeDeps();
-  const { stderr } = await run({ deps });
-  // index.ts must not add its own "Cloning"/"Pushing" step lines; those belong
-  // to git.ts. With git stubbed, neither layer prints them — so the captured
-  // stderr has no clone/push narration originating from index.ts.
-  const indexClonedLines = stderr
-    .split("\n")
-    .filter((l) => /Cloning github\.com/.test(l) && l.includes("→"));
-  assert.equal(indexClonedLines.length, 0, "index.ts emits no `→ Cloning` line");
-});
-
-test("the success operation order matches the base sequence", async () => {
+test("the success operation order: destination FIRST, then read, then clone/fetch/push/open", async () => {
   const { deps, order } = makeDeps();
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
@@ -240,13 +256,54 @@ test("the success operation order matches the base sequence", async () => {
     "clone",
     "fetch:9f3c", // base SHA fetched first
     "fetch:a1b2", // head SHA fetched second
-    "push:backtest-pr123-base",
-    "push:backtest-pr123-head",
+    "push:backtest-pr123-a1b2c3d-base",
+    "push:backtest-pr123-a1b2c3d-head",
     "open-pr",
   ]);
 });
 
-test("an unfetchable commit maps to exit 3 (git failure), unchanged", async () => {
+test("VAL-EXIT-001: a declined plan exits 0 with no writes", async () => {
+  const writes = { clone: 0, push: 0, create: 0 };
+  const { deps } = makeDeps({
+    confirmPlan: async () => false,
+    cloneRepo: async () => {
+      writes.clone += 1;
+      return fakeGit;
+    },
+    pushBranchFromSha: async () => {
+      writes.push += 1;
+    },
+    createPullRequest: async () => {
+      writes.create += 1;
+      return CREATED_URL;
+    },
+  });
+  const { stdout, stderr, exit } = await run({ deps });
+  assert.equal(exit, 0, "a declined plan is a clean exit 0");
+  assert.equal(stdout, "", "no PR URL on stdout for a declined run");
+  assert.match(stderr, /Aborted: no changes were made\./);
+  assert.deepEqual(writes, { clone: 0, push: 0, create: 0 }, "no writes after decline");
+});
+
+test("a verbose run is observation-only — same order, same exit", async () => {
+  const { deps, order } = makeDeps();
+  const { exit } = await run({ deps, verbose: true });
+  assert.equal(exit, 0);
+  assert.deepEqual(order, [
+    "verify-destination",
+    "read-pr",
+    "clone",
+    "fetch:9f3c",
+    "fetch:a1b2",
+    "push:backtest-pr123-a1b2c3d-base",
+    "push:backtest-pr123-a1b2c3d-head",
+    "open-pr",
+  ]);
+});
+
+// --- VAL-EXIT-002: git failure → exit 3 -------------------------------------
+
+test("VAL-EXIT-002: an unfetchable commit maps to exit 3 (git failure)", async () => {
   const { deps } = makeDeps({
     fetchCommit: async (_git, sha, prNumber, remote) => {
       throw new UnfetchableCommitError(sha, prNumber, remote);
@@ -258,16 +315,107 @@ test("an unfetchable commit maps to exit 3 (git failure), unchanged", async () =
   assert.match(stderr, /Could not fetch commit/);
 });
 
-test("a closed/merged prior backtest PR is caught by the pre-flight before any clone/push", async () => {
-  // The pre-flight queries `state: "all"`, so a closed or merged prior backtest
-  // PR for the same branch pair is detected up front. An open-only pre-flight
-  // would miss this PR — modelled here by a fake that only returns a URL when
-  // asked for `"all"`, returning null for the open-only default.
-  const calls = { clone: 0, push: 0, create: 0 };
-  const EXISTING_URL = "https://github.com/acme/api/pull/200";
+test("VAL-EXIT-002: a clone failure maps to exit 3", async () => {
   const { deps } = makeDeps({
-    findExistingPr: async (_octokit, _owner, _repo, _head, _base, state) =>
-      state === "all" ? EXISTING_URL : null,
+    cloneRepo: async () => {
+      throw new Error("Failed to clone github.com/acme/api.");
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 3, "a clone failure is exit 3");
+});
+
+// --- VAL-DEST-004: both flags → exit 1 BEFORE any network -------------------
+
+test("VAL-DEST-004: --primary AND --sandbox exits 1 before any network call", async () => {
+  let networkTouched = false;
+  const { deps } = makeDeps({
+    resolveDestinationChoice: async () => {
+      networkTouched = true;
+      return { owner: SOURCE_OWNER, repo: SOURCE_REPO, isSandbox: false };
+    },
+    resolveWriteToken: async () => {
+      networkTouched = true;
+      return { token: ONE_TOKEN, source: "classic", login: "x", fromPaste: false };
+    },
+  });
+  const { stderr, exit } = await run({
+    deps,
+    primary: true,
+    sandbox: "octocat/sandbox",
+  });
+  assert.equal(exit, 1, "both flags is a bad-args exit 1");
+  assert.match(stderr, /Pass either --primary or --sandbox, not both\./);
+  assert.equal(networkTouched, false, "no token/destination work before the fast-fail");
+});
+
+// --- VAL-BRANCH-001/002: SHA-named branches; distinct commits → distinct PRs -
+
+test("VAL-BRANCH-001: branch names embed the short SHA of the target commit", async () => {
+  const pushed: string[] = [];
+  const { deps } = makeDeps({
+    pushBranchFromSha: async (_git, _sha, branch) => {
+      pushed.push(branch);
+    },
+    createPullRequest: async (_octokit, _owner, _repo, head, base) => {
+      pushed.push(`head:${head}`, `base:${base}`);
+      return CREATED_URL;
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+  // target SHA short = a1b2c3d.
+  assert.deepEqual(pushed, [
+    "backtest-pr123-a1b2c3d-base",
+    "backtest-pr123-a1b2c3d-head",
+    "head:backtest-pr123-a1b2c3d-head",
+    "base:backtest-pr123-a1b2c3d-base",
+  ]);
+});
+
+test("VAL-BRANCH-002: the same PR at two different commits yields two distinct branch sets", async () => {
+  // Two commits in the PR; selecting each (via --commit) yields distinct
+  // SHA-named branches, so two backtests never collide.
+  const COMMIT_A = "aaaaaaa1111111111111111111111111111111aa";
+  const COMMIT_B = "bbbbbbb2222222222222222222222222222222bb";
+  const branchSets: string[][] = [];
+  for (const sel of [COMMIT_A, COMMIT_B]) {
+    const pushed: string[] = [];
+    const { deps } = makeDeps({
+      listPullRequestCommits: async () => [
+        { sha: COMMIT_A, parents: [{ sha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1" }] },
+        { sha: COMMIT_B, parents: [{ sha: COMMIT_A }] },
+      ],
+      pushBranchFromSha: async (_git, _s, branch) => {
+        pushed.push(branch);
+      },
+    });
+    const { exit } = await run({ deps, commit: sel });
+    assert.equal(exit, 0);
+    branchSets.push(pushed);
+  }
+  assert.deepEqual(branchSets[0], [
+    "backtest-pr123-aaaaaaa-base",
+    "backtest-pr123-aaaaaaa-head",
+  ]);
+  assert.deepEqual(branchSets[1], [
+    "backtest-pr123-bbbbbbb-base",
+    "backtest-pr123-bbbbbbb-head",
+  ]);
+  assert.notDeepEqual(branchSets[0], branchSets[1], "two commits → two distinct branch sets");
+});
+
+// --- VAL-BRANCH-003: open dedup → exit 4; closed does NOT block -------------
+
+test("VAL-BRANCH-003: an OPEN backtest PR yields exit 4, URL on stdout, message on stderr", async () => {
+  const EXISTING_URL = "https://github.com/acme/api/pull/200";
+  const calls = { clone: 0, push: 0, create: 0 };
+  const states: Array<"open" | "all"> = [];
+  const { deps } = makeDeps({
+    findExistingPr: async (_o, _ow, _r, _h, _b, state = "open") => {
+      states.push(state);
+      return EXISTING_URL;
+    },
     cloneRepo: async () => {
       calls.clone += 1;
       return fakeGit;
@@ -280,36 +428,75 @@ test("a closed/merged prior backtest PR is caught by the pre-flight before any c
       return CREATED_URL;
     },
   });
-  const { stdout, exit } = await run({ deps });
+  const { stdout, stderr, exit } = await run({ deps });
 
-  assert.equal(exit, 4, "an existing backtest PR is the documented exit 4");
-  assert.equal(stdout, EXISTING_URL + "\n", "stdout is exactly the existing PR URL");
-  assert.equal(calls.clone, 0, "no clone when the pre-flight finds an existing PR");
-  assert.equal(calls.push, 0, "no push when the pre-flight finds an existing PR");
-  assert.equal(calls.create, 0, "no create when the pre-flight finds an existing PR");
-});
-
-test("a verbose run is observation-only — same order, same exit", async () => {
-  const { deps, order } = makeDeps();
-  const { exit } = await run({ deps, verbose: true });
-  assert.equal(exit, 0, "verbose does not change the exit code");
-  assert.deepEqual(
-    order,
-    [
-      "verify-destination",
-      "read-pr",
-      "clone",
-      "fetch:9f3c",
-      "fetch:a1b2",
-      "push:backtest-pr123-base",
-      "push:backtest-pr123-head",
-      "open-pr",
-    ],
-    "verbose does not change the operation order",
+  assert.equal(exit, 4, "an OPEN backtest PR is the documented exit 4");
+  assert.equal(stdout, EXISTING_URL + "\n", "the bare URL is the only thing on stdout");
+  assert.deepEqual(states, ["open"], "the pre-flight queries OPEN PRs only");
+  assert.match(
+    stderr,
+    /A backtest for acme\/api#123 at commit a1b2c3d already exists: https:\/\/github\.com\/acme\/api\/pull\/200/,
   );
+  assert.match(stderr, /To recreate it, close that PR and re-run \(the branch names include the commit SHA\)\./);
+  assert.deepEqual(calls, { clone: 0, push: 0, create: 0 }, "no writes when an open PR blocks");
 });
 
-// --- writes target the destination, never the read-only source --
+test("VAL-BRANCH-003: a CLOSED prior backtest PR does NOT block — the run proceeds", async () => {
+  // The pre-flight queries `state: "open"` only, so a closed prior PR returns
+  // null and the run proceeds to create a fresh one.
+  const { deps, order } = makeDeps({
+    findExistingPr: async (_o, _ow, _r, _h, _b, state = "open") =>
+      // Model a closed-only prior PR: open → null (does not block).
+      state === "open" ? null : "https://github.com/acme/api/pull/200",
+  });
+  const { stdout, exit } = await run({ deps });
+  assert.equal(exit, 0, "a closed prior PR does not block a re-run");
+  assert.equal(stdout, CREATED_URL + "\n", "a fresh PR is created");
+  assert.ok(order.includes("open-pr"), "the run reached create");
+});
+
+// --- VAL-BRANCH-004: 422 backstop -------------------------------------------
+
+test("VAL-BRANCH-004: a 422 with a matching OPEN PR re-queries and exits 4", async () => {
+  const EXISTING_URL = "https://github.com/acme/api/pull/200";
+  let preflightDone = false;
+  const { deps } = makeDeps({
+    findExistingPr: async () => {
+      // First call is the pre-flight (returns null → proceed); the second is the
+      // post-422 re-query (returns the raced URL).
+      if (!preflightDone) {
+        preflightDone = true;
+        return null;
+      }
+      return EXISTING_URL;
+    },
+    createPullRequest: async () => {
+      const err = new Error("Validation Failed") as Error & { status: number };
+      err.status = 422;
+      throw err;
+    },
+  });
+  const { stdout, stderr, exit } = await run({ deps });
+  assert.equal(exit, 4, "a 422 with a matching PR is exit 4");
+  assert.equal(stdout, EXISTING_URL + "\n", "the raced PR URL is on stdout");
+  assert.match(stderr, /already exists/);
+});
+
+test("VAL-BRANCH-004: a 422 with NO matching PR exits 2 (no-diff message)", async () => {
+  const { deps } = makeDeps({
+    findExistingPr: async () => null,
+    createPullRequest: async () => {
+      const err = new Error("Validation Failed") as Error & { status: number };
+      err.status = 422;
+      throw err;
+    },
+  });
+  const { stderr, exit } = await run({ deps });
+  assert.equal(exit, 2, "a 422 with no matching PR is exit 2");
+  assert.match(stderr, /no difference between the target commit and its parent/);
+});
+
+// --- Sandbox write-target invariants (VAL-ROUTE-003) ------------------------
 
 /** A single git/API call that wrote somewhere, tagged with its target repo. */
 interface WriteTarget {
@@ -318,11 +505,6 @@ interface WriteTarget {
   repo: string;
 }
 
-/**
- * Build deps whose clone/push/create/add-source-remote fakes RECORD the
- * owner/repo they were handed (the base `makeDeps` fakes discard them). Returns
- * the deps plus the captured write targets and the source remote target.
- */
 function makeRecordingDeps(overrides: Partial<RunBacktestDeps> = {}): {
   deps: Partial<RunBacktestDeps>;
   writes: WriteTarget[];
@@ -344,10 +526,6 @@ function makeRecordingDeps(overrides: Partial<RunBacktestDeps> = {}): {
       fetchRemotes.push(remote);
     },
     pushBranchFromSha: async (_git, _sha, branch) => {
-      // The push fake cannot see owner/repo (pushBranchFromSha pushes to the
-      // clone's `origin`, which cloneRepo set to the destination). The clone
-      // target is therefore the write target asserted for push; record the
-      // branch so the call is observable.
       writes.push({ op: `push:${branch}`, owner: "", repo: "" });
     },
     createPullRequest: async (_octokit, owner, repo) => {
@@ -359,14 +537,9 @@ function makeRecordingDeps(overrides: Partial<RunBacktestDeps> = {}): {
   return { deps: base, writes, sourceRemote, fetchRemotes };
 }
 
-const SOURCE_OWNER = "acme";
-const SOURCE_REPO = "api";
-const SANDBOX_OWNER = "octocat";
-const SANDBOX_REPO = "pr-backtest-sandbox";
-
-test("a sandbox run clones and opens the PR against the destination, never the source", async () => {
+test("VAL-ROUTE-003: a sandbox run clones + opens against the destination, never the source", async () => {
   const { deps, writes } = makeRecordingDeps({
-    resolveDestination: async () => ({
+    resolveDestinationChoice: async () => ({
       owner: SANDBOX_OWNER,
       repo: SANDBOX_REPO,
       isSandbox: true,
@@ -375,7 +548,6 @@ test("a sandbox run clones and opens the PR against the destination, never the s
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
 
-  // clone and create target the destination.
   const clone = writes.find((w) => w.op === "clone");
   const create = writes.find((w) => w.op === "create");
   assert.deepEqual(
@@ -388,14 +560,10 @@ test("a sandbox run clones and opens the PR against the destination, never the s
     { owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
     "createPullRequest targets the destination",
   );
-
-  // push happened (the branches were pushed to the clone's origin = destination).
   assert.ok(
-    writes.some((w) => w.op === "push:backtest-pr123-head"),
+    writes.some((w) => w.op === "push:backtest-pr123-a1b2c3d-head"),
     "the head branch was pushed",
   );
-
-  // The source owner/repo is NEVER a clone/push/create target.
   for (const w of writes) {
     assert.ok(
       !(w.owner === SOURCE_OWNER && w.repo === SOURCE_REPO),
@@ -406,7 +574,7 @@ test("a sandbox run clones and opens the PR against the destination, never the s
 
 test("a sandbox run adds the source remote for the source repo and fetches from it", async () => {
   const { deps, sourceRemote, fetchRemotes } = makeRecordingDeps({
-    resolveDestination: async () => ({
+    resolveDestinationChoice: async () => ({
       owner: SANDBOX_OWNER,
       repo: SANDBOX_REPO,
       isSandbox: true,
@@ -414,27 +582,18 @@ test("a sandbox run adds the source remote for the source repo and fetches from 
   });
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
-
-  // addSourceRemote is called exactly for the SOURCE owner/repo.
   assert.deepEqual(sourceRemote, [
     { op: "add-source-remote", owner: SOURCE_OWNER, repo: SOURCE_REPO },
   ]);
-  // Both commits are fetched from the `source` remote, not origin.
   assert.deepEqual(fetchRemotes, ["source", "source"]);
 });
 
 test("a primary run never adds a source remote and fetches from origin", async () => {
-  // Default resolveDestination returns the source repo with isSandbox:false.
   const { deps, writes, sourceRemote, fetchRemotes } = makeRecordingDeps();
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
-
-  // No source remote in primary mode; fetch uses origin.
   assert.deepEqual(sourceRemote, [], "primary mode never adds a source remote");
   assert.deepEqual(fetchRemotes, ["origin", "origin"], "primary mode fetches from origin");
-
-  // In primary mode destination == source, so clone/create DO target the source
-  // repo (by design — the user opted in). That is the destination here.
   const clone = writes.find((w) => w.op === "clone");
   assert.deepEqual(
     { owner: clone?.owner, repo: clone?.repo },
@@ -443,16 +602,7 @@ test("a primary run never adds a source remote and fetches from origin", async (
   );
 });
 
-// --- git + Octokit routing: per-owner token + per-instance Octokit ---------
-//
-// These tests are the AUTHORITATIVE evidence for VAL-ROUTE-001/002/003 and
-// VAL-INV-001/002/006. They observe (a) WHICH Octokit instance each API call
-// received, and (b) WHICH token authenticated each git op, by injecting a
-// recording `makeOctokit` (distinct instance per token) and a
-// `resolveTokensForRun` that returns chosen read/write tokens.
-
-const READ_TOKEN = "ghp_READ_token_value_must_route_to_source_reads";
-const WRITE_TOKEN = "ghp_WRITE_token_value_must_route_to_dest_writes";
+// --- Per-op token routing: read vs write Octokit + git credential -----------
 
 /** A recorded API call: the op label + the token whose Octokit was passed. */
 interface ApiCall {
@@ -468,9 +618,9 @@ interface GitCall {
 /**
  * Build routing-aware recording deps. `makeOctokit(token)` returns a tagged
  * instance carrying its token so each API dep can record WHICH token's instance
- * it received. `resolveTokensForRun` is stubbed to return the given tokens so a
- * test can force a two-token (distinct) or one-token (identical) run. Each git
- * dep records the token it was handed (the per-op credential seam).
+ * it received. `resolveWriteToken` / `resolveReadToken` are stubbed to return the
+ * given tokens so a test can force a two-token (distinct) or one-token (identical)
+ * run. Each git dep records the token it was handed (the per-op credential seam).
  */
 function makeRoutingDeps(opts: {
   readToken: string;
@@ -487,8 +637,6 @@ function makeRoutingDeps(opts: {
   const gitCalls: GitCall[] = [];
   const instances = new Map<string, object>();
 
-  // A distinct, identity-stable Octokit per token. Re-requesting the same token
-  // returns the SAME object so identity (===) is meaningful in assertions.
   const makeOctokit = ((token: string): Octokit => {
     let inst = instances.get(token);
     if (!inst) {
@@ -498,40 +646,32 @@ function makeRoutingDeps(opts: {
     return inst as unknown as Octokit;
   }) as unknown as RunBacktestDeps["makeOctokit"];
 
-  /** Read the token an Octokit instance was tagged with. */
   const tokenOf = (octokit: unknown): string =>
     (octokit as { __token?: string }).__token ?? "<untagged>";
 
-  const twoToken = opts.readToken !== opts.writeToken;
-
   const { deps: base } = makeDeps({
-    // The default/resolveToken credential is the write token, so a one-token run
-    // (read===write===default) collapses to a single constructed Octokit.
-    resolveToken: async () => ({
-      token: opts.writeToken,
-      username: "octocat",
-      source: "classic",
-    }),
     makeOctokit,
-    computeTokenNeeds: () => [
-      { kind: "write", owner: "octocat", repo: "sandbox" },
-    ],
-    resolveTokensForRun: async () => ({
-      readToken: opts.readToken,
-      writeToken: opts.writeToken,
-      twoToken,
-    }),
-    resolveDestination: async (source) =>
+    resolveDestinationChoice: async (source) =>
       opts.isSandbox
         ? { owner: SANDBOX_OWNER, repo: SANDBOX_REPO, isSandbox: true }
         : { owner: source.owner, repo: source.repo, isSandbox: false },
-    // verifyRepo is used by the source-visibility probe (default token) AND by
-    // the destination resolver. Report the source as PRIVATE (private: true) so
-    // the cross-owner routing tests exercise the genuine two-token path (a
-    // resolved READ token authenticates source reads) — NOT the public anonymous
-    // read path (which is covered separately below). The destination is writable
-    // (canPush: true), which is all the resolver checks.
-    verifyRepo: async () => ({ exists: true, canPush: true, private: true }),
+    resolveWriteToken: async (o) => {
+      // Exercise the accept predicate on the WRITE Octokit (verifies dest).
+      await o.accept(makeOctokit(opts.writeToken), opts.writeToken);
+      return {
+        token: opts.writeToken,
+        source: "classic",
+        login: "octocat",
+        fromPaste: false,
+      };
+    },
+    resolveReadToken: async () => ({
+      token: opts.readToken,
+      source: "classic",
+      login: "octocat",
+      fromPaste: false,
+    }),
+    verifyRepo: async () => ({ exists: true, canPush: true }),
     getPullRequest: async (octokit) => {
       apiCalls.push({ op: "getPullRequest", token: tokenOf(octokit) });
       return { title: "Add retry to fetch", user: "octocat" };
@@ -593,7 +733,6 @@ test("VAL-ROUTE-001: two-token run routes source reads to READ Octokit, dest cal
       assert.equal(call.token, WRITE_TOKEN, `${call.op} must use the WRITE Octokit`);
     }
   }
-  // Both source reads actually happened on the read instance.
   assert.ok(apiCalls.some((c) => c.op === "getPullRequest" && c.token === READ_TOKEN));
   assert.ok(apiCalls.some((c) => c.op === "createPullRequest" && c.token === WRITE_TOKEN));
 });
@@ -609,7 +748,6 @@ test("VAL-ROUTE-002: source-remote fetch uses READ token; clone + push use WRITE
 
   const clone = gitCalls.find((c) => c.op === "clone");
   assert.equal(clone?.token, WRITE_TOKEN, "clone authenticates with the WRITE token");
-
   for (const c of gitCalls.filter((g) => g.op === "fetch:source")) {
     assert.equal(c.token, READ_TOKEN, "the source fetch authenticates with the READ token");
   }
@@ -627,70 +765,13 @@ test("VAL-ROUTE-003: identical tokens construct exactly one Octokit and one git 
   });
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
-
-  // Exactly one Octokit instance exists for the single token (the recording
-  // makeOctokit returns the same object per token, so a single map entry proves
-  // one instance covered both read and write).
   assert.equal(instances.size, 1, "one token → exactly one Octokit instance");
-  // Every git op authenticates with that one token — byte-for-byte one-token.
   for (const c of gitCalls) {
     assert.equal(c.token, WRITE_TOKEN, `${c.op} uses the single token`);
   }
 });
 
-test("F2: a public cross-owner source is read anonymously (no token) while clone/push use the write token", async () => {
-  // The source-visibility probe reports the source as PUBLIC (private:false);
-  // computeTokenNeeds then yields a single write purpose, so readToken collapses
-  // to the write token. But because the source is public AND cross-owner, the
-  // run must read the source through an ANONYMOUS Octokit (token "") and fetch
-  // the `source` remote with NO credential — never the write token, which (as a
-  // destination-scoped PAT) could 404 a public repo in another org.
-  const { deps, apiCalls, gitCalls } = makeRoutingDeps({
-    readToken: WRITE_TOKEN, // one-token collapse (write purpose only)
-    writeToken: WRITE_TOKEN,
-    isSandbox: true, // cross-owner: source acme, dest octocat/sandbox
-    overrides: {
-      // PUBLIC source; destination still writable.
-      verifyRepo: async () => ({ exists: true, canPush: true, private: false }),
-    },
-  });
-  const { exit } = await run({ deps });
-  assert.equal(exit, 0);
-
-  // Source reads run on the ANONYMOUS Octokit (empty token), never the write token.
-  for (const c of apiCalls.filter((a) =>
-    ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"].includes(a.op),
-  )) {
-    assert.equal(c.token, "", `${c.op} must read the public source anonymously`);
-    assert.notEqual(c.token, WRITE_TOKEN, `${c.op} must not use the write token`);
-  }
-  assert.ok(
-    apiCalls.some((c) => c.op === "getPullRequest" && c.token === ""),
-    "the PR read happened anonymously",
-  );
-
-  // The source fetch is anonymous (empty token); clone + push use the write token.
-  for (const c of gitCalls.filter((g) => g.op === "fetch:source")) {
-    assert.equal(c.token, "", "the public source fetch is anonymous");
-  }
-  assert.equal(
-    gitCalls.find((c) => c.op === "clone")?.token,
-    WRITE_TOKEN,
-    "clone uses the write token",
-  );
-  for (const c of gitCalls.filter((g) => g.op.startsWith("push:"))) {
-    assert.equal(c.token, WRITE_TOKEN, "push uses the write token");
-  }
-
-  // Destination API calls still use the write Octokit.
-  for (const c of apiCalls.filter((a) =>
-    ["findExistingPr", "createPullRequest"].includes(a.op),
-  )) {
-    assert.equal(c.token, WRITE_TOKEN, `${c.op} uses the write Octokit`);
-  }
-});
-
-test("VAL-INV-002 + VAL-INV-006: read token never authenticates a write; write token never the source fetch/read", async () => {
+test("VAL-TOKEN-008 + VAL-ROUTE-002: read token never authenticates a write; write token never the source fetch/read", async () => {
   const { deps, apiCalls, gitCalls } = makeRoutingDeps({
     readToken: READ_TOKEN,
     writeToken: WRITE_TOKEN,
@@ -699,19 +780,14 @@ test("VAL-INV-002 + VAL-INV-006: read token never authenticates a write; write t
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
 
-  // INV-002: the READ token is never the clone/push credential, nor the
-  // create/findExistingPr Octokit.
-  const writeGitOps = gitCalls.filter(
-    (c) => c.op === "clone" || c.op.startsWith("push:"),
-  );
-  for (const c of writeGitOps) {
+  // The READ token is never the clone/push credential, nor the create/find Octokit.
+  for (const c of gitCalls.filter((g) => g.op === "clone" || g.op.startsWith("push:"))) {
     assert.notEqual(c.token, READ_TOKEN, `${c.op} must never use the READ token`);
   }
   for (const c of apiCalls.filter((a) => a.op === "createPullRequest" || a.op === "findExistingPr")) {
     assert.notEqual(c.token, READ_TOKEN, `${c.op} must never use the READ Octokit`);
   }
-
-  // INV-006: the WRITE token never authenticates the source fetch or a source read.
+  // The WRITE token never authenticates the source fetch or a source read.
   for (const c of gitCalls.filter((g) => g.op === "fetch:source")) {
     assert.notEqual(c.token, WRITE_TOKEN, "the source fetch must never use the WRITE token");
   }
@@ -722,8 +798,7 @@ test("VAL-INV-002 + VAL-INV-006: read token never authenticates a write; write t
   }
 });
 
-test("VAL-INV-001: source owner/repo is never a push or createPullRequest target (cross-owner)", async () => {
-  // Record the owner/repo handed to clone/create + the branch handed to push.
+test("VAL-ROUTE-003: source owner/repo is never a push or createPullRequest target (cross-owner)", async () => {
   const writes: WriteTarget[] = [];
   const { deps } = makeRoutingDeps({
     readToken: READ_TOKEN,
@@ -745,14 +820,12 @@ test("VAL-INV-001: source owner/repo is never a push or createPullRequest target
   });
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
-
   for (const w of writes) {
     assert.ok(
       !(w.owner === SOURCE_OWNER && w.repo === SOURCE_REPO),
       `the source repo must never be a push/create target (was for ${w.op})`,
     );
   }
-  // create targeted the sandbox (destination), not the source.
   const create = writes.find((w) => w.op === "create");
   assert.deepEqual(
     { owner: create?.owner, repo: create?.repo },
@@ -760,23 +833,45 @@ test("VAL-INV-001: source owner/repo is never a push or createPullRequest target
   );
 });
 
-test("a non-interactive missing read token exits 1 before any clone/push/create", async () => {
-  // resolveTokensForRun throws the no-source-token error; the run must map it to
-  // exit 1 and perform NO write side effect.
-  const sideEffects = { clone: 0, push: 0, create: 0 };
+// --- VAL-TOKEN-002: quarantine completes ------------------------------------
+
+test("VAL-TOKEN-002 / VAL-FLOW-001: a sandbox run with a read-only source token + write dest token completes", async () => {
+  // The read token (READ_TOKEN) only reads the source; the write token
+  // (WRITE_TOKEN) writes the destination. End-to-end: destination chosen first,
+  // SHA-named branches, source only ever read.
+  const { deps, gitCalls, apiCalls } = makeRoutingDeps({
+    readToken: READ_TOKEN,
+    writeToken: WRITE_TOKEN,
+    isSandbox: true,
+  });
+  const { stdout, exit } = await run({ deps });
+  assert.equal(exit, 0, "the quarantine run completes");
+  assert.equal(stdout, CREATED_URL + "\n");
+
+  // The read-only token authenticates ONLY the source reads + the source fetch.
+  for (const c of gitCalls.filter((g) => g.token === READ_TOKEN)) {
+    assert.equal(c.op, "fetch:source", "the READ token only authenticates the source fetch");
+  }
+  for (const c of apiCalls.filter((a) => a.token === READ_TOKEN)) {
+    assert.ok(
+      ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"].includes(c.op),
+      `the READ token only authenticates source reads (was ${c.op})`,
+    );
+  }
+});
+
+// --- VAL-TOKEN-005/006: missing tokens → exit 1 before any write ------------
+
+test("VAL-TOKEN-006: a missing WRITE token non-interactively exits 1 naming GITHUB_TOKEN, before any write", async () => {
+  const sideEffects = { clone: 0, push: 0, create: 0, readPr: 0 };
   const { deps } = makeDeps({
-    computeTokenNeeds: () => [
-      { kind: "read", owner: SOURCE_OWNER, repo: SOURCE_REPO },
-      { kind: "write", owner: SANDBOX_OWNER, repo: SANDBOX_REPO },
-    ],
-    resolveTokensForRun: async () => {
+    resolveWriteToken: async () => {
       throw new NoTokenNonInteractiveError();
     },
-    resolveDestination: async () => ({
-      owner: SANDBOX_OWNER,
-      repo: SANDBOX_REPO,
-      isSandbox: true,
-    }),
+    getPullRequest: async () => {
+      sideEffects.readPr += 1;
+      return { title: "x", user: "y" };
+    },
     cloneRepo: async () => {
       sideEffects.clone += 1;
       return fakeGit;
@@ -789,7 +884,68 @@ test("a non-interactive missing read token exits 1 before any clone/push/create"
       return CREATED_URL;
     },
   });
-  const { exit } = await run({ deps });
+  const { stderr, exit } = await run({ deps });
+  assert.equal(exit, 1, "a missing write token non-interactively exits 1");
+  assert.match(stderr, /GITHUB_TOKEN/, "the message names GITHUB_TOKEN");
+  assert.deepEqual(
+    sideEffects,
+    { clone: 0, push: 0, create: 0, readPr: 0 },
+    "no write side effect (and no source read) occurred",
+  );
+});
+
+test("VAL-TOKEN-005: a missing READ token non-interactively exits 1 naming GITHUB_SOURCE_TOKEN, before any write", async () => {
+  const sideEffects = { clone: 0, push: 0, create: 0 };
+  const { deps } = makeDeps({
+    resolveDestinationChoice: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+    }),
+    resolveReadToken: async () => {
+      throw new NoSourceTokenNonInteractiveError(SOURCE_OWNER, SOURCE_REPO);
+    },
+    cloneRepo: async () => {
+      sideEffects.clone += 1;
+      return fakeGit;
+    },
+    pushBranchFromSha: async () => {
+      sideEffects.push += 1;
+    },
+    createPullRequest: async () => {
+      sideEffects.create += 1;
+      return CREATED_URL;
+    },
+  });
+  const { stderr, exit } = await run({ deps });
   assert.equal(exit, 1, "a missing read token non-interactively exits 1");
+  assert.match(stderr, /GITHUB_SOURCE_TOKEN/, "the message names GITHUB_SOURCE_TOKEN");
   assert.deepEqual(sideEffects, { clone: 0, push: 0, create: 0 }, "no write side effect occurred");
+});
+
+// --- Destination API errors map to exit 2 -----------------------------------
+
+test("a terminal not-writable destination (DestinationApiError) maps to exit 2", async () => {
+  const { DestinationApiError } = await import("../src/destination.js");
+  const { deps } = makeDeps({
+    resolveWriteToken: async () => {
+      throw new DestinationApiError("no write access");
+    },
+  });
+  const { stderr, exit } = await run({ deps });
+  assert.equal(exit, 2, "a terminal destination API error is exit 2");
+  assert.match(stderr, /no write access/);
+});
+
+// --- A PR read API error maps to exit 2 -------------------------------------
+
+test("a PR-read API error maps to exit 2", async () => {
+  const { deps } = makeDeps({
+    getPullRequest: async () => {
+      throw new Error("Pull request acme/api#123 was not found");
+    },
+  });
+  const { stderr, exit } = await run({ deps });
+  assert.equal(exit, 2, "a PR-not-found is exit 2");
+  assert.match(stderr, /was not found/);
 });

@@ -3,25 +3,31 @@
  *
  * This module owns the numeric exit-code mapping:
  *   0 — success, or the user declined the confirmation prompt
- *   1 — bad args / invalid URL / invalid --commit / no token (non-interactive)
- *   2 — PR not found / GitHub API error
+ *   1 — bad args / invalid URL / invalid --commit / both dest flags / no token (non-interactive)
+ *   2 — PR not found / GitHub API error / destination missing/not writable / creation failed
  *   3 — git operation failed (clone / fetch / push)
- *   4 — a backtest PR already exists for the planned branches
+ *   4 — an OPEN backtest PR already exists for the planned branches
  *
  * SECURITY: the token is never passed to `log`/console, never printed to
  * stdout/stderr, and never written anywhere except auth's 0600 config. The
  * authenticated clone URL (which embeds the token) is never logged — we log
- * `redactedRepoRef(owner, repo)` instead.
+ * `redactedRepoRef(owner, repo)` instead. The read token never authenticates a
+ * write op; the write token never touches the source; both reach GitHub only via
+ * an Octokit or the GIT_ASKPASS env.
+ *
+ * Orchestration order (spec §4): destination FIRST (a local choice, no network),
+ * then the WRITE token (verifying/creating the destination), then the READ token
+ * (reusing the write token when it can read the source — single-PAT). No owner
+ * logic, no source-visibility probe, no anonymous-source read path.
  */
 import type { Octokit } from "@octokit/rest";
 
 import {
-  computeTokenNeeds,
+  NoSourceTokenNonInteractiveError,
   NoTokenNonInteractiveError,
-  resolveToken,
-  resolveTokensForRun,
-  type AuthResult,
-  type RunTokens,
+  resolveReadToken,
+  resolveWriteToken,
+  type AcceptToken,
 } from "./auth.js";
 import {
   addSourceRemote,
@@ -48,23 +54,20 @@ import { readConfig } from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
-  makeInteractivePrompt,
+  makeMenuPrompt,
+  makeRememberPrompt,
   makeSandboxCreator,
-  resolveDestination,
-  type DestinationResolvers,
-  type DestinationSelection,
+  makeSlugPrompt,
+  resolveDestinationChoice,
+  verifyOrCreateDestination,
+  type ChoiceResolvers,
   type RepoRef,
 } from "./destination.js";
-import {
-  error,
-  info,
-  setVerbose,
-  success,
-  traceOp,
-} from "./log.js";
+import { error, info, setVerbose, success, traceOp } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
 import { resolveBase, resolveTarget } from "./resolveCommit.js";
+import { shortSha } from "./util.js";
 
 /** The tool's own repository, linked from the generated PR body. */
 const PROJECT_URL = "https://github.com/govambam/pr-backtest";
@@ -89,29 +92,20 @@ const EXIT = {
  * network/git boundary.
  */
 export interface RunBacktestDeps {
-  resolveToken: typeof resolveToken;
-  /**
-   * Compute the required token purposes from source/destination/visibility
-   * (pure). Injected so a routing test can drive `resolveTokensForRun` without
-   * re-deriving the needs rule.
-   */
-  computeTokenNeeds: typeof computeTokenNeeds;
-  /**
-   * Resolve a token per required purpose, collapsing to one when a single token
-   * covers both. The routing then builds one or two Octokit instances from the
-   * returned `{ readToken, writeToken, twoToken }`.
-   */
-  resolveTokensForRun: typeof resolveTokensForRun;
   makeOctokit: typeof makeOctokit;
-  resolveDestination: (
-    source: RepoRef,
-    resolvers: DestinationResolvers,
-  ) => Promise<{ owner: string; repo: string; isSandbox: boolean }>;
+  /** Pure destination choice (no token, no network) — spec §4.1. */
+  resolveDestinationChoice: typeof resolveDestinationChoice;
+  /** Verify push / create-if-missing for the destination — spec §7. */
+  verifyOrCreateDestination: typeof verifyOrCreateDestination;
+  /** Resolve the WRITE token via an injected accept predicate — spec §5. */
+  resolveWriteToken: typeof resolveWriteToken;
+  /** Resolve the READ token (single-PAT reuse / env / saved / paste) — spec §5. */
+  resolveReadToken: typeof resolveReadToken;
   verifyRepo: typeof verifyRepo;
   makeSandboxCreator: typeof makeSandboxCreator;
-  makeInteractivePrompt: () => (
-    choices: Parameters<ReturnType<typeof makeInteractivePrompt>>[0],
-  ) => Promise<DestinationSelection>;
+  makeMenuPrompt: typeof makeMenuPrompt;
+  makeSlugPrompt: typeof makeSlugPrompt;
+  makeRememberPrompt: typeof makeRememberPrompt;
   readConfig: typeof readConfig;
   getPullRequest: typeof getPullRequest;
   listPullRequestCommits: typeof listPullRequestCommits;
@@ -130,14 +124,16 @@ export interface RunBacktestDeps {
 
 /** Production wiring for {@link RunBacktestDeps} — the live, non-test path. */
 const defaultDeps: RunBacktestDeps = {
-  resolveToken,
-  computeTokenNeeds,
-  resolveTokensForRun,
   makeOctokit,
-  resolveDestination,
+  resolveDestinationChoice,
+  verifyOrCreateDestination,
+  resolveWriteToken,
+  resolveReadToken,
   verifyRepo,
   makeSandboxCreator,
-  makeInteractivePrompt,
+  makeMenuPrompt,
+  makeSlugPrompt,
+  makeRememberPrompt,
   readConfig,
   getPullRequest,
   listPullRequestCommits,
@@ -176,14 +172,10 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Case-insensitive owner equality (GitHub owners are case-insensitive). */
-function sameOwner(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase();
-}
-
 /**
- * Run a full backtest: read the PR, resolve the commit pair, confirm the plan,
- * then clone/fetch/push and open the simulated PR. Owns all exit codes.
+ * Run a full backtest: choose the destination, resolve the write + read tokens,
+ * read the PR, resolve the commit pair, confirm the plan, then clone/fetch/push
+ * and open the simulated PR. Owns all exit codes.
  */
 export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // 0. Wire the live activity trace. `setVerbose` flips the shared switch the
@@ -208,187 +200,150 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 1b. Validate conflicting destination flags BEFORE any network call. The
-  //     resolver also rejects this, but it runs after resolveToken(), so without
-  //     this fail-fast guard a both-flags invocation with a bad/missing token
-  //     would surface a token error and exit 2 instead of the bad-args exit 1
-  //     this conflict warrants.
+  // 2. Both-flags fast-fail BEFORE any network call (VAL-DEST-004). The choice
+  //    resolver also rejects this, but failing fast here keeps the error a clean
+  //    bad-args exit 1 with no token/network work attempted first.
   if (opts.primary === true && typeof opts.sandbox === "string") {
     error("Pass either --primary or --sandbox, not both.");
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 2. Resolve and validate a token, then build the Octokit instance. The token
-  //    is resolved BEFORE the destination because the resolver needs the Octokit
-  //    instance to verify (and possibly create) the destination repo.
-  let token: string;
-  let tokenSource: AuthResult["source"];
-  try {
-    const auth: AuthResult = await deps.resolveToken();
-    token = auth.token;
-    tokenSource = auth.source;
-  } catch (err) {
-    if (err instanceof NoTokenNonInteractiveError) {
-      error(messageOf(err));
-      process.exit(EXIT.BAD_ARGS);
-    }
-    // A rejected/invalid token surfaces here too — treat as an API/auth error.
-    error(messageOf(err));
-    process.exit(EXIT.API_ERROR);
-  }
-  // The token is already registered with the secret scrubber inside
-  // resolveToken (armed before the validation request), so it is scrubbed from
-  // all output for the rest of the run. This default token is the WRITE/default
-  // candidate; its Octokit drives RESOLUTION (the source-visibility probe below
-  // and the destination verify/create) — not the run's source read.
-  const defaultOctokit: Octokit = deps.makeOctokit(token);
-
-  // 2a. Source-visibility probe (RESOLUTION, not the run's source-read). Attempt
-  //     repos.get(source) with the DEFAULT token via `verifyRepo`, which now
-  //     reports the source repo's REAL `private` flag. `sourcePrivate` means
-  //     exactly "the source repo is private" — the value computeTokenNeeds
-  //     consumes.
-  //       - probe SUCCEEDS → trust the reported visibility: `sourcePrivate =
-  //         verification.private === true`. A genuinely PUBLIC source then takes
-  //         the anonymous source-read path (F2); a private source forces a read
-  //         purpose, resolving a scoped read token (GITHUB_SOURCE_TOKEN /
-  //         owner-scoped / guided paste).
-  //       - probe 404s (`exists: false` — repo not found / not visible to the
-  //         default token) → assume PRIVATE (`sourcePrivate = true`).
-  //     A non-404 / transient error from the probe is NOT collapsed into
-  //     "private": it surfaces as an API error (exit 2) so a healthy repo behind
-  //     a blip is never silently forced down the read-token path. Using the
-  //     default token HERE is allowed — this is resolution, not a run source-read.
-  let sourcePrivate: boolean;
-  try {
-    const verification = await deps.verifyRepo(defaultOctokit, owner, repo);
-    // exists:false means a 404 (not visible to the default token) → assume private.
-    sourcePrivate = verification.exists ? verification.private === true : true;
-  } catch (err) {
-    error(messageOf(err));
-    process.exit(EXIT.API_ERROR);
-  }
-
-  // 2b. Resolve where writes go. The source PR is always READ from `owner/repo`;
-  //     the destination is where the branches and simulated PR are CREATED. The
-  //     resolver verifies the destination (existence + write permission) before
-  //     any clone, and never writes the source — the source repo is only read.
-  //
-  //     Exit-code mapping (index.ts owns process.exit): a DestinationArgsError
-  //     (e.g. both --primary and --sandbox, or no destination non-interactively)
-  //     maps to exit 1; a DestinationApiError (404 / not-writable / failed
-  //     creation) maps to exit 2.
+  // 3. Resolve WHERE the backtest PR is written — a PURE local choice. No token,
+  //    no network. `isSandbox` is true only when the destination differs from
+  //    the source. A DestinationArgsError (both flags / no dest non-TTY) → exit 1.
+  const isTTY = process.stdin.isTTY === true;
   let destOwner: string;
   let destRepo: string;
   let isSandbox: boolean;
-  const destTrace = traceOp("Verified destination");
   try {
-    const resolved = await deps.resolveDestination(
+    const choiceResolvers: ChoiceResolvers = {
+      getFlags: () => ({
+        primary: opts.primary,
+        sandbox: opts.sandbox,
+        createSandbox: opts.createSandbox,
+      }),
+      getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+      getIsTTY: () => isTTY,
+      prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
+      promptForSlug: deps.makeSlugPrompt(),
+      promptRemember: deps.makeRememberPrompt(),
+    };
+    const choice = await deps.resolveDestinationChoice(
       { owner, repo },
-      {
-        getFlags: () => ({
-          primary: opts.primary,
-          sandbox: opts.sandbox,
-          createSandbox: opts.createSandbox,
-        }),
-        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
-        getIsTTY: () => process.stdin.isTTY === true,
-        // Destination verify/create + the authenticated-login lookup are
-        // RESOLUTION steps that decide WHERE writes go; they run on the default
-        // token's Octokit. The per-owner WRITE Octokit is built below from the
-        // resolved write token and used for the actual destination run calls
-        // (findExistingPr / createPullRequest).
-        verifyDestination: (vOwner, vRepo) =>
-          deps.verifyRepo(defaultOctokit, vOwner, vRepo),
-        createSandbox: deps.makeSandboxCreator(defaultOctokit),
-        prompt: deps.makeInteractivePrompt(),
-        getAuthenticatedLogin: async () =>
-          (await defaultOctokit.users.getAuthenticated()).data.login,
-      },
+      choiceResolvers,
     );
-    destOwner = resolved.owner;
-    destRepo = resolved.repo;
-    isSandbox = resolved.isSandbox;
+    destOwner = choice.owner;
+    destRepo = choice.repo;
+    isSandbox = choice.isSandbox;
   } catch (err) {
-    destTrace.fail();
     if (err instanceof DestinationArgsError) {
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
     }
+    throw err;
+  }
+
+  // 4. Resolve the WRITE token AND verify/create the destination together. The
+  //    write token's `accept` predicate wraps verifyOrCreateDestination so a
+  //    candidate that cannot write (or cannot create) the destination falls
+  //    through to the next candidate / re-prompt; the first ACCEPTED token both
+  //    covers the destination and (in Primary) reads+writes the source. This is
+  //    the only place the destination is verified — it runs BEFORE any
+  //    clone/push (VAL-TOKEN-006).
+  //
+  //    Exit mapping: a terminal NoTokenNonInteractiveError (names GITHUB_TOKEN)
+  //    → exit 1; a terminal DestinationApiError (not-writable / can't-create
+  //    non-interactively) → exit 2.
+  const dest: RepoRef = { owner: destOwner, repo: destRepo };
+  let writeToken: string;
+  let verifiedDest: RepoRef = dest;
+  const destTrace = traceOp("Verified destination");
+  try {
+    const accept: AcceptToken = async (octokit) => {
+      try {
+        verifiedDest = await deps.verifyOrCreateDestination(dest, {
+          isSandbox,
+          verifyDestination: (vOwner, vRepo) =>
+            deps.verifyRepo(octokit as Octokit, vOwner, vRepo),
+          createSandbox: deps.makeSandboxCreator(octokit as Octokit),
+          createFlag: opts.createSandbox === true,
+          isTTY,
+        });
+        return true;
+      } catch (err) {
+        // A DestinationApiError means this candidate cannot write/create the
+        // destination — reject it so the next candidate / paste is tried. Any
+        // other error (e.g. a genuine API/network failure) is rethrown so it is
+        // not silently swallowed as "wrong token".
+        if (err instanceof DestinationApiError) {
+          return false;
+        }
+        throw err;
+      }
+    };
+    const resolved = await deps.resolveWriteToken({
+      destination: dest,
+      isPrimary: !isSandbox,
+      accept,
+    });
+    writeToken = resolved.token;
+  } catch (err) {
+    destTrace.fail();
+    if (err instanceof NoTokenNonInteractiveError) {
+      // Names GITHUB_TOKEN — no destination-write token, non-interactive (exit 1).
+      error(messageOf(err));
+      process.exit(EXIT.BAD_ARGS);
+    }
     if (err instanceof DestinationApiError) {
+      // Not-writable / can't-create destination, terminal (exit 2).
       error(messageOf(err));
       process.exit(EXIT.API_ERROR);
     }
-    throw err;
+    error(messageOf(err));
+    process.exit(EXIT.API_ERROR);
   }
-  destTrace.done(redactedRepoRef(destOwner, destRepo));
+  destTrace.done(redactedRepoRef(verifiedDest.owner, verifiedDest.repo));
+  destOwner = verifiedDest.owner;
+  destRepo = verifiedDest.repo;
 
-  // 2c. Resolve a token PER PURPOSE and route each run operation by the owner it
-  //     touches (spec §10). `computeTokenNeeds` turns source/destination/source-
-  //     visibility into the required purposes; `resolveTokensForRun` resolves a
-  //     token for each (collapsing to ONE when a single token covers both — the
-  //     common case, byte-for-byte unchanged from today). The WRITE purpose's
-  //     candidate is the already-resolved default token; the READ purpose
-  //     resolves via GITHUB_SOURCE_TOKEN / owner-scoped saved / the default token
-  //     (when it passed the source probe) / a guided read-only paste.
-  //
-  //     A non-interactive run that needs a read token it cannot resolve throws
-  //     NoTokenNonInteractiveError HERE — before any clone/push/create — so no
-  //     write side effect occurs (maps to exit 1, matching the no-token mapping).
-  const purposes = deps.computeTokenNeeds({
-    source: { owner, repo },
-    destination: { owner: destOwner, repo: destRepo },
-    sourcePrivate,
-  });
-  let runTokens: RunTokens;
+  // 5. Resolve the READ token. Reuses the write token IFF it reads the source
+  //    (single-PAT); else GITHUB_SOURCE_TOKEN / saved sourceToken / paste. A
+  //    missing source-read token non-interactively → exit 1 naming
+  //    GITHUB_SOURCE_TOKEN, BEFORE any write side effect (VAL-TOKEN-005/008).
+  let readToken: string;
   try {
-    runTokens = await deps.resolveTokensForRun({
-      purposes,
-      makeOctokit: deps.makeOctokit,
-      // The write purpose's default candidate is the already-resolved default
-      // token — reuse it directly so the gh-CLI / paste prompt never re-fires.
-      // Thread the REAL token source (env/config/gh/paste) computed by
-      // resolveToken instead of fabricating "classic". `fromPaste` stays false:
-      // this default token is already persisted as the primary token.
-      getDefaultToken: async () => ({ token, source: tokenSource, fromPaste: false }),
+    const resolved = await deps.resolveReadToken({
+      source: { owner, repo },
+      writeToken,
     });
+    readToken = resolved.token;
   } catch (err) {
+    if (err instanceof NoSourceTokenNonInteractiveError) {
+      error(messageOf(err));
+      process.exit(EXIT.BAD_ARGS);
+    }
     if (err instanceof NoTokenNonInteractiveError) {
-      // Missing read token, non-interactive: exit 1 before any write side effect.
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
     }
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
   }
+  const twoToken = readToken !== writeToken;
 
-  // A PUBLIC cross-owner source is read ANONYMOUSLY (no token). For such a run
-  // computeTokenNeeds returns a single WRITE purpose, so the resolved read token
-  // collapses to the write token — but that write token may be a fine-grained PAT
-  // scoped only to the destination owner, which 404s a public repo in another
-  // org. Reading the public source with NO credential is strictly safer and
-  // always works. Same-owner runs (incl. public same-owner) keep the one-token
-  // path: the source is read with the same credential, exactly as today. Private
-  // sources always use the resolved read token/Octokit (unchanged).
-  const sourcePublicCrossOwner =
-    sourcePrivate === false && !sameOwner(owner, destOwner);
+  // 6. Build the per-owner Octokit instances (VAL-ROUTE-001). When the read and
+  //    write tokens are IDENTICAL, construct exactly ONE instance and use it for
+  //    both — observable behavior identical to a one-token run. When they differ,
+  //    source reads use `readOctokit` and destination calls use `writeOctokit`;
+  //    neither token ever crosses to the other's operations. There is NO
+  //    anonymous (empty-token) Octokit.
+  const writeOctokit: Octokit = deps.makeOctokit(writeToken);
+  const readOctokit: Octokit = twoToken
+    ? deps.makeOctokit(readToken)
+    : writeOctokit;
 
-  // Build the per-owner Octokit instances. When the read and write tokens are
-  // IDENTICAL, construct exactly ONE instance and use it for both — observable
-  // behavior identical to a one-token run today (VAL-ROUTE-003). When they
-  // differ, source reads use `readOctokit` and destination calls use
-  // `writeOctokit`; neither token ever crosses to the other's operations
-  // (INV-READTOKEN-NOWRITE / INV-WRITETOKEN-PURPOSE). For a public cross-owner
-  // source the source reads run through an ANONYMOUS Octokit (empty token →
-  // makeOctokit sends no Authorization header).
-  const writeOctokit: Octokit = deps.makeOctokit(runTokens.writeToken);
-  const readOctokit: Octokit = sourcePublicCrossOwner
-    ? deps.makeOctokit("")
-    : runTokens.twoToken
-      ? deps.makeOctokit(runTokens.readToken)
-      : writeOctokit;
-
-  // 3. Fetch the PR and its commits. Any GitHub/API error maps to exit 2.
+  // 7. Read the PR and its commits via the READ Octokit. Any GitHub/API error
+  //    maps to exit 2.
   let prTitle: string;
   let prAuthor: string;
   let prCommits: Awaited<ReturnType<typeof listPullRequestCommits>>;
@@ -405,10 +360,10 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   readTrace.done(`"${prTitle}"`);
 
-  // 4. Resolve the target commit and its base (first parent). An invalid
+  // 8. Resolve the target commit and its base (first parent). An invalid
   //    --commit value is a bad-args failure (exit 1). Pre-fetch the parent via
-  //    GitHub only when the listed commit carries no parent of its own, so the
-  //    synchronous `resolveBase` callback never needs to do network I/O.
+  //    GitHub (READ Octokit) only when the listed commit carries no parent of
+  //    its own, so the synchronous `resolveBase` callback never does I/O.
   let targetSha: string;
   let baseSha: string;
   try {
@@ -424,13 +379,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 5. Branch names follow the backtest-pr<N>-{head,base} convention.
-  const headBranch = `backtest-pr${number}-head`;
-  const baseBranch = `backtest-pr${number}-base`;
+  // 9. Branch names include the SHORT SHA of the target commit (VAL-BRANCH-001),
+  //    so the (PR, commit) pair is the backtest identity: the same PR at
+  //    different commits produces distinct branches (no collision).
+  const sha = shortSha(targetSha);
+  const headBranch = `backtest-pr${number}-${sha}-head`;
+  const baseBranch = `backtest-pr${number}-${sha}-base`;
 
-  // 6. Pre-flight: bail out if a backtest PR already exists for these branches.
-  //    Query `all` states so a closed or merged prior backtest PR is caught here,
-  //    before any clone/fetch/push — not only after the post-create 422 backstop.
+  // 10. Open-only dedup pre-flight (VAL-BRANCH-003). Query OPEN PRs only: if an
+  //     OPEN backtest PR already exists for these branches, print its bare URL to
+  //     stdout, the two-line actionable message to stderr, and exit 4. A CLOSED
+  //     prior PR no longer blocks — that is the behavior change.
   let existingUrl: string | null;
   try {
     existingUrl = await deps.findExistingPr(
@@ -439,19 +398,25 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       destRepo,
       headBranch,
       baseBranch,
-      "all",
+      "open",
     );
   } catch (err) {
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
   }
   if (existingUrl) {
-    info("A backtest PR already exists for these branches:");
     process.stdout.write(existingUrl + "\n");
+    error(
+      `A backtest for ${owner}/${repo}#${number} at commit ${sha} already exists: ${existingUrl}`,
+    );
+    error(
+      "To recreate it, close that PR and re-run (the branch names include the commit SHA).",
+    );
     process.exit(EXIT.EXISTING_PR);
   }
 
-  // 7. Show the plan and confirm (unless -y). A decline is a clean exit 0.
+  // 11. Show the plan and confirm (unless -y). A decline is a clean exit 0. The
+  //     plan's two-token annotation is driven off the run's resolved token count.
   const targetLabel = opts.commit === "initial" ? "initial commit" : "selected commit";
   const planInput: PlanInput = {
     ownerRepo: `${owner}/${repo}`,
@@ -464,10 +429,9 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     headBranch,
     baseBranch,
     targetRepo: `${destOwner}/${destRepo}`,
-    // Drive the plan's two-token annotation off the run's resolved token count
-    // (spec §11). True only when the read and write tokens are distinct strings;
-    // the boolean is all the plan needs — no token value crosses this boundary.
-    twoToken: runTokens.twoToken,
+    // True only when the read and write tokens are distinct strings; the boolean
+    // is all the plan needs — no token value crosses this boundary.
+    twoToken,
   };
   const proceed = await deps.confirmPlan(planInput, { yes: opts.yes });
   if (!proceed) {
@@ -475,40 +439,34 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.SUCCESS);
   }
 
-  // 8. Clone, fetch the two commits, push them as branches, open the PR.
-  //    The temp clone is always removed via the `finally` block (plus the
-  //    process-exit safety net registered below).
+  // 12. Clone, fetch the two commits, push them as branches, open the PR — with
+  //     per-op token routing (spec §9). The temp clone is always removed via the
+  //     `finally` block (plus the process-exit safety net registered below).
   const tmpDir = deps.makeTempDir();
   deps.registerCleanup(tmpDir);
 
+  // 12a. Clone, fetch the two commits, push them as branches. A git failure
+  //      (clone/fetch/push, including an unfetchable commit) maps to exit 3. The
+  //      create call is handled separately (12b) so its 422/API mapping is not
+  //      collapsed into the git-failure exit.
   let prUrl: string | null = null;
   try {
-    // Per-owner git credential routing (spec §10):
+    // Per-op git credential routing (spec §9):
     //  - clone (origin = destination) authenticates with the WRITE token;
     //  - the `source`-remote fetch (sandbox mode) authenticates with the READ
     //    token, supplied per-op so it never becomes the push credential;
     //  - push (origin = destination) re-asserts the WRITE token per-op so a
     //    prior source fetch's read-token override can never authenticate it.
     // The token reaches git ONLY via the askpass env — never logged, in a URL,
-    // or on the command line. clone/fetch/push each narrate their own ✓ from
-    // git.ts, so index.ts adds no `step("Cloning …")` line of its own.
-    const git = await deps.cloneRepo(destOwner, destRepo, runTokens.writeToken, tmpDir);
+    // or on the command line. clone/fetch/push each narrate their own ✓.
+    const git = await deps.cloneRepo(destOwner, destRepo, writeToken, tmpDir);
 
-    // In sandbox mode the commits live in the PR's repo, not the sandbox —
-    // fetch them from a `source` remote. Otherwise origin (the clone) already
-    // has them and authenticates with the WRITE token.
+    // In sandbox mode the commits live in the PR's repo, not the sandbox — fetch
+    // them from a `source` remote with the READ token. Otherwise origin (the
+    // clone) already has them and authenticates with the WRITE token. There is
+    // NO anonymous "" path.
     const commitRemote = isSandbox ? "source" : "origin";
-    // Per-op git credential routing:
-    //  - origin fetch (one-token / same-owner path): the WRITE token.
-    //  - source fetch, PRIVATE source: the resolved READ token.
-    //  - source fetch, PUBLIC cross-owner source: NO token ("" → anonymous
-    //    https fetch), strictly safer and immune to a destination-scoped PAT
-    //    404ing the public source.
-    const fetchToken = !isSandbox
-      ? runTokens.writeToken
-      : sourcePublicCrossOwner
-        ? ""
-        : runTokens.readToken;
+    const fetchToken = isSandbox ? readToken : writeToken;
     if (isSandbox) {
       await deps.addSourceRemote(git, owner, repo);
     }
@@ -519,73 +477,75 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     } catch (err) {
       if (err instanceof UnfetchableCommitError) {
         error(err.message);
+        deps.cleanup(tmpDir);
         process.exit(EXIT.GIT_FAILURE);
       }
       throw err;
     }
 
-    await deps.pushBranchFromSha(git, baseSha, baseBranch, runTokens.writeToken);
-    await deps.pushBranchFromSha(git, targetSha, headBranch, runTokens.writeToken);
-
-    // Open-PR has no git-layer trace, so narrate its ✓ completion here.
-    const openTrace = traceOp("Opened backtest PR");
-    const body = [
-      `Backtest of ${owner}/${repo}#${number} at \`${targetSha}\`.`,
-      "",
-      `Recreated by [pr-backtest](${PROJECT_URL}) so a PR-review bot can ` +
-        `review the code as it existed at the target commit.`,
-    ].join("\n");
-    try {
-      prUrl = await deps.createPullRequest(
-        writeOctokit,
-        destOwner,
-        destRepo,
-        headBranch,
-        baseBranch,
-        `[backtest] ${prTitle}`,
-        body,
-      );
-    } catch (err) {
-      openTrace.fail();
-      // A 422 here means a backtest PR for these branches already exists (e.g.
-      // a closed/merged one the open-only pre-flight didn't catch). Surface its
-      // URL and the documented existing-PR exit code rather than a git failure.
-      if (isHttpStatus(err, 422)) {
-        const existingUrl = await deps
-          .findExistingPr(
-            writeOctokit,
-            destOwner,
-            destRepo,
-            headBranch,
-            baseBranch,
-            "all",
-          )
-          .catch(() => null);
-        deps.cleanup(tmpDir);
-        if (existingUrl) {
-          info("A backtest PR already exists for these branches:");
-          process.stdout.write(existingUrl + "\n");
-          process.exit(EXIT.EXISTING_PR);
-        }
-        // 422 without a matching PR (e.g. no diff between the two commits).
-        error(
-          "GitHub rejected the PR: there may be no difference between the " +
-            "target commit and its parent for these branches.",
-        );
-        process.exit(EXIT.API_ERROR);
-      }
-      throw err;
-    }
-    openTrace.done();
+    await deps.pushBranchFromSha(git, baseSha, baseBranch, writeToken);
+    await deps.pushBranchFromSha(git, targetSha, headBranch, writeToken);
   } catch (err) {
     error(messageOf(err));
     deps.cleanup(tmpDir);
     process.exit(EXIT.GIT_FAILURE);
-  } finally {
-    deps.cleanup(tmpDir);
   }
 
-  // 9. Success: the PR URL is the final line on stdout (pipe-friendly).
+  // 12b. Open the PR. A 422 backstop (VAL-BRANCH-004) recovers a raced OPEN PR
+  //      (exit 4) or reports a no-diff (exit 2); any other API error → exit 2.
+  //      Open-PR has no git-layer trace, so narrate its ✓ completion here.
+  const openTrace = traceOp("Opened backtest PR");
+  const body = [
+    `Backtest of ${owner}/${repo}#${number} at \`${targetSha}\`.`,
+    "",
+    `Recreated by [pr-backtest](${PROJECT_URL}) so a PR-review bot can ` +
+      `review the code as it existed at the target commit.`,
+  ].join("\n");
+  try {
+    prUrl = await deps.createPullRequest(
+      writeOctokit,
+      destOwner,
+      destRepo,
+      headBranch,
+      baseBranch,
+      `[backtest] ${prTitle}`,
+      body,
+    );
+  } catch (err) {
+    openTrace.fail();
+    deps.cleanup(tmpDir);
+    // A 422 here means a backtest PR for these branches already exists (a race
+    // the open-only pre-flight didn't catch). Re-query the SAME branches: a
+    // matching OPEN PR surfaces its URL + exit 4; otherwise exit 2 (no-diff).
+    if (isHttpStatus(err, 422)) {
+      const racedUrl = await deps
+        .findExistingPr(writeOctokit, destOwner, destRepo, headBranch, baseBranch, "open")
+        .catch(() => null);
+      if (racedUrl) {
+        process.stdout.write(racedUrl + "\n");
+        error(
+          `A backtest for ${owner}/${repo}#${number} at commit ${sha} already exists: ${racedUrl}`,
+        );
+        error(
+          "To recreate it, close that PR and re-run (the branch names include the commit SHA).",
+        );
+        process.exit(EXIT.EXISTING_PR);
+      }
+      // 422 without a matching PR (e.g. no diff between the two commits).
+      error(
+        "GitHub rejected the PR: there may be no difference between the " +
+          "target commit and its parent for these branches.",
+      );
+      process.exit(EXIT.API_ERROR);
+    }
+    // Any other create failure is an API error (exit 2), not a git failure.
+    error(messageOf(err));
+    process.exit(EXIT.API_ERROR);
+  }
+  openTrace.done();
+  deps.cleanup(tmpDir);
+
+  // 13. Success: the PR URL is the final line on stdout (pipe-friendly).
   success("Backtest PR created.");
   process.stdout.write(prUrl + "\n");
   process.exit(EXIT.SUCCESS);
