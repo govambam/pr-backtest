@@ -1,439 +1,127 @@
 /**
- * Token resolution: env -> config file -> gh CLI -> interactive prompt.
+ * Reactive two-capability token resolver (spec §5).
  *
- * SECURITY: the token value is never logged, printed, or written anywhere
- * except the 0600 config file. It is never included in error messages.
+ * A backtest needs exactly two capabilities — READ the source and WRITE the
+ * destination. The tool does not predict the token shape from owners; it derives
+ * the need from the user's destination choice and resolves a token per capability
+ * in a fixed precedence order, accepting the first candidate that VALIDATES:
+ *
+ *   write:  GITHUB_TOKEN env -> saved destinationToken -> interactive paste
+ *   read:   GITHUB_SOURCE_TOKEN env -> saved sourceToken
+ *           -> the already-resolved write token IFF it reads the source (single-PAT)
+ *           -> interactive paste
+ *
+ * Validation is the cheap, pre-write `repos.get` the tool already runs:
+ *   read valid  <=> repos.get(source) succeeds.
+ *   write valid <=> repos.get(dest).permissions.push === true.
+ * A freshly pasted token is additionally validated via users.getAuthenticated to
+ * capture its `@login`.
+ *
+ * SECURITY (spec §9): each token is registered with the secret scrubber the
+ * instant it is resolved, BEFORE any network request with it. The token never
+ * appears in logs, errors, or output; it reaches GitHub only through an Octokit.
  */
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
 import { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 
 import {
   mergeConfig,
   readConfig,
-  writeConfig,
   type Config,
+  type TokenSlot,
   type TokenSource,
 } from "./config.js";
 import { isHttpStatus, makeOctokit } from "./github.js";
-import { info, registerSecret, step, success, warn } from "./log.js";
+import { info, registerSecret, success } from "./log.js";
 
-const execFileAsync = promisify(execFile);
-
-/** A token plus where it came from (before validation). */
-export interface ResolvedTokenSource {
-  token: string;
-  source: TokenSource;
-  /** Whether this token came from a fresh paste and should be persisted. */
-  fromPaste: boolean;
-}
+/** The pre-fillable fine-grained-PAT creation URL, shown in every guided paste. */
+export const PAT_CREATE_URL =
+  "https://github.com/settings/personal-access-tokens/new";
 
 /**
- * Thrown when no token can be resolved and stdin is not a TTY, so the tool
- * cannot prompt. The caller (index.ts) maps this to exit code 1 with setup
- * guidance.
+ * How many times a guided interactive paste is re-prompted when the pasted token
+ * fails its validation (read can't read the source / write can't write the
+ * destination). A fat-fingered or wrong-scope paste re-prompts rather than
+ * falling straight through to a hard {@link NoTokenNonInteractiveError}. Off-TTY
+ * paste getters return null on the first call, so the loop exits at once.
+ */
+const PASTE_MAX_ATTEMPTS = 3;
+
+/**
+ * Thrown when no DESTINATION/write token can be resolved and stdin is not a TTY,
+ * so the tool cannot prompt. The message names `GITHUB_TOKEN`. The caller
+ * (index.ts) maps this to exit code 1 with setup guidance.
  */
 export class NoTokenNonInteractiveError extends Error {
   readonly kind = "no-token-non-interactive" as const;
   constructor() {
     super(
-      "No GitHub token configured and stdin is not a TTY. " +
-        "Set GITHUB_TOKEN, run `pr-backtest <pr-url>` in an interactive terminal " +
-        "to configure one (it can reuse your `gh` login), or see the setup " +
-        "instructions in the README.",
+      "No GitHub write token configured and stdin is not a TTY. Set GITHUB_TOKEN " +
+        "to a token that can write the destination, run `pr-backtest <pr-url>` in " +
+        "an interactive terminal to configure one, or see the README setup " +
+        "instructions.",
     );
     this.name = "NoTokenNonInteractiveError";
   }
 }
 
 /**
- * Thrown when a cross-owner run against a PRIVATE source has no covering READ
- * token and stdin is not a TTY (so the tool cannot prompt for one). The message
- * names `GITHUB_SOURCE_TOKEN` explicitly (spec §5.2 / VAL-TOKEN-005). The caller
- * (index.ts) maps this to exit code 1 BEFORE any destination Octokit or git
- * child is constructed, so no write side effect occurs. Extends
- * {@link NoTokenNonInteractiveError} so existing exit-1 mapping keeps working.
+ * Thrown when no READ token can read the source and stdin is not a TTY (so the
+ * tool cannot prompt). The message names `GITHUB_SOURCE_TOKEN` explicitly (spec
+ * §4.4 / VAL-TOKEN-005). The caller maps it to exit code 1 BEFORE any write side
+ * effect occurs. Extends {@link NoTokenNonInteractiveError} so existing exit-1
+ * mapping keeps working.
  */
 export class NoSourceTokenNonInteractiveError extends NoTokenNonInteractiveError {
   constructor(owner: string, repo: string) {
     super();
     this.message =
-      `No read token can read the private source ${owner}/${repo}, and stdin is ` +
-      `not a TTY. Set GITHUB_SOURCE_TOKEN to a fine-grained token with Contents: ` +
-      `Read and Pull requests: Read on ${owner}/${repo} (read-only — it needs no ` +
-      `write access anywhere), or run in an interactive terminal to paste one.`;
+      `No token can read the source ${owner}/${repo}, and stdin is not a TTY. ` +
+      `Set GITHUB_SOURCE_TOKEN to a token with Contents: Read and Pull requests: ` +
+      `Read on ${owner}/${repo} (read-only — it needs no write access anywhere), ` +
+      `or run in an interactive terminal to paste one.`;
     this.name = "NoSourceTokenNonInteractiveError";
   }
 }
 
-/**
- * The two access capabilities a backtest run can require (spec §4):
- * - `read`  — read the PR + fetch its commits from the SOURCE owner/repo.
- * - `write` — clone, push branches, open the PR (and create the repo) on the
- *   DESTINATION owner/repo.
- */
-export type TokenPurposeKind = "read" | "write";
-
-/**
- * One required token capability, named by the owner/repo it acts on. This
- * carries owners/repos and visibility intent only — never a token value.
- */
-export interface TokenPurpose {
-  kind: TokenPurposeKind;
-  owner: string;
-  repo: string;
-  /**
-   * True only for a `read` purpose whose source is public, i.e. the source
-   * read may be performed anonymously. Such a purpose is informational and is
-   * NOT part of the required set. Omitted (undefined) for every required
-   * purpose. See {@link computeTokenNeeds}.
-   */
-  optional?: boolean;
-}
-
-/**
- * Input to {@link computeTokenNeeds}. Owners are compared case-insensitively
- * (GitHub owners are case-insensitive), matching `sameRepo` in destination.ts.
- *
- * The "self-owned source" / "new personal sandbox under @login" case (spec
- * §12.3, VAL-NEED-004) is expressed purely as `destination.owner === source.owner`:
- * the caller resolving a personal sandbox sets the destination owner to the
- * authenticated login, so when that login equals the source owner the two
- * owners simply match and the same-owner rule applies. No separate
- * `authenticatedLogin` argument is needed here — keeping this function a pure
- * function of owners + visibility.
- */
-export interface TokenNeedsInput {
-  source: { owner: string; repo: string };
-  destination: { owner: string; repo: string };
-  /** True when the source repo is private. False = public source. */
-  sourcePrivate: boolean;
-}
-
-/** Case-insensitive owner equality, matching `sameRepo` in src/destination.ts. */
-function sameOwner(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase();
-}
-
-/**
- * PURE token-needs rule (spec §4). Given the source repo, the destination repo,
- * and the source's visibility, return the set of token *purposes* the run
- * requires. No network, no token values, no resolution, no probing.
- *
- * Rules (owners compared case-insensitively):
- * - destination owner == source owner (Primary, org sandbox, self-owned source)
- *   → a SINGLE `write` purpose on the shared owner. One token covers read+write
- *   on one owner, so we model it as one purpose (its `kind` is `write` because a
- *   write-capable token on an owner can also read that owner). (VAL-NEED-001,
- *   VAL-NEED-004.)
- * - destination owner != source owner AND source private → TWO purposes:
- *   `read` on the source and `write` on the destination. (VAL-NEED-002.)
- * - destination owner != source owner AND source public → a SINGLE `write`
- *   purpose on the destination; the source read is anonymous. An additional
- *   `read` purpose flagged `optional: true` is appended so callers can surface
- *   the anonymous source read, but the REQUIRED set (entries without
- *   `optional`) is exactly the one write purpose. (VAL-NEED-003.)
- *
- * The required purposes are always the entries with `optional` undefined.
- */
-export function computeTokenNeeds(input: TokenNeedsInput): TokenPurpose[] {
-  const { source, destination, sourcePrivate } = input;
-
-  // Same owner (incl. self-owned source / personal sandbox under @login):
-  // one token covers both halves. Return exactly one purpose.
-  if (sameOwner(destination.owner, source.owner)) {
-    return [{ kind: "write", owner: destination.owner, repo: destination.repo }];
-  }
-
-  // Cross-owner. Write on the destination is always required.
-  const write: TokenPurpose = {
-    kind: "write",
-    owner: destination.owner,
-    repo: destination.repo,
-  };
-
-  if (sourcePrivate) {
-    // Private source needs a real READ token on the source owner.
-    return [{ kind: "read", owner: source.owner, repo: source.repo }, write];
-  }
-
-  // Public source: the only REQUIRED purpose is the destination write. The
-  // anonymous source read is appended as an optional, non-required entry.
-  return [
-    write,
-    { kind: "read", owner: source.owner, repo: source.repo, optional: true },
-  ];
-}
-
 /** Infer the token source from its prefix. */
 function inferPasteSource(token: string): TokenSource {
-  // github_pat_ => fine-grained PAT; ghp_ => classic PAT.
+  // github_pat_ => fine-grained PAT; ghp_ (and everything else) => classic PAT.
   return token.startsWith("github_pat_") ? "fine-grained" : "classic";
 }
 
-/** Getters injected into the resolution-order function (testability). */
-export interface TokenResolvers {
-  /** Read GITHUB_TOKEN (or equivalent) from the environment. */
-  getEnvToken: () => string | undefined;
-  /** Read the persisted config file. */
-  getConfig: () => Config | null;
-  /** Resolve a token from gh CLI, prompting the user first. Null if declined/unavailable. */
-  getGhToken: () => Promise<string | null>;
-  /** Prompt the user to paste a token interactively. Null if no TTY / aborted. */
-  getInteractiveToken: () => Promise<string | null>;
+/**
+ * A repo coordinate (`owner`/`repo`). Carries no token value — only the location
+ * a capability acts on.
+ */
+export interface RepoRef {
+  owner: string;
+  repo: string;
 }
 
 /**
- * Pure-ish resolution order (first match wins). No network, no validation.
- * Exported for deterministic precedence testing.
- *
- * Throws {@link NoTokenNonInteractiveError} when nothing resolves and there is
- * no interactive path.
+ * The minimal Octokit surface the capability checks + paste validation need:
+ * read a repo (read/write checks) and the authenticated user (paste @login
+ * capture). This is the seam `makeOctokit` satisfies; tests inject a fake of this
+ * shape so resolution runs with no network.
  */
-export async function resolveTokenSource(
-  resolvers: TokenResolvers,
-): Promise<ResolvedTokenSource> {
-  // 1. GITHUB_TOKEN env var.
-  const envToken = resolvers.getEnvToken();
-  if (envToken && envToken.length > 0) {
-    return { token: envToken, source: inferPasteSource(envToken), fromPaste: false };
-  }
+export type ResolverOctokit = Pick<Octokit, "repos" | "users">;
 
-  // 2. Config file.
-  const cfg = resolvers.getConfig();
-  if (cfg && cfg.token && cfg.token.length > 0) {
-    // readConfig only sets `token` alongside a valid `source`, but `source` is
-    // now optionally typed; fall back to the paste heuristic to stay typed.
-    const source = cfg.source ?? inferPasteSource(cfg.token);
-    return { token: cfg.token, source, fromPaste: false };
-  }
-
-  // 3. gh CLI (offered for reuse, prompted before use).
-  const ghToken = await resolvers.getGhToken();
-  if (ghToken && ghToken.length > 0) {
-    return { token: ghToken, source: "gh-cli", fromPaste: false };
-  }
-
-  // 4. Interactive paste.
-  const pasted = await resolvers.getInteractiveToken();
-  if (pasted && pasted.length > 0) {
-    return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
-  }
-
-  throw new NoTokenNonInteractiveError();
-}
-
-/** Check whether `gh` is installed and authenticated, returning its username. */
-async function ghStatus(): Promise<string | null> {
-  try {
-    // `gh auth status` exits non-zero when not authenticated.
-    const { stderr, stdout } = await execFileAsync("gh", ["auth", "status"]);
-    const text = stdout + stderr;
-    const match = text.match(/account\s+(\S+)|Logged in to [^ ]+ as (\S+)/i);
-    return match ? (match[1] ?? match[2] ?? "your account") : "your account";
-  } catch {
-    return null;
-  }
-}
-
-/** Default gh resolver: detect gh, prompt the user, then run `gh auth token`. */
-async function defaultGetGhToken(): Promise<string | null> {
-  if (!process.stdin.isTTY) {
-    return null;
-  }
-  const username = await ghStatus();
-  if (username === null) {
-    return null;
-  }
-
-  info("");
-  info(`I see you have \`gh\` CLI installed and authenticated as ${username}.`);
-  const { reuse } = await prompts({
-    type: "confirm",
-    name: "reuse",
-    message: "Use that token?",
-    initial: true,
-  });
-  if (!reuse) {
-    return null;
-  }
-
-  try {
-    const { stdout } = await execFileAsync("gh", ["auth", "token"]);
-    const token = stdout.trim();
-    return token.length > 0 ? token : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Default interactive resolver: print PAT guidance, then a masked paste prompt. */
-async function defaultGetInteractiveToken(): Promise<string | null> {
-  if (!process.stdin.isTTY) {
-    return null;
-  }
-
-  info("");
-  info("pr-backtest needs a GitHub token with these permissions on the repo it writes to:");
-  info("  • Contents:      Read & write   (push backtest branches)");
-  info("  • Pull requests: Read & write   (read PR data, open the simulated PR)");
-  info("  • Metadata:      Read           (required for all tokens)");
-  info("");
-  info("Recommended: create a fine-grained token scoped to just the repo(s) you need:");
-  info("  https://github.com/settings/personal-access-tokens/new");
-  info("");
-  info(
-    "Landing in a separate sandbox? You may be prompted for a second, read-only " +
-      "source token — see the README / GITHUB_SOURCE_TOKEN.",
-  );
-  info("");
-
-  const { token } = await prompts({
-    type: "password",
-    name: "token",
-    message: "Paste your token:",
-  });
-
-  if (typeof token !== "string") {
-    return null;
-  }
-  const trimmed = token.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-/** The validated, ready-to-use result returned to callers. */
-export interface AuthResult {
-  token: string;
-  /**
-   * Where the token came from (env / config / gh CLI / paste), as computed by
-   * {@link resolveTokenSource}. Threaded through so callers can reuse the REAL
-   * provenance instead of fabricating one (e.g. when this default token becomes
-   * the WRITE-purpose candidate in {@link resolveTokensForRun}).
-   */
-  source: TokenSource;
-}
-
-/** Options for {@link resolveToken} (primarily for testing / injection). */
-export interface ResolveTokenOptions {
-  resolvers?: Partial<TokenResolvers>;
-  /** Factory for an Octokit instance; injected in tests. */
-  makeOctokit?: (token: string) => Pick<Octokit, "users">;
-}
+/** Factory that builds an Octokit from a token. Injectable for tests. */
+export type MakeOctokit = (token: string) => ResolverOctokit;
 
 /**
- * Resolve, validate, and (if freshly pasted) persist a GitHub token.
- *
- * Resolution order: GITHUB_TOKEN env -> config file -> gh CLI (with prompt)
- * -> interactive masked paste. Validates via `octokit.users.getAuthenticated()`
- * and surfaces the username. Throws {@link NoTokenNonInteractiveError} when no
- * token is available and stdin is not a TTY.
+ * READ capability check (spec §5). `repos.get(source)` succeeding with the
+ * candidate's Octokit means it can read the source. BOTH 403 and 404 are treated
+ * as not-readable; any other error is rethrown (it is not a capability signal).
+ * Never takes a raw token — the candidate reaches GitHub only via the Octokit.
  */
-export async function resolveToken(
-  options: ResolveTokenOptions = {},
-): Promise<AuthResult> {
-  const resolvers: TokenResolvers = {
-    getEnvToken: () => process.env.GITHUB_TOKEN,
-    getConfig: () => readConfig(),
-    getGhToken: defaultGetGhToken,
-    getInteractiveToken: defaultGetInteractiveToken,
-    ...options.resolvers,
-  };
-
-  const resolved = await resolveTokenSource(resolvers);
-
-  // Arm the secret scrubber the instant a token is resolved, before any network
-  // request is issued. This keeps the redaction net active for the entire
-  // authenticated lifetime — including the validation request below.
-  registerSecret(resolved.token);
-
-  // Validate the token by calling the authenticated-user endpoint. The default
-  // path routes through the shared `makeOctokit` factory so the `GET /user`
-  // validation call is traced and carries the `pr-backtest` userAgent.
-  // `options.makeOctokit` is the test-injection seam, preserved.
-  const octokit = options.makeOctokit
-    ? options.makeOctokit(resolved.token)
-    : makeOctokit(resolved.token);
-
-  step("Validating token...");
-  let login: string;
-  try {
-    const { data } = await octokit.users.getAuthenticated();
-    login = data.login;
-  } catch {
-    // Never include the token in the error.
-    throw new Error(
-      "GitHub rejected the token. Check that it is valid and has not expired, " +
-        "then try again (or `pr-backtest logout` to clear a saved token).",
-    );
-  }
-
-  success(`Authenticated as @${login}`);
-
-  // Persist only freshly pasted tokens.
-  if (resolved.fromPaste) {
-    writeConfig({ token: resolved.token, username: login, source: resolved.source });
-    success(`Token saved (mode 0600).`);
-  }
-
-  return { token: resolved.token, source: resolved.source };
-}
-
-// ---------------------------------------------------------------------------
-// Purpose-aware resolution (spec §6/§7, two-token model).
-//
-// Token resolution generalizes from "one token" to "a token PER PURPOSE". For
-// each REQUIRED purpose (from computeTokenNeeds) we resolve a token using a
-// fixed precedence order, accepting a candidate only if it passes that
-// purpose's capability PROBE; otherwise we fall through to the next source.
-//
-// One token may satisfy both purposes (the common case): when the existing
-// default token passes both the read-source and write-destination probes, both
-// purposes resolve to it and NO second token is requested. That keeps every
-// existing one-token path (Primary, same-owner sandbox, public source,
-// `--sandbox` same-owner) byte-for-byte unchanged — there is exactly one
-// REQUIRED purpose, resolved from the default token, with no extra prompt.
-//
-// Security: EACH resolved token is registered with the secret scrubber the
-// instant it is resolved, before any network request issued with it. The probe
-// itself takes an Octokit (never a raw token in a logged path).
-// ---------------------------------------------------------------------------
-
-/** The pre-fillable fine-grained-PAT creation URL, shown in every guided paste. */
-const PAT_CREATE_URL = "https://github.com/settings/personal-access-tokens/new";
-
-/**
- * How many times a guided interactive paste is re-prompted when the pasted
- * token fails its capability probe (read can't read the source / write can't
- * write the destination). Mirrors `promptForSlug`'s loop-on-error pattern in
- * destination.ts: a fat-fingered or wrong-scope paste should re-prompt rather
- * than fall straight through to a hard {@link NoTokenNonInteractiveError}.
- * Non-TTY paths never enter the loop (the paste getter returns null at once).
- */
-const PASTE_MAX_ATTEMPTS = 3;
-
-/**
- * The minimal Octokit surface the probes + paste validation need: read a repo
- * (the read-source probe) and the authenticated user (paste validation). This
- * is the seam `makeOctokit` satisfies; tests inject a fake of this shape.
- */
-export type ProbeOctokit = Pick<Octokit, "repos" | "users">;
-
-/**
- * READ-source capability probe (spec §7.1, VAL-PROBE-001). Issues
- * `repos.get(sourceOwner, sourceRepo)` on the CANDIDATE token's own Octokit.
- * BOTH a 403 and a 404 are interpreted as not-readable; any other error is
- * rethrown (it is not a capability signal). Never takes a raw token — the
- * candidate token reaches GitHub only through the injected Octokit.
- */
-export async function probeReadSource(
-  octokit: ProbeOctokit,
-  owner: string,
-  repo: string,
+export async function canRead(
+  octokit: ResolverOctokit,
+  source: RepoRef,
 ): Promise<boolean> {
   try {
-    await octokit.repos.get({ owner, repo });
+    await octokit.repos.get({ owner: source.owner, repo: source.repo });
     return true;
   } catch (err: unknown) {
     if (isHttpStatus(err, 403) || isHttpStatus(err, 404)) {
@@ -444,467 +132,375 @@ export async function probeReadSource(
 }
 
 /**
- * A capability probe for a candidate token, given the Octokit built from it.
- * Returns true when the token covers the purpose. For a `read` purpose this is
- * {@link probeReadSource}; for a `write` purpose the existing default token is
- * already trusted as the write credential (write probing is a later feature),
- * so the write probe defaults to "passes". The probe is an injected seam so
- * precedence + probe-gating are testable with no network.
+ * WRITE capability check for an EXISTING destination (spec §5/§7). The token can
+ * write iff `repos.get(dest).permissions.push === true`. A 403/404 (repo missing
+ * or not visible) is treated as not-writable; any other error is rethrown.
+ *
+ * IMPORTANT: this checks an EXISTING repo only. When the destination is a sandbox
+ * to be created, `repos.get(dest)` 404s and this returns false — the orchestration
+ * feature (destination.ts) owns the create-then-reprobe path. Never takes a raw
+ * token — the candidate reaches GitHub only via the Octokit.
  */
-export type CapabilityProbe = (
-  octokit: ProbeOctokit,
-  purpose: TokenPurpose,
-) => Promise<boolean>;
-
-/**
- * Default capability probe: a `read` purpose runs the read-source probe on the
- * candidate's Octokit; a `write` purpose is accepted (the write-destination
- * probe + post-create re-check belong to the menu-and-create-routing feature,
- * which verifies the destination separately via `verifyRepo`).
- */
-export const defaultCapabilityProbe: CapabilityProbe = async (octokit, purpose) => {
-  if (purpose.kind === "read") {
-    return probeReadSource(octokit, purpose.owner, purpose.repo);
-  }
-  return true;
-};
-
-/**
- * A candidate token under consideration for a purpose, before its probe runs.
- * `fromPaste` marks a freshly pasted token that should be offered for
- * owner-scoped persistence on a passing probe (mirrors {@link ResolvedTokenSource}).
- */
-interface PurposeCandidate {
-  token: string;
-  source: TokenSource;
-  fromPaste: boolean;
-}
-
-/**
- * Per-purpose injected getters (mirror {@link TokenResolvers}). Each returns a
- * candidate token string (or null to skip). The resolver tries them in the
- * fixed order below and accepts the FIRST candidate that passes the purpose's
- * probe. No network, no TTY here — everything is injected.
- */
-export interface PurposeResolvers {
-  /** (1) The purpose-specific env var: GITHUB_SOURCE_TOKEN (read) / GITHUB_TOKEN (write). */
-  getPurposeEnvToken: () => string | undefined;
-  /** (2) An owner-scoped saved token (Config.tokens[]) for this purpose's owner. */
-  getOwnerScopedToken: () => string | undefined;
-  /** (3) The existing default token (env GITHUB_TOKEN / config token / gh CLI). */
-  getDefaultToken: () => Promise<PurposeCandidate | null>;
-  /** (4) Interactive guided paste for this purpose (TTY only). Null off-TTY / aborted. */
-  getInteractivePaste: () => Promise<string | null>;
-}
-
-/** The token resolved for one purpose, plus its provenance. */
-export interface ResolvedPurposeToken {
-  token: string;
-  source: TokenSource;
-  /** True only when this token came from a fresh paste (offer to persist). */
-  fromPaste: boolean;
-  /** Which precedence step produced the accepted token (for tracing/tests). */
-  via: "purpose-env" | "owner-scoped" | "default" | "paste";
-}
-
-/**
- * Build the candidate from a probe seam: build the candidate's Octokit, run the
- * purpose probe against it, and return whether it passed. The Octokit factory is
- * injected so a test sees exactly which token built the probed instance
- * (VAL-PROBE-001).
- */
-async function candidatePasses(
-  token: string,
-  purpose: TokenPurpose,
-  makeProbeOctokit: (token: string) => ProbeOctokit,
-  probe: CapabilityProbe,
+export async function canWrite(
+  octokit: ResolverOctokit,
+  dest: RepoRef,
 ): Promise<boolean> {
-  const octokit = makeProbeOctokit(token);
-  return probe(octokit, purpose);
+  try {
+    const { data } = await octokit.repos.get({ owner: dest.owner, repo: dest.repo });
+    return data.permissions?.push === true;
+  } catch (err: unknown) {
+    if (isHttpStatus(err, 403) || isHttpStatus(err, 404)) {
+      return false;
+    }
+    throw err;
+  }
+}
+
+/** Validate a token against a capability (read source / write dest). */
+async function validates(
+  octokit: ResolverOctokit,
+  capability: "read" | "write",
+  source: RepoRef,
+  destination: RepoRef,
+): Promise<boolean> {
+  return capability === "read"
+    ? canRead(octokit, source)
+    : canWrite(octokit, destination);
 }
 
 /**
- * PURE-ish per-purpose resolution (spec §6). Tries, in fixed order:
- *   (1) purpose-specific env var
- *   (2) owner-scoped saved token for this owner
- *   (3) the existing default token
- *   (4) interactive guided paste (TTY only)
- * and returns the FIRST candidate that PASSES this purpose's probe. A candidate
- * that fails the probe is skipped; resolution falls through to the next step.
- *
- * Registers each candidate with the secret scrubber the instant it is read,
- * BEFORE the probe issues its first network request with that candidate
- * (INV-TOKEN, VAL-INV-003). Throws {@link NoTokenNonInteractiveError} when no
- * covering candidate exists and there is no interactive path.
- *
- * No network or TTY of its own — the probe and the getters are injected.
+ * The per-capability tokens a run needs, returned to the orchestrator. They may
+ * be the SAME string (Primary, or single-PAT Sandbox), in which case `twoToken`
+ * is false and the orchestrator builds a single Octokit.
  */
-export async function resolvePurposeToken(
-  purpose: TokenPurpose,
-  resolvers: PurposeResolvers,
-  makeProbeOctokit: (token: string) => ProbeOctokit,
-  probe: CapabilityProbe = defaultCapabilityProbe,
-): Promise<ResolvedPurposeToken> {
-  // (1) purpose-specific env var.
-  const envToken = resolvers.getPurposeEnvToken();
-  if (envToken && envToken.length > 0) {
-    registerSecret(envToken);
-    if (await candidatePasses(envToken, purpose, makeProbeOctokit, probe)) {
-      return {
-        token: envToken,
-        source: inferPasteSource(envToken),
-        fromPaste: false,
-        via: "purpose-env",
-      };
-    }
-  }
+export interface RunTokens {
+  /** Authenticates source reads + the source-remote fetch. */
+  readToken: string;
+  /** Authenticates clone/push/create/open-PR on the destination. */
+  writeToken: string;
+  /** True only when the read and write tokens are distinct strings. */
+  twoToken: boolean;
+}
 
-  // (2) owner-scoped saved token.
-  const ownerToken = resolvers.getOwnerScopedToken();
-  if (ownerToken && ownerToken.length > 0) {
-    registerSecret(ownerToken);
-    if (await candidatePasses(ownerToken, purpose, makeProbeOctokit, probe)) {
-      return {
-        token: ownerToken,
-        source: inferPasteSource(ownerToken),
-        fromPaste: false,
-        via: "owner-scoped",
-      };
-    }
-  }
-
-  // (3) the existing default token.
-  const def = await resolvers.getDefaultToken();
-  if (def && def.token.length > 0) {
-    registerSecret(def.token);
-    if (await candidatePasses(def.token, purpose, makeProbeOctokit, probe)) {
-      return { token: def.token, source: def.source, fromPaste: def.fromPaste, via: "default" };
-    }
-  }
-
-  // (4) interactive guided paste — bounded retry loop. On a TTY, a pasted token
-  // that fails the probe RE-PROMPTS (up to PASTE_MAX_ATTEMPTS) rather than
-  // throwing straight away (matches promptForSlug's loop). Off-TTY the getter
-  // returns null on the first call, so the loop exits immediately and we throw
-  // the clear non-interactive error unchanged.
-  for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
-    const pasted = await resolvers.getInteractivePaste();
-    if (!pasted || pasted.length === 0) {
-      break; // no paste (off-TTY / aborted) → give up with the clear error.
-    }
-    registerSecret(pasted);
-    if (await candidatePasses(pasted, purpose, makeProbeOctokit, probe)) {
-      return {
-        token: pasted,
-        source: inferPasteSource(pasted),
-        fromPaste: true,
-        via: "paste",
-      };
-    }
-    // Failed the probe: tell the user what went wrong, then loop to re-prompt.
-    if (attempt < PASTE_MAX_ATTEMPTS - 1) {
-      warn(
-        purpose.kind === "read"
-          ? `That token cannot read ${purpose.owner}/${purpose.repo}. ` +
-              "Check it has Contents: Read + Pull requests: Read on that repo, then try again."
-          : `That token cannot write ${purpose.owner}/${purpose.repo}. ` +
-              "Check it has Contents + Pull requests: Read & write on that owner, then try again.",
-      );
-    }
-  }
-
-  throw new NoTokenNonInteractiveError();
+/** A resolved candidate token plus its provenance (pre-persistence). */
+interface Candidate {
+  token: string;
+  source: TokenSource;
+  /** True only when this token came from a fresh interactive paste. */
+  fromPaste: boolean;
 }
 
 /**
- * Guided interactive paste for a READ/source purpose (spec §7.2, VAL-TOKEN-006).
- * The copy states the token is READ-ONLY, scoped to the source repo, and needs
- * NO write access anywhere. Returns the trimmed paste, or null off-TTY / aborted.
+ * Injected getters for {@link resolveRunTokens} (mirror the existing
+ * test-injection style). Every seam is overridable so tests drive resolution with
+ * no network and no TTY; defaults wire the real env/config/paste paths.
  */
-export async function defaultGetReadPaste(
-  purpose: TokenPurpose,
+export interface ResolveRunTokensOptions {
+  /** The source repo (read capability target). */
+  source: RepoRef;
+  /** The destination repo (write capability target). */
+  destination: RepoRef;
+  /**
+   * True for a Primary run (destination === source). Chooses the Primary
+   * read+write prompt copy over the Sandbox two-step copy. This is a LOCAL
+   * destination fact (NOT owner logic).
+   */
+  isPrimary: boolean;
+  /** Octokit factory; injected in tests. Defaults to {@link makeOctokit}. */
+  makeOctokit?: MakeOctokit;
+  /** Read GITHUB_TOKEN (write env). Defaults to the process env. */
+  getWriteEnvToken?: () => string | undefined;
+  /** Read GITHUB_SOURCE_TOKEN (read env). Defaults to the process env. */
+  getSourceEnvToken?: () => string | undefined;
+  /** Read the persisted config (for the saved slots). Defaults to {@link readConfig}. */
+  getConfig?: () => Config | null;
+  /** Persist a slot update. Defaults to {@link mergeConfig}. */
+  saveConfig?: (update: Partial<Config>) => void;
+  /** Interactive paste for the Primary read+write source token. TTY-only; null off-TTY. */
+  getPrimaryPaste?: (source: RepoRef) => Promise<string | null>;
+  /** Interactive paste for the Sandbox read-only source token (#1). TTY-only; null off-TTY. */
+  getSandboxReadPaste?: (source: RepoRef) => Promise<string | null>;
+  /** Interactive paste for the Sandbox write destination token (#2). TTY-only; null off-TTY. */
+  getSandboxWritePaste?: (destination: RepoRef) => Promise<string | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Default interactive paste getters (spec §4.2 / §4.3, VAL-TOKEN-010).
+// Each prints the precise scope guidance, then a masked paste prompt. None ever
+// echoes the token value. Off-TTY each returns null immediately (one attempt).
+// ---------------------------------------------------------------------------
+
+/** Masked paste prompt; trims and returns the value, or null off-TTY / aborted. */
+async function maskedPaste(message: string): Promise<string | null> {
+  const { token } = await prompts({ type: "password", name: "token", message });
+  if (typeof token !== "string") {
+    return null;
+  }
+  const trimmed = token.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Primary prompt: a single token with READ + WRITE on the source (spec §4.2). */
+async function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
+  if (!process.stdin.isTTY) {
+    return null;
+  }
+  info("");
+  info(
+    `pr-backtest needs a token with read + write on the source ` +
+      `${source.owner}/${source.repo}:`,
+  );
+  info("  • Contents:      Read & write   (push backtest branches)");
+  info("  • Pull requests: Read & write   (read the PR, open the simulated PR)");
+  info("  • Metadata:      Read           (required for all tokens)");
+  info("");
+  info(`Create a fine-grained token scoped to ${source.owner}/${source.repo}:`);
+  info(`  ${PAT_CREATE_URL}`);
+  info("");
+  return maskedPaste("Paste your token:");
+}
+
+/** Sandbox token #1: a READ-ONLY source token is enough (spec §4.3). */
+async function defaultGetSandboxReadPaste(
+  source: RepoRef,
 ): Promise<string | null> {
   if (!process.stdin.isTTY) {
     return null;
   }
   info("");
   info(
-    `pr-backtest needs a READ-ONLY token scoped to the source repo ` +
-      `${purpose.owner}/${purpose.repo}:`,
+    `pr-backtest needs a token that can read the source ` +
+      `${source.owner}/${source.repo} — a read-only token is enough:`,
   );
   info("  • Contents:      Read   (fetch the PR's commits)");
   info("  • Pull requests: Read   (read the PR)");
   info("  • Metadata:      Read   (required for all tokens)");
   info("");
   info(`This token is read-only and needs no write access anywhere.`);
-  info(
-    `Create a fine-grained token on ${purpose.owner}, repository access limited to ` +
-      `${purpose.owner}/${purpose.repo}:`,
-  );
+  info(`Create a fine-grained token scoped to ${source.owner}/${source.repo}:`);
   info(`  ${PAT_CREATE_URL}`);
   info("");
-
-  const { token } = await prompts({
-    type: "password",
-    name: "token",
-    message: "Paste your read-only source token:",
-  });
-  if (typeof token !== "string") {
-    return null;
-  }
-  const trimmed = token.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  return maskedPaste("Paste your read-only source token:");
 }
 
-/**
- * Guided interactive paste for a WRITE/destination purpose (spec §7.2,
- * VAL-TOKEN-006). The copy states Contents + Pull requests WRITE on the
- * destination owner. Returns the trimmed paste, or null off-TTY / aborted.
- */
-export async function defaultGetWritePaste(
-  purpose: TokenPurpose,
+/** Sandbox token #2: a WRITE token on the destination (spec §4.3). */
+async function defaultGetSandboxWritePaste(
+  destination: RepoRef,
 ): Promise<string | null> {
   if (!process.stdin.isTTY) {
     return null;
   }
   info("");
   info(
-    `pr-backtest needs a WRITE token on the destination owner ${purpose.owner} ` +
-      `(${purpose.owner}/${purpose.repo}):`,
+    `pr-backtest needs a token with write on the destination ` +
+      `${destination.owner}/${destination.repo}:`,
   );
   info("  • Contents:      Read & write   (push backtest branches)");
   info("  • Pull requests: Read & write   (open the simulated PR)");
   info("  • Metadata:      Read           (required for all tokens)");
   info("");
-  info(
-    `For a new sandbox under your personal account, choose All repositories ` +
-      `(so the not-yet-created repo is covered) and add Administration: Read & ` +
-      `write (needed to create the repo).`,
-  );
-  info(`Create a fine-grained token on ${purpose.owner}:`);
+  info(`Create a fine-grained token scoped to ${destination.owner}/${destination.repo}:`);
   info(`  ${PAT_CREATE_URL}`);
   info("");
+  return maskedPaste("Paste your destination write token:");
+}
 
-  const { token } = await prompts({
-    type: "password",
-    name: "token",
-    message: "Paste your destination write token:",
-  });
-  if (typeof token !== "string") {
+/**
+ * Validate a freshly pasted token via `users.getAuthenticated` to capture its
+ * `@login` (stored as the slot's `username`). The scrubber is already armed; the
+ * error never includes the token.
+ */
+async function captureLogin(octokit: ResolverOctokit): Promise<string> {
+  try {
+    const { data } = await octokit.users.getAuthenticated();
+    return data.login;
+  } catch {
+    throw new Error(
+      "GitHub rejected the pasted token. Check that it is valid and has not " +
+        "expired, then try again.",
+    );
+  }
+}
+
+/**
+ * Resolve one capability through its fixed precedence. `candidates` are the
+ * non-interactive sources in order (env, saved slot, optional write-reuse); each
+ * is tried and accepted on the first that validates. If none validate, the
+ * bounded interactive paste loop runs (TTY only). Each candidate is registered
+ * with the scrubber the instant it is read, BEFORE its first request.
+ *
+ * Returns the resolved token plus whether it came from a fresh paste (so the
+ * caller can persist + capture @login). Throws when nothing validates and there
+ * is no interactive path — the caller maps to the right non-interactive error.
+ */
+async function resolveCapability(
+  capability: "read" | "write",
+  candidates: Array<Candidate | null>,
+  getPaste: () => Promise<string | null>,
+  make: MakeOctokit,
+  source: RepoRef,
+  destination: RepoRef,
+): Promise<Candidate> {
+  for (const candidate of candidates) {
+    if (!candidate || candidate.token.length === 0) {
+      continue;
+    }
+    registerSecret(candidate.token);
+    const octokit = make(candidate.token);
+    if (await validates(octokit, capability, source, destination)) {
+      return candidate;
+    }
+  }
+
+  // Bounded interactive paste loop. Off-TTY the getter returns null on the first
+  // call, so the loop exits immediately and the caller throws the clear error.
+  for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
+    const pasted = await getPaste();
+    if (!pasted || pasted.length === 0) {
+      break;
+    }
+    registerSecret(pasted);
+    const octokit = make(pasted);
+    if (await validates(octokit, capability, source, destination)) {
+      return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
+    }
+    if (attempt < PASTE_MAX_ATTEMPTS - 1) {
+      info(
+        capability === "read"
+          ? `That token cannot read ${source.owner}/${source.repo}. Check it has ` +
+              "Contents: Read + Pull requests: Read on that repo, then try again."
+          : `That token cannot write ${destination.owner}/${destination.repo}. ` +
+              "Check it has Contents + Pull requests: Read & write on that repo, then try again.",
+      );
+    }
+  }
+
+  // Exhausted with no validating token and no interactive path.
+  throw capability === "read"
+    ? new NoSourceTokenNonInteractiveError(source.owner, source.repo)
+    : new NoTokenNonInteractiveError();
+}
+
+/** Look up a saved slot as a non-paste candidate (null when absent). */
+function slotCandidate(slot: TokenSlot | undefined): Candidate | null {
+  if (!slot || slot.token.length === 0) {
     return null;
   }
-  const trimmed = token.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  return { token: slot.token, source: slot.source, fromPaste: false };
+}
+
+/** Wrap a raw env-var value as a non-paste candidate (null when unset/empty). */
+function envCandidate(value: string | undefined): Candidate | null {
+  if (!value || value.length === 0) {
+    return null;
+  }
+  return { token: value, source: inferPasteSource(value), fromPaste: false };
 }
 
 /**
- * The per-purpose tokens a run needs, returned to the caller (`runBacktest`).
- * `readToken` authenticates source reads + the source-remote fetch; `writeToken`
- * authenticates clone/push/create/open-PR. They may be the SAME string (the
- * common one-token case), in which case `twoToken` is false and the routing
- * feature builds a single Octokit.
- */
-export interface RunTokens {
-  readToken: string;
-  writeToken: string;
-  /** True only when the read and write tokens are distinct strings. */
-  twoToken: boolean;
-}
-
-/** Options for {@link resolveTokensForRun} (injection seams for testing). */
-export interface ResolveTokensForRunOptions {
-  /** The REQUIRED purposes for the run (from {@link computeTokenNeeds}; entries with `optional` are ignored). */
-  purposes: TokenPurpose[];
-  /** Factory for the probe/validation Octokit; injected in tests. Defaults to {@link makeOctokit}. */
-  makeOctokit?: (token: string) => ProbeOctokit;
-  /** The capability probe; injected in tests. Defaults to {@link defaultCapabilityProbe}. */
-  probe?: CapabilityProbe;
-  /** Override the default-token candidate resolver (env/config/gh/paste). */
-  getDefaultToken?: () => Promise<PurposeCandidate | null>;
-  /** Read GITHUB_SOURCE_TOKEN. Defaults to the process env. */
-  getSourceEnvToken?: () => string | undefined;
-  /** Read GITHUB_TOKEN. Defaults to the process env. */
-  getWriteEnvToken?: () => string | undefined;
-  /** Read the persisted config (for owner-scoped tokens). Defaults to {@link readConfig}. */
-  getConfig?: () => Config | null;
-  /** Interactive guided paste for a READ purpose. Defaults to {@link defaultGetReadPaste}. */
-  getReadPaste?: (purpose: TokenPurpose) => Promise<string | null>;
-  /** Interactive guided paste for a WRITE purpose. Defaults to {@link defaultGetWritePaste}. */
-  getWritePaste?: (purpose: TokenPurpose) => Promise<string | null>;
-  /** Persist an owner-scoped token (offered after a passing fresh paste). Defaults to {@link mergeConfig}. */
-  saveOwnerToken?: (update: Partial<Config>) => void;
-  /** Confirm whether to persist a freshly pasted owner-scoped token. Defaults to a TTY confirm prompt. */
-  confirmSave?: (purpose: TokenPurpose) => Promise<boolean>;
-}
-
-/** The single default-token candidate resolver, reused for every purpose. */
-function makeDefaultTokenResolver(
-  options: ResolveTokensForRunOptions,
-): () => Promise<PurposeCandidate | null> {
-  if (options.getDefaultToken) {
-    return options.getDefaultToken;
-  }
-  // Memoize so the gh-CLI / paste prompt fires at most once across purposes.
-  let cached: PurposeCandidate | null | undefined;
-  return async () => {
-    if (cached !== undefined) {
-      return cached;
-    }
-    try {
-      const resolved = await resolveTokenSource({
-        getEnvToken: options.getWriteEnvToken ?? (() => process.env.GITHUB_TOKEN),
-        getConfig: options.getConfig ?? (() => readConfig()),
-        getGhToken: defaultGetGhToken,
-        getInteractiveToken: defaultGetInteractiveToken,
-      });
-      cached = {
-        token: resolved.token,
-        source: resolved.source,
-        fromPaste: resolved.fromPaste,
-      };
-    } catch (err) {
-      if (err instanceof NoTokenNonInteractiveError) {
-        cached = null;
-      } else {
-        throw err;
-      }
-    }
-    return cached;
-  };
-}
-
-/** Look up an owner-scoped saved token for a purpose's owner (case-insensitive). */
-function ownerScopedTokenFor(
-  cfg: Config | null,
-  owner: string,
-): string | undefined {
-  const entry = cfg?.tokens?.find(
-    (t) => t.owner.toLowerCase() === owner.toLowerCase(),
-  );
-  return entry?.token;
-}
-
-/** Default TTY confirm for persisting a freshly pasted owner-scoped token. */
-async function defaultConfirmSave(purpose: TokenPurpose): Promise<boolean> {
-  if (!process.stdin.isTTY) {
-    return false;
-  }
-  const { save } = await prompts({
-    type: "confirm",
-    name: "save",
-    message: `Save this token for ${purpose.owner} so future runs reuse it?`,
-    initial: true,
-  });
-  return save === true;
-}
-
-/**
- * Resolve a token for EVERY required purpose (spec §6). Returns the per-purpose
- * tokens the routing feature consumes ({@link RunTokens}). When a single token
- * covers both purposes (the common case) `readToken === writeToken` and
- * `twoToken` is false — identical to today's one-token behavior, no extra
- * prompt.
+ * Resolve a token per capability (spec §5) and return the run's read/write
+ * tokens. This is the single entry the orchestrator (index.ts) calls for the
+ * common existing-repo path.
  *
- * For each REQUIRED purpose, runs {@link resolvePurposeToken} with the fixed
- * precedence (purpose-env → owner-scoped → default → guided paste), gating each
- * candidate on the purpose's probe. A freshly pasted token that passes its probe
- * is validated via `users.getAuthenticated` and offered for owner-scoped
- * persistence (VAL-TOKEN-007). Each resolved token is registered with the secret
- * scrubber before its first request (done inside {@link resolvePurposeToken}).
+ * Write precedence: GITHUB_TOKEN env -> saved destinationToken -> interactive
+ * paste. Read precedence: GITHUB_SOURCE_TOKEN env -> saved sourceToken -> the
+ * already-resolved write token IFF it reads the source (single-PAT detection) ->
+ * interactive paste.
  *
- * Throws {@link NoTokenNonInteractiveError} when a REQUIRED purpose has no
- * covering candidate and no interactive path — the caller maps it to exit 1
- * (for the read case the message names `GITHUB_SOURCE_TOKEN`).
+ * Single-PAT detection (spec §4.3): the write token is re-offered as the read
+ * candidate; when it reads the source it fills both slots and NO read prompt is
+ * shown. `twoToken = (readToken !== writeToken)`.
+ *
+ * Persistence: a freshly pasted write token persists to `destinationToken`; a
+ * freshly pasted read token to `sourceToken` — each via the injected
+ * `saveConfig`, storing `{ token, username: @login, source }`. In the single-PAT
+ * case the same value already fills both slots (the write paste persists it; the
+ * read reuse needs no second write).
+ *
+ * Each token is registered with the secret scrubber before its first request.
+ * Throws {@link NoTokenNonInteractiveError} (write) or
+ * {@link NoSourceTokenNonInteractiveError} (read) when a capability cannot be
+ * covered and there is no interactive path.
  */
-export async function resolveTokensForRun(
-  options: ResolveTokensForRunOptions,
+export async function resolveRunTokens(
+  options: ResolveRunTokensOptions,
 ): Promise<RunTokens> {
-  const makeProbeOctokit = options.makeOctokit ?? makeOctokit;
-  const probe = options.probe ?? defaultCapabilityProbe;
-  const getConfig = options.getConfig ?? (() => readConfig());
-  const getSourceEnv =
-    options.getSourceEnvToken ?? (() => process.env.GITHUB_SOURCE_TOKEN);
+  const { source, destination, isPrimary } = options;
+  const make = options.makeOctokit ?? makeOctokit;
   const getWriteEnv =
     options.getWriteEnvToken ?? (() => process.env.GITHUB_TOKEN);
-  const getReadPaste = options.getReadPaste ?? defaultGetReadPaste;
-  const getWritePaste = options.getWritePaste ?? defaultGetWritePaste;
-  const saveOwnerToken = options.saveOwnerToken ?? mergeConfig;
-  const confirmSave = options.confirmSave ?? defaultConfirmSave;
-  const getDefaultToken = makeDefaultTokenResolver(options);
+  const getSourceEnv =
+    options.getSourceEnvToken ?? (() => process.env.GITHUB_SOURCE_TOKEN);
+  const getConfig = options.getConfig ?? (() => readConfig());
+  const saveConfig = options.saveConfig ?? mergeConfig;
+  const getPrimaryPaste = options.getPrimaryPaste ?? defaultGetPrimaryPaste;
+  const getSandboxReadPaste =
+    options.getSandboxReadPaste ?? defaultGetSandboxReadPaste;
+  const getSandboxWritePaste =
+    options.getSandboxWritePaste ?? defaultGetSandboxWritePaste;
 
-  const required = options.purposes.filter((p) => p.optional !== true);
+  const cfg = getConfig();
 
-  let readToken: string | undefined;
-  let writeToken: string | undefined;
+  // ----- WRITE capability: GITHUB_TOKEN -> saved destinationToken -> paste -----
+  // For Primary the destination IS the source, so the single paste is framed as
+  // read+write on the source; for Sandbox it is framed as write on the dest.
+  const writePaste = isPrimary
+    ? () => getPrimaryPaste(source)
+    : () => getSandboxWritePaste(destination);
 
-  for (const purpose of required) {
-    const isRead = purpose.kind === "read";
-    const resolvers: PurposeResolvers = {
-      getPurposeEnvToken: () => (isRead ? getSourceEnv() : getWriteEnv()),
-      getOwnerScopedToken: () => ownerScopedTokenFor(getConfig(), purpose.owner),
-      getDefaultToken,
-      getInteractivePaste: () =>
-        isRead ? getReadPaste(purpose) : getWritePaste(purpose),
-    };
+  const write = await resolveCapability(
+    "write",
+    [envCandidate(getWriteEnv()), slotCandidate(cfg?.destinationToken)],
+    writePaste,
+    make,
+    source,
+    destination,
+  );
 
-    let resolved: ResolvedPurposeToken;
-    try {
-      resolved = await resolvePurposeToken(purpose, resolvers, makeProbeOctokit, probe);
-    } catch (err) {
-      if (err instanceof NoTokenNonInteractiveError && isRead) {
-        // Read-specific guidance names GITHUB_SOURCE_TOKEN (VAL-TOKEN-005).
-        throw new NoSourceTokenNonInteractiveError(purpose.owner, purpose.repo);
-      }
-      throw err;
-    }
-
-    // A freshly pasted token: validate via users.getAuthenticated, then offer
-    // owner-scoped persistence (VAL-TOKEN-007). The scrubber is already armed.
-    if (resolved.fromPaste) {
-      const octokit = makeProbeOctokit(resolved.token);
-      let login: string;
-      try {
-        const { data } = await octokit.users.getAuthenticated();
-        login = data.login;
-      } catch {
-        throw new Error(
-          "GitHub rejected the pasted token. Check that it is valid and has not " +
-            "expired, then try again.",
-        );
-      }
-      success(`Authenticated as @${login}`);
-      if (await confirmSave(purpose)) {
-        saveOwnerToken({
-          tokens: [
-            {
-              owner: purpose.owner,
-              token: resolved.token,
-              source: resolved.source,
-              username: login,
-            },
-          ],
-        });
-        success(`Token saved for ${purpose.owner} (mode 0600).`);
-      }
-    }
-
-    if (isRead) {
-      readToken = resolved.token;
-    } else {
-      writeToken = resolved.token;
-    }
+  if (write.fromPaste) {
+    const login = await captureLogin(make(write.token));
+    success(`Authenticated as @${login}`);
+    saveConfig({
+      destinationToken: { token: write.token, username: login, source: write.source },
+    });
+    success(`Token saved (mode 0600).`);
   }
 
-  // Same-owner / public-source single-write runs have exactly one (write)
-  // purpose; the read token is then the same as the write token (the source is
-  // read with the same credential, exactly as today). When there is no write
-  // purpose (cannot happen — write is always required), fall back symmetrically.
-  const write = writeToken ?? readToken;
-  const read = readToken ?? writeToken;
-  if (write === undefined || read === undefined) {
-    // Defensive: required always contains at least the write purpose.
-    throw new NoTokenNonInteractiveError();
+  // ----- READ capability: GITHUB_SOURCE_TOKEN -> saved sourceToken -----
+  // -----   -> the resolved write token IFF it reads the source -> paste -----
+  // The write token is offered as a (non-paste) read candidate AFTER the env and
+  // saved slot: single-PAT detection. When it validates, no read prompt fires.
+  const writeReuse: Candidate = {
+    token: write.token,
+    source: write.source,
+    fromPaste: false,
+  };
+
+  const read = await resolveCapability(
+    "read",
+    [
+      envCandidate(getSourceEnv()),
+      slotCandidate(cfg?.sourceToken),
+      writeReuse,
+    ],
+    () => getSandboxReadPaste(source),
+    make,
+    source,
+    destination,
+  );
+
+  if (read.fromPaste) {
+    const login = await captureLogin(make(read.token));
+    success(`Authenticated as @${login}`);
+    saveConfig({
+      sourceToken: { token: read.token, username: login, source: read.source },
+    });
+    success(`Token saved (mode 0600).`);
   }
 
-  return { readToken: read, writeToken: write, twoToken: read !== write };
+  return {
+    readToken: read.token,
+    writeToken: write.token,
+    twoToken: read.token !== write.token,
+  };
 }
