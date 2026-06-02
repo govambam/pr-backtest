@@ -23,6 +23,8 @@
 import type { Octokit } from "@octokit/rest";
 
 import {
+  defaultGetSandboxReadPaste,
+  defaultGetSandboxWritePaste,
   NoSourceTokenNonInteractiveError,
   NoTokenNonInteractiveError,
   resolveReadToken,
@@ -50,19 +52,32 @@ import {
   makeOctokit,
   verifyRepo,
 } from "./github.js";
-import { readConfig, type RepoRef } from "./config.js";
+import { readConfig, type RepoRef, type TokenSource } from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
+  PrimaryFallbackDeclinedError,
   makeConfirmCreate,
   makeMenuPrompt,
+  makePrimaryFallbackPrompt,
   makeRememberPrompt,
   makeSandboxCreator,
   makeSlugPrompt,
   resolveDestinationChoice,
+  sameRepo,
   verifyOrCreateDestination,
   type ChoiceResolvers,
 } from "./destination.js";
+import {
+  makeAuthOfferPrompt,
+  makeDetectInherited,
+  makeLandingChoicePrompt,
+  makeLandInSourcePrompt,
+  makeSandboxNamePrompt,
+  resolveAuthFirstChoice,
+  type AuthFirstResolvers,
+} from "./authFirst.js";
+import type { InheritedCredential } from "./inheritedAuth.js";
 import { error, info, setVerbose, success, traceOp } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
@@ -93,8 +108,29 @@ const EXIT = {
  */
 export interface RunBacktestDeps {
   makeOctokit: typeof makeOctokit;
-  /** Pure destination choice (no token, no network). */
+  /** Pure destination choice (no token, no network) — flag + non-TTY paths. */
   resolveDestinationChoice: typeof resolveDestinationChoice;
+  /**
+   * Interactive (TTY, no-flag) auth-first choice. Returns the
+   * destination AND, on the inherited fork, the detected credential to pass to
+   * the resolvers. Only the interactive no-flag path uses this; flag + non-TTY
+   * paths stay on {@link resolveDestinationChoice}.
+   */
+  resolveAuthFirstChoice: typeof resolveAuthFirstChoice;
+  /** Detect the inherited credential (TTY only) — auth-offer detection seam. */
+  detectInheritedCredential: () => Promise<InheritedCredential | null>;
+  /** Build the "Use your existing GitHub login? [Y/n]" offer prompt. */
+  makeAuthOfferPrompt: typeof makeAuthOfferPrompt;
+  /** Build the inherited-fork "Where should the backtest PR land?" prompt. */
+  makeLandingChoicePrompt: typeof makeLandingChoicePrompt;
+  /** Build the inherited new-sandbox editable-name prompt (default `<src-repo>-backtest`). */
+  makeSandboxNamePrompt: typeof makeSandboxNamePrompt;
+  /** Build the scoped-fork "Land in the original source repo? [Y/n]" prompt. */
+  makeLandInSourcePrompt: typeof makeLandInSourcePrompt;
+  /** Scoped-sandbox READ-only source paste seam (the resolver's own getter). */
+  sandboxReadPaste: typeof defaultGetSandboxReadPaste;
+  /** Scoped-sandbox READ+WRITE destination paste seam (the resolver's own getter). */
+  sandboxWritePaste: typeof defaultGetSandboxWritePaste;
   /** Verify push / create-if-missing for the destination. */
   verifyOrCreateDestination: typeof verifyOrCreateDestination;
   /** Resolve the WRITE token via an injected accept predicate. */
@@ -108,6 +144,12 @@ export interface RunBacktestDeps {
   makeRememberPrompt: typeof makeRememberPrompt;
   /** Interactive "create this sandbox?" confirm seam (TTY only). */
   makeConfirmCreate: typeof makeConfirmCreate;
+  /**
+   * Build the interactive 403 → Primary-fallback prompt. Wired into
+   * `verifyOrCreateDestination`'s `onCreateForbidden` seam ONLY on the inherited
+   * new-sandbox fork; off-TTY / `--create-sandbox` it is never consulted.
+   */
+  makePrimaryFallbackPrompt: typeof makePrimaryFallbackPrompt;
   readConfig: typeof readConfig;
   getPullRequest: typeof getPullRequest;
   listPullRequestCommits: typeof listPullRequestCommits;
@@ -128,6 +170,14 @@ export interface RunBacktestDeps {
 const defaultDeps: RunBacktestDeps = {
   makeOctokit,
   resolveDestinationChoice,
+  resolveAuthFirstChoice,
+  detectInheritedCredential: makeDetectInherited(),
+  makeAuthOfferPrompt,
+  makeLandingChoicePrompt,
+  makeLandInSourcePrompt,
+  makeSandboxNamePrompt,
+  sandboxReadPaste: defaultGetSandboxReadPaste,
+  sandboxWritePaste: defaultGetSandboxWritePaste,
   verifyOrCreateDestination,
   resolveWriteToken,
   resolveReadToken,
@@ -137,6 +187,7 @@ const defaultDeps: RunBacktestDeps = {
   makeSlugPrompt,
   makeRememberPrompt,
   makeConfirmCreate,
+  makePrimaryFallbackPrompt,
   readConfig,
   getPullRequest,
   listPullRequestCommits,
@@ -176,6 +227,36 @@ function messageOf(err: unknown): string {
 }
 
 /**
+ * Wrap an eagerly-collected paste so the resolver's bounded re-prompt is NOT
+ * defeated.
+ *
+ * The scoped-Sandbox fork collects its pastes eagerly in user-facing order
+ * (read-then-write) and the orchestrator replays them into the resolvers. But a
+ * resolver's `getPaste` is called up to {@link PASTE_MAX_ATTEMPTS} times to
+ * re-prompt when a pasted token is rejected. A CONSTANT thunk would hand back the
+ * SAME (already-rejected) token on every attempt and hard-fail, defeating
+ * recovery. So: return the eagerly-collected `eager` value ONCE on the first
+ * call, then DELEGATE every subsequent call to the LIVE default getter, which
+ * re-prompts the user (TTY) for a fresh token. A null eager value falls straight
+ * through to the live getter on the first call too (nothing was collected).
+ */
+function makeReplayThenLivePaste<A extends unknown[]>(
+  eager: string | null,
+  live: (...args: A) => Promise<string | null>,
+): (...args: A) => Promise<string | null> {
+  let used = false;
+  return async (...args: A): Promise<string | null> => {
+    if (!used) {
+      used = true;
+      if (eager !== null) {
+        return eager;
+      }
+    }
+    return live(...args);
+  };
+}
+
+/**
  * Run a full backtest: choose the destination, resolve the write + read tokens,
  * read the PR, resolve the commit pair, confirm the plan, then clone/fetch/push
  * and open the simulated PR. Owns all exit codes.
@@ -211,10 +292,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.BAD_ARGS);
   }
 
-  // 3. Resolve WHERE the backtest PR is written — a PURE local choice. No token,
-  //    no network. `isSandbox` is true only when the destination differs from
-  //    the source. A DestinationArgsError (both flags / no dest non-TTY) → exit 1.
+  // 3. Resolve WHERE the backtest PR is written. The INTERACTIVE (TTY, no-flag)
+  //    path is now AUTH-FIRST: it offers the inherited GitHub login
+  //    BEFORE any destination question, then forks the destination off the
+  //    answer (and the inherited credential it carries forward). The flag and
+  //    non-TTY paths are UNCHANGED — they stay on the pure `resolveDestinationChoice`
+  //    (its DestinationArgsError → exit 1). No token resolution or
+  //    network happens here beyond the detector's own scrubbed login lookup.
   const isTTY = process.stdin.isTTY === true;
+  const interactiveNoFlag =
+    isTTY && opts.primary !== true && typeof opts.sandbox !== "string";
+  const source: RepoRef = { owner, repo };
   let destOwner: string;
   let destRepo: string;
   let isSandbox: boolean;
@@ -222,26 +310,58 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // 13). Persisting here, before the destination is verified/created and before
   // the run succeeds, would poison the saved default with an unusable repo.
   let offerRemember = false;
+  // The accepted inherited credential (interactive YES fork only); null on every
+  // other path. When present it is threaded into the write/read resolvers as the
+  // `getInheritedCredential` source so the inherited token is USED (no paste).
+  // It carries `fromPaste: false`, so it is never persisted to the 0600 config.
+  let inheritedCredential: InheritedCredential | null = null;
+  // The scoped-sandbox fork collects its two pastes (read FIRST, then write) in
+  // user-facing order; the orchestrator feeds them to the resolvers' paste
+  // getters below so the user is prompted read-then-write even though the write
+  // token is resolved (step 4) before the read token (step 5). Null on every
+  // other path (the resolvers prompt with their own default paste copy).
+  let scopedSandboxPastes: { read: string | null; write: string | null } | null =
+    null;
   try {
-    const choiceResolvers: ChoiceResolvers = {
-      getFlags: () => ({
-        primary: opts.primary,
-        sandbox: opts.sandbox,
-        createSandbox: opts.createSandbox,
-      }),
-      getDefaultDestination: () => deps.readConfig()?.defaultDestination,
-      getIsTTY: () => isTTY,
-      prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
-      promptForSlug: deps.makeSlugPrompt(),
-    };
-    const choice = await deps.resolveDestinationChoice(
-      { owner, repo },
-      choiceResolvers,
-    );
-    destOwner = choice.owner;
-    destRepo = choice.repo;
-    isSandbox = choice.isSandbox;
-    offerRemember = choice.offerRemember;
+    if (interactiveNoFlag) {
+      const authResolvers: AuthFirstResolvers = {
+        detectInherited: () => deps.detectInheritedCredential(),
+        offerInherited: deps.makeAuthOfferPrompt({ isTTY: () => isTTY }),
+        promptLanding: deps.makeLandingChoicePrompt(source, { isTTY: () => isTTY }),
+        promptSandboxName: deps.makeSandboxNamePrompt({ isTTY: () => isTTY }),
+        promptLandInSource: deps.makeLandInSourcePrompt(source, {
+          isTTY: () => isTTY,
+        }),
+        promptForSlug: deps.makeSlugPrompt(),
+        getSandboxReadPaste: deps.sandboxReadPaste,
+        getSandboxWritePaste: deps.sandboxWritePaste,
+        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+      };
+      const choice = await deps.resolveAuthFirstChoice(source, authResolvers);
+      destOwner = choice.owner;
+      destRepo = choice.repo;
+      isSandbox = choice.isSandbox;
+      offerRemember = choice.offerRemember;
+      inheritedCredential = choice.inheritedCredential;
+      scopedSandboxPastes = choice.scopedSandboxPastes;
+    } else {
+      const choiceResolvers: ChoiceResolvers = {
+        getFlags: () => ({
+          primary: opts.primary,
+          sandbox: opts.sandbox,
+          createSandbox: opts.createSandbox,
+        }),
+        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+        getIsTTY: () => isTTY,
+        prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
+        promptForSlug: deps.makeSlugPrompt(),
+      };
+      const choice = await deps.resolveDestinationChoice(source, choiceResolvers);
+      destOwner = choice.owner;
+      destRepo = choice.repo;
+      isSandbox = choice.isSandbox;
+      offerRemember = choice.offerRemember;
+    }
   } catch (err) {
     if (err instanceof DestinationArgsError) {
       error(messageOf(err));
@@ -249,6 +369,19 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     }
     throw err;
   }
+
+  // The inherited credential, adapted to the resolvers' `getInheritedCredential`
+  // thunk. On the inherited (YES) fork this yields the detected credential (so it
+  // sits AFTER env + saved and BEFORE the paste); on every other path it is
+  // undefined, so the resolvers go env → saved → paste with NO detection. AUTH-004
+  // is handled naturally: if the inherited token cannot write the Primary
+  // destination, the resolver's accept rejects it and falls through to the paste,
+  // emitting its token-free explanation.
+  const getInheritedCredential:
+    | (() => Promise<{ token: string; source: TokenSource } | null>)
+    | undefined = inheritedCredential
+    ? async () => inheritedCredential
+    : undefined;
 
   // 4. Resolve the WRITE token AND verify/create the destination together. The
   //    write token's `accept` predicate wraps verifyOrCreateDestination so a
@@ -280,11 +413,26 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         createSandbox: deps.makeSandboxCreator(octokit as Octokit),
         createFlag: opts.createSandbox === true,
         isTTY,
+        // Auto-create in the INTERACTIVE path is inherited-only. A
+        // scoped interactive Sandbox run (no inherited credential) must NEVER
+        // invoke the creator — the user pre-creates the repo — so `allowCreate`
+        // is false there. Flag / non-TTY paths keep their behavior (the
+        // `--create-sandbox` flag is governed by `createFlag`, not this gate;
+        // a `--sandbox X` + TTY run keeps its existing interactive create offer).
+        allowCreate: !interactiveNoFlag || inheritedCredential !== null,
         // Interactive create offer: without this seam, a TTY
         // user who picks a not-yet-existing sandbox is never offered to create
         // it. The seam self-guards off-TTY; verifyOrCreateDestination only
         // invokes it on the isTTY branch.
         confirmCreate: deps.makeConfirmCreate(),
+        // 403 → Primary fallback: wired ONLY on the inherited fork. When
+        // the create returns 403 on a TTY, this offers ONLY the source repo as
+        // the fallback destination; declining throws PrimaryFallbackDeclinedError
+        // (exit 0). Absent on every other path, so off-TTY / `--create-sandbox`
+        // a 403 stays a DestinationApiError → exit 2 (unchanged).
+        onCreateForbidden: inheritedCredential
+          ? deps.makePrimaryFallbackPrompt(source, { isTTY: () => isTTY })
+          : undefined,
       });
       return true;
     };
@@ -292,17 +440,51 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       destination: dest,
       isPrimary: !isSandbox,
       accept,
+      // Interactive YES fork only: the inherited credential sits AFTER env + saved
+      // and BEFORE the paste. AUTH-004: if it cannot write the destination, the
+      // resolver falls through to the paste with its token-free explanation.
+      getInheritedCredential,
+      // If the inherited token cannot WRITE the destination, explain
+      // (token-free) and let the resolver drop to the paste path — no hard failure.
+      onInheritedReject: inheritedCredential
+        ? () =>
+            info(
+              `Your existing GitHub login (@${inheritedCredential.login}) cannot ` +
+                `write ${dest.owner}/${dest.repo}. Paste a token with write access ` +
+                "to continue.",
+            )
+        : undefined,
+      // Scoped-sandbox fork only: replay the eagerly-collected write paste, then
+      // delegate to the live getter on re-prompt (see {@link makeReplayThenLivePaste}).
+      ...(scopedSandboxPastes
+        ? {
+            getPaste: makeReplayThenLivePaste(
+              scopedSandboxPastes.write,
+              (dest: RepoRef) => defaultGetSandboxWritePaste(dest),
+            ),
+          }
+        : {}),
     });
     writeToken = resolved.token;
   } catch (err) {
     destTrace.fail();
+    if (err instanceof PrimaryFallbackDeclinedError) {
+      // The inherited new-sandbox create returned 403 and the user
+      // declined the Primary fallback. Nothing was created or written — a clean
+      // no-op outcome, NOT an error: exit 0. (Checked BEFORE DestinationApiError,
+      // which it deliberately does not extend.)
+      info("Aborted: no changes were made.");
+      process.exit(EXIT.SUCCESS);
+    }
     if (err instanceof NoTokenNonInteractiveError) {
       // Names GITHUB_TOKEN — no destination-write token, non-interactive (exit 1).
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
     }
     if (err instanceof DestinationApiError) {
-      // Not-writable / can't-create destination, terminal (exit 2).
+      // Not-writable / can't-create destination, terminal (exit 2). This
+      // includes a SandboxCreateForbiddenError that reached here off a TTY /
+      // `--create-sandbox` (no Primary-fallback seam wired) — unchanged.
       error(messageOf(err));
       process.exit(EXIT.API_ERROR);
     }
@@ -312,6 +494,14 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   destTrace.done(redactedRepoRef(verifiedDest.owner, verifiedDest.repo));
   destOwner = verifiedDest.owner;
   destRepo = verifiedDest.repo;
+  // The destination is now SETTLED — before the plan. A
+  // 403 → Primary fallback returns the SOURCE as the verified destination, so the
+  // run is no longer a sandbox. Recompute `isSandbox` from the settled dest vs
+  // the source so the plan, token routing, and the source-fetch remote all
+  // reflect Primary (dest === source ⇒ the source IS the destination and may be
+  // written — intended for Primary). Every non-fallback case is unaffected: a
+  // real sandbox stays != source (isSandbox true) and a Primary stays == source.
+  isSandbox = !sameRepo(verifiedDest, source);
 
   // 5. Resolve the READ token. Reuses the write token IFF it reads the source
   //    (single-PAT); else GITHUB_SOURCE_TOKEN / saved sourceToken / paste. A
@@ -328,6 +518,33 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const resolved = await deps.resolveReadToken({
       source: { owner, repo },
       writeToken,
+      // Interactive YES fork only: the inherited credential is offered AFTER env +
+      // saved + single-PAT write-reuse and BEFORE the paste. In the both-capability
+      // case the write token already reads the source (single-PAT), so this is
+      // never consulted; it matters when the inherited write token cannot read.
+      getInheritedCredential,
+      // Read side: if the inherited token cannot READ the source,
+      // explain (token-free) and drop to the paste rather than failing.
+      onInheritedReject: inheritedCredential
+        ? () =>
+            info(
+              `Your existing GitHub login (@${inheritedCredential.login}) cannot ` +
+                `read the source ${owner}/${repo}. Paste a read-only source token ` +
+                "to continue.",
+            )
+        : undefined,
+      // Scoped-sandbox fork only: replay the eagerly-collected read paste, then
+      // delegate to the live getter on re-prompt (see {@link makeReplayThenLivePaste}).
+      // Single-PAT reuse still runs first, so a write token that also reads the
+      // source short-circuits before this is consulted.
+      ...(scopedSandboxPastes
+        ? {
+            getPaste: makeReplayThenLivePaste(
+              scopedSandboxPastes.read,
+              (src: RepoRef) => defaultGetSandboxReadPaste(src),
+            ),
+          }
+        : {}),
     });
     readToken = resolved.token;
   } catch (err) {
@@ -588,8 +805,15 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //     the run has actually succeeded. This is the single place
   //     `defaultDestination` may be persisted, so no non-success exit path (verify
   //     /create failure, read-token exit 1, git failure, decline, dup exit 4) can
-  //     save a destination the run never proved usable. Gated on a non-default
-  //     interactively-chosen Sandbox (`offerRemember`).
+  //     save a destination the run never proved usable.
+  //
+  //     BOTH guards are load-bearing — do not drop `&& isSandbox`. `offerRemember`
+  //     is fixed at the choice stage (a non-default interactively-chosen Sandbox),
+  //     but `isSandbox` is recomputed above after destination resolution: a 403 →
+  //     Primary fallback settles the destination to the SOURCE and flips
+  //     `isSandbox` to false while `offerRemember` stays true. Without `&& isSandbox`
+  //     the fallback would prompt "remember <source> as your default sandbox" for
+  //     the Primary repo — wrong: the source is never a sandbox to remember.
   if (offerRemember && isSandbox) {
     await deps.makeRememberPrompt()({ owner: destOwner, repo: destRepo });
   }

@@ -37,10 +37,19 @@ import { UnfetchableCommitError } from "../src/git.js";
 import {
   NoSourceTokenNonInteractiveError,
   NoTokenNonInteractiveError,
+  resolveReadToken,
+  resolveWriteToken,
+  type ResolverOctokit,
 } from "../src/auth.js";
-import { DestinationApiError } from "../src/destination.js";
+import {
+  DestinationApiError,
+  SandboxCreateForbiddenError,
+  verifyOrCreateDestination,
+} from "../src/destination.js";
+import { resolveAuthFirstChoice, sandboxCreateWarning } from "../src/authFirst.js";
+import type { InheritedCredential } from "../src/inheritedAuth.js";
 import type { RepoRef } from "../src/config.js";
-import { setTtyOverride, setVerbose } from "../src/log.js";
+import { redact, setTtyOverride, setVerbose } from "../src/log.js";
 
 /** An `Error` tagged with the exit code a stubbed `process.exit` was given. */
 class ExitError extends Error {
@@ -52,9 +61,15 @@ class ExitError extends Error {
   }
 }
 
-/** Capture stdout AND stderr separately for the duration of `run`. */
+/**
+ * Capture stdout AND stderr separately for the duration of `run`. `onStderr`, if
+ * supplied, is invoked with each stderr chunk AS IT IS WRITTEN — letting a test
+ * record the exact interleaving of a logged line (e.g. the new-sandbox warning)
+ * against other recorded events.
+ */
 async function capture(
   run: () => Promise<void>,
+  onStderr?: (chunk: string) => void,
 ): Promise<{ stdout: string; stderr: string }> {
   const realOut = process.stdout.write.bind(process.stdout);
   const realErr = process.stderr.write.bind(process.stderr);
@@ -65,7 +80,9 @@ async function capture(
     return true;
   }) as typeof process.stdout.write;
   process.stderr.write = ((chunk: string | Uint8Array): boolean => {
-    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    stderr += text;
+    onStderr?.(text);
     return true;
   }) as typeof process.stderr.write;
   try {
@@ -184,8 +201,12 @@ function makeDeps(
 /** Drive `runBacktest`, translating the stubbed `process.exit` into an ExitError. */
 async function run(
   opts: Omit<RunBacktestOptions, "prUrl" | "commit" | "yes"> &
-    Partial<Pick<RunBacktestOptions, "prUrl" | "commit" | "yes">>,
+    Partial<Pick<RunBacktestOptions, "prUrl" | "commit" | "yes">> & {
+      /** Invoked with each stderr chunk as it is written (event-interleave tests). */
+      onStderr?: (chunk: string) => void;
+    },
 ): Promise<{ stdout: string; stderr: string; exit: number }> {
+  const { onStderr, ...runOpts } = opts;
   const realExit = process.exit;
   (process as { exit: unknown }).exit = (code?: number): never => {
     throw new ExitError(code ?? 0);
@@ -199,7 +220,7 @@ async function run(
           prUrl: PR_URL,
           commit: "initial",
           yes: true,
-          ...opts,
+          ...runOpts,
         });
       } catch (err) {
         if (err instanceof ExitError) {
@@ -208,7 +229,7 @@ async function run(
         }
         throw err;
       }
-    });
+    }, onStderr);
   } finally {
     process.exit = realExit;
   }
@@ -1164,4 +1185,1058 @@ test("a PR-read API error maps to exit 2", async () => {
   const { stderr, exit } = await run({ deps });
   assert.equal(exit, 2, "a PR-not-found is exit 2");
   assert.match(stderr, /was not found/);
+});
+
+// ===========================================================================
+// Auth-first interactive onboarding (spec §3) — guided-setup-flow feature.
+//
+// These drive the INTERACTIVE (TTY, no-flag) path. `runBacktest` reads
+// `process.stdin.isTTY` directly to decide the interactive fork, so each test
+// forces it true for the duration of the run.
+// ===========================================================================
+
+/** An HTTP-status-bearing error shaped like an Octokit failure. */
+function httpError(status: number): Error & { status: number } {
+  const err = new Error(`HTTP ${status}`) as Error & { status: number };
+  err.status = status;
+  return err;
+}
+
+/** Force `process.stdin.isTTY` true for `fn`, restoring it after. */
+async function withTty<T>(fn: () => Promise<T>): Promise<T> {
+  const real = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", {
+    value: true,
+    configurable: true,
+  });
+  try {
+    return await fn();
+  } finally {
+    if (real) {
+      Object.defineProperty(process.stdin, "isTTY", real);
+    } else {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    }
+  }
+}
+
+const INHERITED_TOKEN = "ghp_inherited_credential_value_authfirst_xx";
+const INHERITED_CRED: InheritedCredential = {
+  token: INHERITED_TOKEN,
+  login: "octocat",
+  source: "classic",
+};
+
+/**
+ * Build deps for an INTERACTIVE auth-first run using the REAL
+ * `resolveAuthFirstChoice` driven by injected leaf seams. The seams append to a
+ * shared `order` log so a test can prove the auth offer precedes the destination
+ * prompt. Token resolution + git/API default to the inert `makeDeps` fakes.
+ */
+function makeAuthFirstDeps(opts: {
+  detected?: InheritedCredential | null;
+  useInherited?: boolean;
+  landing?: "primary" | "sandbox";
+  landInSource?: boolean;
+  slug?: RepoRef;
+  /** The new-sandbox name the editable-name prompt returns (default unchanged). */
+  editName?: string;
+  overrides?: Partial<RunBacktestDeps>;
+  tokenOpts?: { writeToken?: string; readToken?: string };
+}): { deps: Partial<RunBacktestDeps>; order: string[] } {
+  const order: string[] = [];
+  const { deps } = makeDeps(
+    {
+      resolveAuthFirstChoice,
+      detectInheritedCredential: async () => {
+        order.push("detect");
+        return opts.detected === undefined ? INHERITED_CRED : opts.detected;
+      },
+      makeAuthOfferPrompt: () => async (login: string) => {
+        order.push(`offer:${login}`);
+        return opts.useInherited ?? true;
+      },
+      makeLandingChoicePrompt: () => async () => {
+        order.push("landing");
+        return opts.landing ?? "primary";
+      },
+      // The editable-name prompt: record it and return the edited name (or the
+      // default) WITHOUT touching real `prompts` (which would hang under withTty).
+      makeSandboxNamePrompt: () => async (defaultName: string) => {
+        order.push(`name:${defaultName}`);
+        return opts.editName ?? defaultName;
+      },
+      makeLandInSourcePrompt: () => async () => {
+        order.push("land-in-source");
+        return opts.landInSource ?? true;
+      },
+      makeSlugPrompt: () => async () => {
+        order.push("slug");
+        if (!opts.slug) throw new Error("no slug fake");
+        return opts.slug;
+      },
+      // Sandbox runs need an inert source remote.
+      addSourceRemote: async () => {},
+      ...opts.overrides,
+    },
+    opts.tokenOpts,
+  );
+  return { deps, order };
+}
+
+// --- VAL-FLOW-001: auth offer precedes the destination prompt (both forks) ---
+
+test("VAL-FLOW-001: end-to-end, the auth offer fires BEFORE the destination prompt (ACCEPT path)", async () => {
+  const { deps, order } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "primary",
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  const offerIdx = order.indexOf("offer:octocat");
+  const landingIdx = order.indexOf("landing");
+  assert.ok(offerIdx >= 0, "the auth offer was rendered");
+  assert.ok(landingIdx >= 0, "the destination prompt was rendered");
+  assert.ok(offerIdx < landingIdx, "the auth offer precedes the destination prompt (YES fork)");
+});
+
+test("VAL-FLOW-001: end-to-end, the auth offer fires BEFORE the destination prompt (DECLINE path)", async () => {
+  const { deps, order } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: false, // decline → scoped fork
+    landInSource: true,
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  const offerIdx = order.indexOf("offer:octocat");
+  const landIdx = order.indexOf("land-in-source");
+  assert.ok(offerIdx >= 0 && landIdx >= 0);
+  assert.ok(offerIdx < landIdx, "the auth offer precedes the destination prompt (NO fork)");
+});
+
+test("VAL-FLOW-001: no credential detected → NO offer rendered, straight into the scoped fork", async () => {
+  const { deps, order } = makeAuthFirstDeps({
+    detected: null,
+    landInSource: true,
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.ok(!order.some((o) => o.startsWith("offer:")), "no offer when nothing is detected");
+  assert.ok(order.includes("land-in-source"), "the scoped fork was entered directly");
+});
+
+test("VAL-AUTH-001: the rendered offer string contains @<login>", async () => {
+  // The exact offer copy lives in the greppable `authOfferMessage` helper that
+  // makeAuthOfferPrompt renders; assert it names the literal @<login>.
+  const { authOfferMessage } = await import("../src/authFirst.js");
+  assert.match(authOfferMessage("octocat"), /@octocat/);
+  assert.match(authOfferMessage("octocat"), /Detected a GitHub login as @octocat/);
+
+  // And in the real flow the offer seam receives that login (proven end-to-end:
+  // the ACCEPT-path test above records `offer:octocat`).
+  const { deps, order } = makeAuthFirstDeps({
+    detected: { ...INHERITED_CRED, login: "alice" },
+    useInherited: true,
+    landing: "primary",
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.ok(order.includes("offer:alice"), "the offer seam received the detected @login");
+});
+
+// --- VAL-FLOW-002: inherited fork routing -----------------------------------
+
+test("VAL-FLOW-002: inherited + Original → Primary (isSandbox false, dest === source)", async () => {
+  let verifyArgs: { dest: RepoRef; isSandbox: boolean } | undefined;
+  const { deps } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "primary",
+    overrides: {
+      verifyOrCreateDestination: async (dest, vopts) => {
+        verifyArgs = { dest, isSandbox: vopts.isSandbox };
+        return dest;
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.equal(verifyArgs?.isSandbox, false, "Original repo → Primary (isSandbox false)");
+  assert.deepEqual(verifyArgs?.dest, { owner: SOURCE_OWNER, repo: SOURCE_REPO }, "dest === source");
+});
+
+test("VAL-FLOW-002: inherited + new sandbox → <src-owner>/<src-repo>-backtest, isSandbox true, create engaged", async () => {
+  let verifyArgs: { dest: RepoRef; isSandbox: boolean } | undefined;
+  const { deps } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "sandbox",
+    tokenOpts: { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+    overrides: {
+      verifyOrCreateDestination: async (dest, vopts) => {
+        verifyArgs = { dest, isSandbox: vopts.isSandbox };
+        return dest;
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.equal(verifyArgs?.isSandbox, true, "new sandbox → isSandbox true");
+  assert.deepEqual(
+    verifyArgs?.dest,
+    { owner: SOURCE_OWNER, repo: `${SOURCE_REPO}-backtest` },
+    "dest is <src-owner>/<src-repo>-backtest, routed into the existing create path",
+  );
+});
+
+// --- VAL-FLOW-003: scoped fork routing --------------------------------------
+
+test("VAL-FLOW-003: scoped + yes → Primary, exactly one primary paste, no inherited credential", async () => {
+  // Drive the REAL resolveWriteToken so the paste getter wiring is genuine. No
+  // env, no saved, no inherited (scoped fork) → the single primary paste resolves.
+  const pasteCalls: string[] = [];
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: { get: async () => ({ data: { permissions: { push: true } } }) },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+  const { deps } = makeAuthFirstDeps({
+    detected: null, // nothing detected → scoped fork
+    landInSource: true,
+    overrides: {
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async (_dest, isPrimary) => {
+            pasteCalls.push(isPrimary ? "primary" : "sandbox-write");
+            return WRITE_TOKEN;
+          },
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async () => READ_TOKEN,
+        }),
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(pasteCalls, ["primary"], "exactly one primary paste prompt");
+});
+
+test("VAL-FLOW-003: scoped + no → guidance, slug re-prompt (bad→good), read paste, write paste in order", async () => {
+  // The REAL makeSlugPrompt loops on a parse error, so feeding one BAD slug then
+  // one GOOD slug must cause two prompt iterations before advancing. The guidance
+  // line is emitted before the slug prompt. Then the scoped Sandbox fork collects
+  // the READ-only source paste FIRST, then the READ+WRITE destination paste — the
+  // §3b user-facing order — via the injectable sandboxReadPaste/sandboxWritePaste
+  // seams. The orchestrator replays those into the resolvers, so a single
+  // distinct-token run completes.
+  const events: string[] = [];
+  const prompts = (await import("prompts")).default;
+  // makeSlugPrompt uses prompts.text; inject a bad value then a good one.
+  prompts.inject(["not-a-valid-slug", "you/sandbox"]);
+
+  // The write token writes the dest but CANNOT read the source; the read token
+  // reads the source. This forces a genuine two-token run (no single-PAT reuse),
+  // so BOTH the read and write pastes are consulted.
+  const factory = (token: string) =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource = args.owner === SOURCE_OWNER && args.repo === SOURCE_REPO;
+          // Source readable only by READ_TOKEN; dest writable only by WRITE_TOKEN.
+          if (isSource) {
+            if (token !== READ_TOKEN) throw httpError(404);
+            return { data: {} };
+          }
+          return { data: { permissions: { push: token === WRITE_TOKEN } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { makeSlugPrompt } = await import("../src/destination.js");
+
+  const { deps } = makeDeps(
+    {
+      resolveAuthFirstChoice,
+      detectInheritedCredential: async () => null, // scoped fork
+      makeAuthOfferPrompt: () => async () => false,
+      makeLandingChoicePrompt: () => async () => "primary",
+      makeLandInSourcePrompt: () => async () => {
+        events.push("land-in-source");
+        return false; // → scoped sandbox
+      },
+      makeSlugPrompt, // REAL: re-prompts on parse error
+      // The scoped pastes, collected by the fork in §3b order. The seams record
+      // their invocation order: read BEFORE write.
+      sandboxReadPaste: async () => {
+        events.push("paste:read");
+        return READ_TOKEN;
+      },
+      sandboxWritePaste: async () => {
+        events.push("paste:write");
+        return WRITE_TOKEN;
+      },
+      addSourceRemote: async () => {},
+      verifyRepo: async (octokit, owner, repo) => {
+        const { data } = await (octokit as unknown as ResolverOctokit).repos.get({
+          owner,
+          repo,
+        });
+        return { exists: true, canPush: data.permissions?.push === true };
+      },
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+
+  const { stderr, exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  // The guidance line is emitted (before the slug prompt advances).
+  assert.match(stderr, /Create a private repo to hold the backtests/);
+  // The slug re-prompt warned on the bad slug (makeSlugPrompt warns then loops).
+  assert.match(stderr, /Invalid|owner\/repo/i);
+  // §3b USER-FACING order: read paste then write paste, both AFTER the
+  // land-in-source question. The slug prompt is the REAL prompts-backed one (two
+  // injected answers), so its looping is proven by the run completing with the
+  // GOOD slug "you/sandbox" as the destination.
+  assert.deepEqual(events, ["land-in-source", "paste:read", "paste:write"]);
+});
+
+// --- FIX 3: eager-paste replay does NOT defeat the bounded re-prompt ----------
+
+test("FIX-3: scoped-sandbox first eager write paste rejected → live re-prompt succeeds (recovery not defeated)", async () => {
+  // The scoped Sandbox fork eagerly collects a write paste. If that FIRST token
+  // is rejected by `accept` (cannot write the destination), the resolver's bounded
+  // re-prompt must fall back to the LIVE default getter (which re-prompts the
+  // user) — a constant thunk would hand back the same rejected token 3× and
+  // hard-fail. Here the eager write token is BAD; the live re-prompt (driven via
+  // prompts.inject) supplies the GOOD write token, and the run succeeds.
+  const BAD_WRITE = "ghp_BAD_eager_write_token_cannot_write_dest";
+  const events: string[] = [];
+
+  // The live default write paste uses prompts({type:"password"}). Inject the GOOD
+  // write token so the SECOND getPaste call (the live re-prompt) recovers.
+  const prompts = (await import("prompts")).default;
+  prompts.inject([WRITE_TOKEN]);
+
+  // Source readable only by READ_TOKEN; dest writable only by WRITE_TOKEN. The
+  // BAD eager write token can neither read the source nor write the dest, so the
+  // write `accept` (verify-or-create) rejects it.
+  const factory = (token: string) =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource = args.owner === SOURCE_OWNER && args.repo === SOURCE_REPO;
+          if (isSource) {
+            if (token !== READ_TOKEN) throw httpError(404);
+            return { data: {} };
+          }
+          return { data: { permissions: { push: token === WRITE_TOKEN } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { deps } = makeDeps(
+    {
+      resolveAuthFirstChoice,
+      detectInheritedCredential: async () => null, // scoped fork
+      makeAuthOfferPrompt: () => async () => false,
+      makeLandingChoicePrompt: () => async () => "primary",
+      makeLandInSourcePrompt: () => async () => false, // → scoped sandbox
+      // Slug fixed to a real sandbox so dest != source (a genuine sandbox run).
+      makeSlugPrompt: () => async () => ({ owner: "you", repo: "sandbox" }),
+      // §3b eager pastes: read is GOOD; write is BAD (forces the re-prompt).
+      sandboxReadPaste: async () => {
+        events.push("eager:read");
+        return READ_TOKEN;
+      },
+      sandboxWritePaste: async () => {
+        events.push("eager:write-bad");
+        return BAD_WRITE;
+      },
+      addSourceRemote: async () => {},
+      verifyRepo: async (octokit, owner, repo) => {
+        const { data } = await (octokit as unknown as ResolverOctokit).repos.get({
+          owner,
+          repo,
+        });
+        return { exists: true, canPush: data.permissions?.push === true };
+      },
+      // REAL verify-or-create so the write `accept` genuinely REJECTS the BAD
+      // eager token (it cannot push the dest → DestinationApiError), forcing the
+      // resolver's bounded re-prompt. (makeDeps' default just returns dest without
+      // checking, which would wrongly accept the BAD token.)
+      verifyOrCreateDestination,
+      // REAL resolvers: the orchestrator supplies getPaste via its replay-then-live
+      // wrapper, so we deliberately do NOT override getPaste here. The first call
+      // yields the eager BAD token; the second delegates to the LIVE default write
+      // paste, which prompts.inject feeds the GOOD WRITE_TOKEN.
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+
+  const { exit } = await withTty(() => run({ deps }));
+  // The run SUCCEEDS: the bounded re-prompt recovered via the live getter. With a
+  // constant thunk the BAD token would be returned 3× and the write resolver
+  // would hard-fail (exit 1/2) instead of reaching exit 0.
+  assert.equal(exit, 0, "the live re-prompt recovered the run (recovery not defeated)");
+  assert.deepEqual(events, ["eager:read", "eager:write-bad"]);
+});
+
+// --- VAL-AUTH-002: accepting a both-capability inherited credential ----------
+
+test("VAL-AUTH-002: inherited both-cap → no paste, no saveConfig, single-PAT (twoToken false), reaches clone+push", async () => {
+  const pasteCalls: string[] = [];
+  const saveCalls: number[] = [];
+  const reached: string[] = [];
+  // The inherited token reads the source AND writes the destination → single PAT.
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: { get: async () => ({ data: { permissions: { push: true } } }) },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { deps } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "primary",
+    overrides: {
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {
+            saveCalls.push(1);
+          },
+          getPaste: async () => {
+            pasteCalls.push("write");
+            return null;
+          },
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {
+            saveCalls.push(1);
+          },
+          getPaste: async () => {
+            pasteCalls.push("read");
+            return null;
+          },
+        }),
+      cloneRepo: async (_o, _r, token) => {
+        reached.push(`clone:${token}`);
+        return fakeGit;
+      },
+      pushBranchFromSha: async (_g, _s, branch, token) => {
+        reached.push(`push:${token}`);
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "the inherited both-capability run completes");
+  assert.deepEqual(pasteCalls, [], "no paste getter was ever invoked");
+  assert.deepEqual(saveCalls, [], "saveConfig/mergeConfig was never called for the inherited token");
+  // Single-PAT collapse: the run reached clone + push with the inherited token.
+  assert.ok(
+    reached.some((r) => r === `clone:${INHERITED_TOKEN}`),
+    "clone used the inherited token (reached the write path)",
+  );
+  assert.ok(
+    reached.some((r) => r === `push:${INHERITED_TOKEN}`),
+    "push used the inherited token (reached the push path)",
+  );
+});
+
+test("VAL-AUTH-002: inherited both-cap collapses to one Octokit instance (twoToken false)", async () => {
+  // makeOctokit is called per token value; identical read+write tokens → one
+  // instance. With the inherited token covering both, the read and write Octokit
+  // are the SAME instance.
+  const instances = new Map<string, object>();
+  const octFactory = (token: string): ResolverOctokit => {
+    let inst = instances.get(token);
+    if (!inst) {
+      inst = {
+        repos: { get: async () => ({ data: { permissions: { push: true } } }) },
+        users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+      };
+      instances.set(token, inst);
+    }
+    return inst as ResolverOctokit;
+  };
+  const builtTokens: string[] = [];
+  const { deps } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "primary",
+    overrides: {
+      makeOctokit: ((token: string) => {
+        builtTokens.push(token);
+        return octFactory(token) as unknown as Octokit;
+      }) as RunBacktestDeps["makeOctokit"],
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: octFactory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async () => null,
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: octFactory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async () => null,
+        }),
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  // The orchestrator builds exactly ONE Octokit (read === write) for the single
+  // inherited token → twoToken false.
+  assert.deepEqual(
+    [...new Set(builtTokens)],
+    [INHERITED_TOKEN],
+    "only the inherited token's Octokit is built (single-PAT, twoToken false)",
+  );
+  assert.equal(builtTokens.length, 1, "exactly one Octokit instance is constructed");
+});
+
+// --- VAL-AUTH-004: inherited write-miss for Primary → drop to scoped paste ----
+
+test("VAL-AUTH-004: inherited can't write Primary → primary paste invoked, run proceeds, explanation, no token leak, no non-zero exit", async () => {
+  const pasteCalls: string[] = [];
+  // The inherited token CANNOT write (push:false); a pasted token CAN.
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: async () => ({
+          data: { permissions: { push: token !== INHERITED_TOKEN } },
+        }),
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { deps } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "primary",
+    overrides: {
+      // The destination verify reflects the candidate token's push capability via
+      // its octokit, throwing the write-permission error when it can't push — so
+      // the inherited token (push:false) is rejected by the write `accept`.
+      verifyOrCreateDestination: async (dest, vopts) => {
+        const ver = await vopts.verifyDestination(dest.owner, dest.repo);
+        if (!ver.canPush) throw new DestinationApiError("no write access");
+        return dest;
+      },
+      verifyRepo: async (octokit, owner, repo) => {
+        const { data } = await (octokit as unknown as ResolverOctokit).repos.get({
+          owner,
+          repo,
+        });
+        return { exists: true, canPush: data.permissions?.push === true };
+      },
+      // Real write resolver: env→saved→inherited(reject)→paste. The paste token
+      // writes, so the run proceeds.
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async (_dest, isPrimary) => {
+            pasteCalls.push(isPrimary ? "primary" : "write");
+            return WRITE_TOKEN;
+          },
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async () => READ_TOKEN,
+        }),
+    },
+  });
+  const { stdout, stderr, exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "no non-zero exit on the inherited write-miss alone");
+  assert.deepEqual(pasteCalls, ["primary"], "the primary paste getter was invoked after the inherited miss");
+  // The run proceeded (a PR URL is the final stdout line).
+  assert.equal(stdout, CREATED_URL + "\n", "the run proceeded on the good paste");
+  // A clear, token-free explanation of the inherited write-miss is emitted.
+  assert.match(stderr, /cannot write/, "an explanation of the inherited write-miss is emitted");
+  // The inherited token never appears anywhere — redact scrubs it.
+  assert.equal(redact(stderr), stderr, "no inherited token substring in stderr (already redacted)");
+  assert.ok(!stderr.includes(INHERITED_TOKEN), "the inherited token never leaks to stderr");
+  assert.ok(!stdout.includes(INHERITED_TOKEN), "the inherited token never leaks to stdout");
+});
+
+// --- VAL-KEEP-001: source is never written under a broad inherited token -----
+
+test("VAL-KEEP-001: inherited broad token, new sandbox → push/PR get the DESTINATION token + owner only", async () => {
+  // The inherited token can write everything (broad). In a sandbox run the source
+  // must STILL never be written: clone/push/PR target the destination with the
+  // destination (write) token; the source remote fetch uses the read token.
+  const factory = (): ResolverOctokit =>
+    ({
+      repos: { get: async () => ({ data: { permissions: { push: true } } }) },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const pushes: Array<{ token: string | undefined }> = [];
+  const prs: Array<{ owner: string; repo: string }> = [];
+  const fetches: Array<{ remote: string; token: string | undefined }> = [];
+  let cloneTarget: { owner: string; repo: string } | undefined;
+
+  const { deps } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "sandbox",
+    overrides: {
+      // Inherited covers write; for the source READ in a cross/same-owner sandbox
+      // the inherited token reads too — but to PROVE routing we make the write
+      // resolver return the inherited token and the read resolver also the
+      // inherited token (single broad PAT). The routing invariant must hold by
+      // OWNER/remote, independent of token scope.
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async () => null,
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+          getPaste: async () => null,
+        }),
+      cloneRepo: async (owner, repo, _token) => {
+        cloneTarget = { owner, repo };
+        return fakeGit;
+      },
+      addSourceRemote: async () => {},
+      fetchCommit: async (_g, _s, _n, remote, token) => {
+        fetches.push({ remote, token });
+      },
+      pushBranchFromSha: async (_g, _s, _branch, token) => {
+        pushes.push({ token });
+      },
+      createPullRequest: async (_o, owner, repo) => {
+        prs.push({ owner, repo });
+        return CREATED_URL;
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  // Clone targets the destination sandbox, never the source.
+  assert.deepEqual(cloneTarget, { owner: SOURCE_OWNER, repo: `${SOURCE_REPO}-backtest` });
+  // Every push uses the inherited (= destination/write) token VALUE.
+  for (const p of pushes) {
+    assert.equal(p.token, INHERITED_TOKEN, "push uses the destination/write token value");
+  }
+  // The PR opens only against the destination sandbox.
+  for (const pr of prs) {
+    assert.ok(
+      !(pr.owner === SOURCE_OWNER && pr.repo === SOURCE_REPO),
+      "the PR never targets the source repo",
+    );
+    assert.deepEqual(pr, { owner: SOURCE_OWNER, repo: `${SOURCE_REPO}-backtest` });
+  }
+  // The source remote fetch is the only thing that touches the source.
+  for (const f of fetches) {
+    assert.equal(f.remote, "source", "commits are fetched from the source remote only");
+  }
+});
+
+// ===========================================================================
+// CREATE — auto-create policy + the 403 → Primary fallback (spec §5)
+// ===========================================================================
+
+const SANDBOX_DEFAULT_REPO = `${SOURCE_REPO}-backtest`;
+
+/** A recorded create call against the injected sandbox creator seam. */
+interface CreateCall {
+  owner: string;
+  name: string;
+}
+
+/**
+ * Build deps for an INHERITED new-sandbox run driving the REAL
+ * `verifyOrCreateDestination` (so the create gate + 403 fallback are genuinely
+ * exercised). The creator/verify/confirm/primary-fallback seams are injected and
+ * recorded. `createOutcome` controls what the creator does: "ok" creates the
+ * sandbox; "403" throws a SandboxCreateForbiddenError.
+ */
+function makeInheritedSandboxDeps(opts: {
+  editName?: string;
+  createOutcome: "ok" | "403";
+  /** The Primary-fallback answer (only used on a 403). */
+  fallback?: "accept" | "decline";
+  overrides?: Partial<RunBacktestDeps>;
+}): {
+  deps: Partial<RunBacktestDeps>;
+  order: string[];
+  creates: CreateCall[];
+} {
+  const creates: CreateCall[] = [];
+  const createdNames = new Set<string>();
+  const { deps, order } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "sandbox",
+    editName: opts.editName,
+    tokenOpts: { writeToken: INHERITED_TOKEN, readToken: INHERITED_TOKEN },
+    overrides: {
+      // REAL verify/create orchestration.
+      verifyOrCreateDestination,
+      // The sandbox is missing until it is created; the source exists + is
+      // writable (so a Primary fallback re-verify passes). A just-created sandbox
+      // verifies as existing + writable (so the post-create reprobe succeeds with
+      // no real sleeps).
+      verifyRepo: async (_octokit, owner, repo) => {
+        if (owner === SOURCE_OWNER && repo === SOURCE_REPO) {
+          return { exists: true, canPush: true };
+        }
+        if (createdNames.has(`${owner}/${repo}`)) {
+          return { exists: true, canPush: true };
+        }
+        return { exists: false, canPush: false };
+      },
+      makeSandboxCreator: () => async (req) => {
+        creates.push({ owner: req.owner, name: req.name });
+        // Record the create as a REAL event in the shared order array so the
+        // ordering tests assert against the create itself, not a prompt proxy.
+        order.push(`create:${req.owner}/${req.name}`);
+        if (opts.createOutcome === "403") {
+          throw new SandboxCreateForbiddenError(
+            req.owner,
+            `Cannot create a sandbox repository under ${req.owner}: the token ` +
+              "lacks permission to create repositories there.",
+          );
+        }
+        createdNames.add(`${req.owner}/${req.name}`);
+        return { owner: req.owner, repo: req.name };
+      },
+      makeConfirmCreate: () => async () => true,
+      makePrimaryFallbackPrompt: (source) => async () => {
+        order.push("primary-fallback");
+        return opts.fallback === "accept"
+          ? { owner: source.owner, repo: source.repo }
+          : null;
+      },
+      // Record confirmPlan + its destination for the create-before-plan and
+      // 403→Primary assertions.
+      confirmPlan: async (planInput) => {
+        order.push(`confirm-plan:${planInput.targetRepo}`);
+        return true;
+      },
+      addSourceRemote: async () => {
+        order.push("add-source-remote");
+      },
+      ...opts.overrides,
+    },
+  });
+  return { deps, order, creates };
+}
+
+// --- VAL-CREATE-002: warn upfront before the create attempt -----------------
+
+test("VAL-CREATE-002: the new-sandbox warning is emitted BEFORE the create seam (location + scope)", async () => {
+  const { deps, order, creates } = makeInheritedSandboxDeps({
+    createOutcome: "ok",
+  });
+  // Record the warning as a REAL event the instant it is written to stderr, into
+  // the SAME order array the create call records into — so we assert the actual
+  // emission interleaving, not a prompt-index proxy. The warning's first line
+  // (sandboxCreateWarning) is the marker.
+  const warnMarker = sandboxCreateWarning(
+    { owner: SOURCE_OWNER, repo: SOURCE_REPO },
+    `${SOURCE_REPO}-backtest`,
+  ).split("\n")[0]!;
+  const { stderr, exit } = await withTty(() =>
+    run({
+      deps,
+      onStderr: (chunk) => {
+        if (chunk.includes(warnMarker) && !order.includes("warn")) {
+          order.push("warn");
+        }
+      },
+    }),
+  );
+  assert.equal(exit, 0);
+  // The warning names the repo to be created and the required scope on the owner.
+  assert.match(stderr, /acme\/api-backtest/, "warning names <src-owner>/<src-repo>-backtest");
+  assert.match(stderr, /create repos in acme/, "warning states repo-creation scope on <src-owner>");
+  // The warning's emission is recorded BEFORE the actual create event — moving the
+  // warning to after the create makes this fail.
+  const warnIdx = order.indexOf("warn");
+  const createIdx = order.findIndex((o) => o.startsWith("create:"));
+  assert.ok(warnIdx >= 0, "the warning was emitted");
+  assert.ok(createIdx >= 0, "the create fired");
+  assert.ok(warnIdx < createIdx, "the warn-upfront precedes the create call");
+  assert.equal(creates.length, 1, "the creator ran exactly once");
+});
+
+// --- VAL-CREATE-003: editable name flows through to the creator --------------
+
+test("VAL-CREATE-003: default name → creator receives <src-repo>-backtest", async () => {
+  const { deps, creates } = makeInheritedSandboxDeps({ createOutcome: "ok" });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(creates, [{ owner: SOURCE_OWNER, name: SANDBOX_DEFAULT_REPO }]);
+});
+
+test("VAL-CREATE-003: edited name 'foo' → creator receives name 'foo' (under the source owner)", async () => {
+  const { deps, creates } = makeInheritedSandboxDeps({
+    createOutcome: "ok",
+    editName: "foo",
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(creates, [{ owner: SOURCE_OWNER, name: "foo" }]);
+});
+
+// --- VAL-CREATE-001: scoped Sandbox never creates ---------------------------
+
+test("VAL-CREATE-001: a scoped interactive Sandbox run NEVER invokes the sandbox creator", async () => {
+  const creates: CreateCall[] = [];
+  // Scoped fork: nothing detected → no inherited credential. The user picks "no"
+  // (land in source? no → guided sandbox) and supplies a pre-created repo slug.
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource = args.owner === SOURCE_OWNER && args.repo === SOURCE_REPO;
+          if (isSource) {
+            if (token !== READ_TOKEN) throw httpError(404);
+            return { data: {} };
+          }
+          // The pre-created destination exists + is writable for the write token.
+          return { data: { permissions: { push: token === WRITE_TOKEN } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "octocat" } }) },
+    }) as unknown as ResolverOctokit;
+
+  const { deps } = makeDeps(
+    {
+      resolveAuthFirstChoice,
+      verifyOrCreateDestination,
+      detectInheritedCredential: async () => null, // scoped fork
+      makeAuthOfferPrompt: () => async () => false,
+      makeLandingChoicePrompt: () => async () => "primary",
+      makeLandInSourcePrompt: () => async () => false, // → guided sandbox
+      makeSlugPrompt: () => async () => ({ owner: "you", repo: "sandbox" }),
+      sandboxReadPaste: async () => READ_TOKEN,
+      sandboxWritePaste: async () => WRITE_TOKEN,
+      makeSandboxCreator: () => async (req) => {
+        creates.push({ owner: req.owner, name: req.name });
+        return { owner: req.owner, repo: req.name };
+      },
+      verifyRepo: async (octokit, owner, repo) => {
+        const { data } = await (octokit as unknown as ResolverOctokit).repos.get({
+          owner,
+          repo,
+        });
+        return { exists: true, canPush: data.permissions?.push === true };
+      },
+      addSourceRemote: async () => {},
+      resolveWriteToken: (wopts) =>
+        resolveWriteToken({
+          ...wopts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+      resolveReadToken: (ropts) =>
+        resolveReadToken({
+          ...ropts,
+          makeOctokit: factory,
+          getEnvToken: () => undefined,
+          getConfig: () => null,
+          saveConfig: () => {},
+        }),
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  assert.deepEqual(creates, [], "the scoped Sandbox path never invokes the creator");
+});
+
+// --- VAL-CREATE-004: create-before-plan + 403 → Primary-only fallback --------
+
+test("VAL-CREATE-004: the create runs BEFORE confirmPlan", async () => {
+  const { deps, order } = makeInheritedSandboxDeps({ createOutcome: "ok" });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0);
+  // Assert against the REAL create event (recorded by the creator fake), not a
+  // prompt-index proxy: firing the create AFTER confirmPlan makes this fail.
+  const createIdx = order.findIndex((o) => o.startsWith("create:"));
+  const confirmIdx = order.findIndex((o) => o.startsWith("confirm-plan:"));
+  assert.ok(createIdx >= 0, "the create fired");
+  assert.ok(confirmIdx >= 0, "confirmPlan fired");
+  assert.ok(createIdx < confirmIdx, "the create precedes confirmPlan");
+});
+
+test("VAL-CREATE-004: 403 + ACCEPT → destination becomes the source; confirmPlan sees dest === source; run proceeds", async () => {
+  const { deps, order, creates } = makeInheritedSandboxDeps({
+    createOutcome: "403",
+    fallback: "accept",
+  });
+  const { stdout, exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "the run proceeds against the source after the Primary fallback");
+  assert.equal(stdout, CREATED_URL + "\n", "a PR URL is produced");
+  // The fallback was offered, then confirmPlan saw the SOURCE as the destination.
+  assert.ok(order.includes("primary-fallback"), "the Primary fallback was offered");
+  assert.ok(
+    order.includes(`confirm-plan:${SOURCE_OWNER}/${SOURCE_REPO}`),
+    "confirmPlan received destination === source",
+  );
+  assert.equal(creates.length, 1, "the creator was attempted exactly once");
+});
+
+test("VAL-CREATE-004: 403 + ACCEPT (Primary fallback) does NOT offer remember-as-default for the source repo", async () => {
+  // Regression for the Macroscope finding: a 403 → Primary fallback recomputes
+  // `isSandbox` to false (dest === source) while `offerRemember` stays true from
+  // the choice stage. The remember prompt is gated on BOTH, so a Primary
+  // destination must NEVER be offered as a "default sandbox". Dropping the
+  // `&& isSandbox` guard at the success path makes this fail.
+  const remembered: RepoRef[] = [];
+  const { deps } = makeInheritedSandboxDeps({
+    createOutcome: "403",
+    fallback: "accept",
+    overrides: {
+      makeRememberPrompt: () => async (dest: RepoRef): Promise<void> => {
+        remembered.push(dest);
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "the run proceeds to success after the Primary fallback");
+  assert.deepEqual(
+    remembered,
+    [],
+    "the source (Primary) repo is never offered as a default sandbox after a 403 fallback",
+  );
+});
+
+test("VAL-CREATE-004: 403 + DECLINE → exit 0, zero clone/push, creator called exactly once, no other-owner retry", async () => {
+  const writes = { clone: 0, push: 0 };
+  const { deps, order, creates } = makeInheritedSandboxDeps({
+    createOutcome: "403",
+    fallback: "decline",
+    overrides: {
+      cloneRepo: async () => {
+        writes.clone += 1;
+        return fakeGit;
+      },
+      pushBranchFromSha: async () => {
+        writes.push += 1;
+      },
+    },
+  });
+  const { exit } = await withTty(() => run({ deps }));
+  assert.equal(exit, 0, "declining the Primary fallback is a clean exit 0 (NOT 2)");
+  assert.deepEqual(writes, { clone: 0, push: 0 }, "nothing was cloned or pushed");
+  assert.equal(creates.length, 1, "the creator was called exactly once");
+  // No retry under any other owner: the single create targeted only the source owner.
+  assert.deepEqual(creates, [{ owner: SOURCE_OWNER, name: SANDBOX_DEFAULT_REPO }]);
+  assert.ok(order.includes("primary-fallback"), "the fallback was offered before the decline");
+  assert.ok(
+    !order.some((o) => o.startsWith("confirm-plan:")),
+    "no plan was shown on the declined fallback",
+  );
+});
+
+test("VAL-CREATE-004: non-interactive --create-sandbox 403 → exit 2 (unchanged, no fallback)", async () => {
+  const creates: CreateCall[] = [];
+  // Non-interactive: --sandbox X --create-sandbox, no TTY. The create returns 403
+  // (SandboxCreateForbiddenError). This must stay exit 2 — no Primary fallback.
+  const { deps } = makeDeps({
+    verifyOrCreateDestination,
+    resolveDestinationChoice: async () => ({
+      owner: SANDBOX_OWNER,
+      repo: SANDBOX_REPO,
+      isSandbox: true,
+      offerRemember: false,
+    }),
+    verifyRepo: async () => ({ exists: false, canPush: false }),
+    makeSandboxCreator: () => async (req) => {
+      creates.push({ owner: req.owner, name: req.name });
+      throw new SandboxCreateForbiddenError(req.owner, "no creation scope");
+    },
+  });
+  const { exit } = await run({
+    deps,
+    sandbox: `${SANDBOX_OWNER}/${SANDBOX_REPO}`,
+    createSandbox: true,
+  });
+  assert.equal(exit, 2, "a non-interactive --create-sandbox 403 still exits 2");
+  assert.equal(creates.length, 1, "the creator was attempted once");
 });

@@ -343,6 +343,30 @@ test("the token lives only in the child env, never in the URL, argv, or display 
   }
 });
 
+test("gitEnv strips GIT_EDITOR / GIT_SEQUENCE_EDITOR so an ambient editor can't break git", () => {
+  // simple-git refuses to run when these are present in the child env (an
+  // editor-RCE mitigation). The tool never opens an editor, so gitEnv must drop
+  // them even when the ambient process.env sets one (VS Code, many shells do).
+  const priorEditor = process.env.GIT_EDITOR;
+  const priorSeq = process.env.GIT_SEQUENCE_EDITOR;
+  try {
+    process.env.GIT_EDITOR = "true";
+    process.env.GIT_SEQUENCE_EDITOR = "true";
+    const env = gitEnv(TOKEN, "/tmp/pr-backtest-xyz/askpass.sh");
+    assert.equal(env.GIT_EDITOR, undefined, "GIT_EDITOR must be stripped from the git child env");
+    assert.equal(
+      env.GIT_SEQUENCE_EDITOR,
+      undefined,
+      "GIT_SEQUENCE_EDITOR must be stripped from the git child env",
+    );
+  } finally {
+    if (priorEditor === undefined) delete process.env.GIT_EDITOR;
+    else process.env.GIT_EDITOR = priorEditor;
+    if (priorSeq === undefined) delete process.env.GIT_SEQUENCE_EDITOR;
+    else process.env.GIT_SEQUENCE_EDITOR = priorSeq;
+  }
+});
+
 test("repoHttpsUrl carries the x-access-token username and never the token", () => {
   const url = repoHttpsUrl("acme", "api");
   assert.match(url, /^https:\/\/x-access-token@github\.com\/acme\/api\.git$/);

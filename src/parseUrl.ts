@@ -53,6 +53,40 @@ export function parseRepoSlug(slug: string): RepoSlug {
   return { owner: match[1], repo: match[2] };
 }
 
+/**
+ * Validate a single repository NAME segment (no owner, no slash) against the SAME
+ * rule {@link parseRepoSlug} enforces for the repo part: the `[\w.-]+` character
+ * class, non-empty, and not a dot-only name (`.` / `..`). Returns the trimmed
+ * name on success; throws a clear `Error` otherwise.
+ *
+ * Implemented by reusing {@link parseRepoSlug} (with a fixed throwaway owner) so
+ * the name rule lives in exactly one place. Used by the interactive new-sandbox
+ * NAME prompt so an edited name is validated the same way every other destination
+ * input is, instead of flowing unchecked into the repo creator.
+ */
+export function parseRepoName(name: string): string {
+  if (typeof name !== "string" || name.trim() === "") {
+    throw new Error("Invalid repository name: expected a non-empty name.");
+  }
+  const trimmed = name.trim();
+  // A slash here would smuggle in an owner; reject it explicitly so the error
+  // names the real problem rather than parseRepoSlug's owner/repo message.
+  if (trimmed.includes("/")) {
+    throw new Error(
+      `Invalid repository name: "${name}". Expected a bare repo name (no "/").`,
+    );
+  }
+  try {
+    // Reuse the slug rule for the repo segment via a fixed valid owner.
+    return parseRepoSlug(`_/${trimmed}`).repo;
+  } catch {
+    throw new Error(
+      `Invalid repository name: "${name}". ` +
+        "Use letters, digits, dots, hyphens, or underscores.",
+    );
+  }
+}
+
 // owner / repo segments: GitHub allows letters, digits, dots, hyphens, underscores.
 // The PR number is one-or-more digits, optionally followed by a trailing path
 // segment, a query string, or a fragment.

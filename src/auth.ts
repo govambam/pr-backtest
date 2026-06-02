@@ -25,6 +25,7 @@ import { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 
 import {
+  inferTokenSource,
   mergeConfig,
   readConfig,
   type Config,
@@ -88,12 +89,6 @@ export class NoSourceTokenNonInteractiveError extends NoTokenNonInteractiveError
       `or run in an interactive terminal to paste one.`;
     this.name = "NoSourceTokenNonInteractiveError";
   }
-}
-
-/** Infer the token source from its prefix. */
-function inferPasteSource(token: string): TokenSource {
-  // github_pat_ => fine-grained PAT; ghp_ (and everything else) => classic PAT.
-  return token.startsWith("github_pat_") ? "fine-grained" : "classic";
 }
 
 /**
@@ -233,8 +228,13 @@ function defaultGetPrimaryPaste(source: RepoRef): Promise<string | null> {
   });
 }
 
-/** Sandbox token #1: a READ-ONLY source token is enough. */
-function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
+/**
+ * Sandbox token #1: a READ-ONLY source token is enough. Exported so the scoped
+ * Sandbox interactive fork (authFirst.ts) can reuse this exact copy and collect
+ * the read paste in user-facing order — keeping the guided-paste scope text in ONE
+ * place rather than duplicating it.
+ */
+export function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
   return guidedPaste({
     repoLabel: `${source.owner}/${source.repo}`,
     intro:
@@ -250,8 +250,13 @@ function defaultGetSandboxReadPaste(source: RepoRef): Promise<string | null> {
   });
 }
 
-/** Sandbox token #2: a WRITE token on the destination. */
-function defaultGetSandboxWritePaste(
+/**
+ * Sandbox token #2: a WRITE token on the destination. Exported so the scoped
+ * Sandbox interactive fork (authFirst.ts) can reuse this exact copy and collect
+ * the write paste in user-facing order. The copy requests only Contents + Pull
+ * requests: Read & write — never `Administration` (the scoped path never creates).
+ */
+export function defaultGetSandboxWritePaste(
   destination: RepoRef,
 ): Promise<string | null> {
   return guidedPaste({
@@ -298,7 +303,30 @@ function envCandidate(value: string | undefined): Candidate | null {
   if (!value || value.length === 0) {
     return null;
   }
-  return { token: value, source: inferPasteSource(value), fromPaste: false };
+  return { token: value, source: inferTokenSource(value), fromPaste: false };
+}
+
+/**
+ * Adapt an optional inherited-credential getter into the lazy {@link ExtraCandidate}
+ * the resolver offers between the saved slot and the interactive paste. When no
+ * getter is injected (non-interactive callers / tests), the thunk yields null and
+ * the inherited source is never consulted. The inherited credential is NOT a
+ * fresh paste, so the resulting candidate carries `fromPaste: false` and is never
+ * persisted to the 0600 config.
+ */
+function inheritedExtra(
+  getInherited?: () => Promise<{ token: string; source: TokenSource } | null>,
+): ExtraCandidate {
+  if (!getInherited) {
+    return async () => null;
+  }
+  return async () => {
+    const cred = await getInherited();
+    if (!cred || cred.token.length === 0) {
+      return null;
+    }
+    return { token: cred.token, source: cred.source, fromPaste: false };
+  };
 }
 
 // ===========================================================================
@@ -336,12 +364,23 @@ export type AcceptToken = (
 ) => Promise<boolean>;
 
 /**
+ * A lazily-resolved extra candidate, tried AFTER the eager `candidates` and
+ * BEFORE the interactive paste. It is a thunk so it runs ONLY when the eager
+ * sources are all rejected — e.g. the interactive inherited-credential detector
+ * must not shell out to `git credential` / `gh` when a saved slot already wins.
+ * Returns null when there is no extra candidate to offer.
+ */
+type ExtraCandidate = () => Promise<Candidate | null>;
+
+/**
  * Run the env → saved → [extra] → paste precedence with an injected `accept`
  * predicate. `candidates` are the ordered non-paste sources; each is registered
- * with the scrubber and offered to `accept` (first accepted wins). On exhaustion
- * the bounded paste loop runs (TTY only); off-TTY the getter returns null on the
- * first call so the loop exits at once. Returns the accepted candidate (without
- * `@login` — the caller captures it for a fresh paste).
+ * with the scrubber and offered to `accept` (first accepted wins). When all are
+ * rejected, the lazy `getExtra` candidate (e.g. the inherited credential) is
+ * resolved and offered next. On exhaustion the bounded paste loop runs (TTY
+ * only); off-TTY the getter returns null on the first call so the loop exits at
+ * once. Returns the accepted candidate (without `@login` — the caller captures it
+ * for a fresh paste).
  *
  * `onPasteReject` renders the per-attempt scope hint between failed pastes.
  *
@@ -360,6 +399,8 @@ async function resolveWithAccept(
   getPaste: () => Promise<string | null>,
   onPasteReject: () => void,
   notInteractiveError: () => NoTokenNonInteractiveError,
+  getExtra: ExtraCandidate = async () => null,
+  onExtraReject: () => void = () => {},
 ): Promise<Candidate> {
   // The last DestinationApiError a candidate was rejected with, if any. When
   // every source is rejected for the SAME destination reason (e.g. the repo
@@ -391,6 +432,24 @@ async function resolveWithAccept(
     }
   }
 
+  // The lazy extra candidate (e.g. the inherited credential) is resolved ONLY
+  // now — after the eager env/saved sources are all rejected — so a saved slot
+  // that wins never triggers the inherited detector's exec seam.
+  // It carries fromPaste: false, so an accepted inherited token is never
+  // persisted to the 0600 config.
+  const extra = await getExtra();
+  if (extra && extra.token.length > 0) {
+    registerSecret(extra.token);
+    if (await tryAccept(make(extra.token), extra.token)) {
+      return extra;
+    }
+    // The extra (inherited) candidate was offered but cannot satisfy the chosen
+    // destination's capability: emit a token-free explanation and
+    // CONTINUE to the paste path rather than failing. The hook (token-free by
+    // construction) is the caller's; the scrubber already covers it anyway.
+    onExtraReject();
+  }
+
   for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
     const pasted = await getPaste();
     if (!pasted || pasted.length === 0) {
@@ -398,7 +457,7 @@ async function resolveWithAccept(
     }
     registerSecret(pasted);
     if (await tryAccept(make(pasted), pasted)) {
-      return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
+      return { token: pasted, source: inferTokenSource(pasted), fromPaste: true };
     }
     if (attempt < PASTE_MAX_ATTEMPTS - 1) {
       onPasteReject();
@@ -435,6 +494,26 @@ export interface ResolveWriteTokenOptions {
   saveConfig?: (update: Partial<Config>) => void;
   /** Interactive paste getter. Defaults to the Primary/Sandbox-write copy per `isPrimary`. */
   getPaste?: (destination: RepoRef, isPrimary: boolean) => Promise<string | null>;
+  /**
+   * INTERACTIVE-ONLY inherited-credential source, offered AFTER env + saved slot
+   * and BEFORE the paste. Returns the inherited credential, or null when none is
+   * detected (or off a TTY). OPTIONAL/injectable: non-interactive callers and
+   * tests omit it, so off-TTY it is never consulted. The token is
+   * already registered with the scrubber by the detector and is NOT persisted
+   * (it is not a fresh paste). Resolved lazily — only when env/saved are
+   * rejected — so a winning saved slot never triggers detection.
+   */
+  getInheritedCredential?: () => Promise<{
+    token: string;
+    source: TokenSource;
+  } | null>;
+  /**
+   * Called when an offered inherited credential is REJECTED (cannot write/create
+   * the destination) and the resolver falls through to the paste — the place to
+   * emit the token-free explanation. OPTIONAL; default is a no-op.
+   * Never receives or echoes a token.
+   */
+  onInheritedReject?: () => void;
   /**
    * Accept a candidate write token via the caller's verify-or-create check —
    * this lets a token that can CREATE a missing destination be accepted even
@@ -487,6 +566,8 @@ export async function resolveWriteToken(
           "creation rights if the repo does not exist yet), then try again.",
       ),
     () => new NoTokenNonInteractiveError(),
+    inheritedExtra(options.getInheritedCredential),
+    options.onInheritedReject,
   );
 
   // A fresh paste is validated via users.getAuthenticated to capture its @login;
@@ -525,6 +606,22 @@ export interface ResolveReadTokenOptions {
   saveConfig?: (update: Partial<Config>) => void;
   /** Interactive paste getter (read-only copy). Defaults to {@link defaultGetSandboxReadPaste}. */
   getPaste?: (source: RepoRef) => Promise<string | null>;
+  /**
+   * INTERACTIVE-ONLY inherited-credential source, offered AFTER env + saved slot
+   * + single-PAT write-reuse and BEFORE the paste. Same contract as the write
+   * resolver's option: OPTIONAL/injectable (off-TTY it is never consulted),
+   * resolved lazily (a winning earlier source never triggers detection), and the
+   * inherited token is NOT persisted.
+   */
+  getInheritedCredential?: () => Promise<{
+    token: string;
+    source: TokenSource;
+  } | null>;
+  /**
+   * Called when an offered inherited credential is rejected (cannot read the
+   * source) and the resolver falls through to the paste. OPTIONAL; default no-op.
+   */
+  onInheritedReject?: () => void;
 }
 
 /**
@@ -556,7 +653,7 @@ export async function resolveReadToken(
   // The write token is offered AFTER env + saved slot: single-PAT detection.
   const writeReuse: Candidate | null =
     writeToken.length > 0
-      ? { token: writeToken, source: inferPasteSource(writeToken), fromPaste: false }
+      ? { token: writeToken, source: inferTokenSource(writeToken), fromPaste: false }
       : null;
 
   const resolved = await resolveWithAccept(
@@ -570,6 +667,8 @@ export async function resolveReadToken(
           "Contents: Read + Pull requests: Read on that repo, then try again.",
       ),
     () => new NoSourceTokenNonInteractiveError(source.owner, source.repo),
+    inheritedExtra(options.getInheritedCredential),
+    options.onInheritedReject,
   );
 
   // A fresh paste is validated via users.getAuthenticated to capture its @login;
