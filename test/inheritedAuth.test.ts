@@ -313,22 +313,73 @@ test("FIX-1: the real defaultExec passes GIT_TERMINAL_PROMPT=0 + GCM_INTERACTIVE
   assert.equal(seen.g, "never", "GCM_INTERACTIVE=never reaches the child");
 });
 
-test("FIX-1: a child that exits before reading stdin does NOT crash the process (EPIPE swallowed)", async () => {
-  // The stdin error listener (registered BEFORE end()) swallows the EPIPE from a
-  // git child that exits before draining its stdin. We feed a large stdin to a
-  // child that exits immediately; the seam must still RESOLVE (never reject /
-  // throw), preserving the never-rejects contract.
+test("FIX-1: the timeout fires — a child that blocks past the bound resolves { failed: true }", async () => {
+  // The whole point of the hang guard: a credential helper that never returns
+  // (here, a node child that sleeps far past the bound) must NOT hang the tool.
+  // Inject a tiny timeout so the kill fires fast; the seam must resolve a miss
+  // (failed: true) well within a generous bound, proving the timeout is wired.
   const { defaultExec } = await import("../src/inheritedAuth.js");
-  const big = "x".repeat(1024 * 256);
+  const start = Date.now();
   let result: ExecResult | undefined;
   await assert.doesNotReject(async () => {
     result = await defaultExec(
       process.execPath,
-      ["-e", "process.exit(0)"],
-      big,
+      ["-e", "setTimeout(() => {}, 60000)"],
+      undefined,
+      50, // tiny injected hang-guard bound
     );
   });
+  const elapsed = Date.now() - start;
   assert.ok(result, "the seam resolved");
+  assert.equal(
+    result!.failed,
+    true,
+    "a child that outlives the timeout is reported as a miss (failed: true)",
+  );
+  assert.ok(
+    elapsed < 5000,
+    `the timeout fired promptly (elapsed ${elapsed}ms ≪ the 60s child sleep)`,
+  );
+});
+
+test("FIX-1: writing to a child that closes stdin immediately fires NO unhandled error (EPIPE swallowed)", async () => {
+  // The stdin error listener (registered BEFORE end()) swallows the EPIPE from a
+  // git child that exits before draining its stdin. Assert DETERMINISTICALLY:
+  // register process-level unhandledRejection/uncaughtException spies and prove
+  // they stay empty while writing a large stdin to a fast-exiting child. Removing
+  // the `child.stdin.on("error", ...)` line would surface the EPIPE here.
+  const { defaultExec } = await import("../src/inheritedAuth.js");
+  const unhandled: unknown[] = [];
+  const onRejection = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  const onException = (err: unknown): void => {
+    unhandled.push(err);
+  };
+  process.on("unhandledRejection", onRejection);
+  process.on("uncaughtException", onException);
+  try {
+    const big = "x".repeat(1024 * 256);
+    let result: ExecResult | undefined;
+    await assert.doesNotReject(async () => {
+      result = await defaultExec(
+        process.execPath,
+        ["-e", "process.stdin.destroy(); process.exit(0)"],
+        big,
+      );
+    });
+    assert.ok(result, "the seam resolved");
+    // Give any deferred stream 'error' event a tick to surface before we check.
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(
+      unhandled,
+      [],
+      "no unhandledRejection / uncaughtException fired while writing to a child that closed stdin",
+    );
+  } finally {
+    process.off("unhandledRejection", onRejection);
+    process.off("uncaughtException", onException);
+  }
 });
 
 // ===========================================================================

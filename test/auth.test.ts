@@ -718,16 +718,32 @@ test("VAL-AUTH-006 (write): inherited is offered AFTER env/saved are rejected an
   let detectorCalls = 0;
   let pasteCalls = 0;
   let saveCalls = 0;
+  // Record the order accept is offered each candidate, so we prove the inherited
+  // probe runs AFTER both the env token and the saved slot are actually rejected —
+  // not as the sole candidate. Moving the inherited probe ahead of the env+saved
+  // loop in src/auth.ts makes the order assertion below fail.
+  const acceptOrder: string[] = [];
   const result = await resolveWriteToken(
     writeOptions({
-      // env present but rejected; no saved slot.
+      // BOTH env AND a saved slot present — and BOTH rejected by accept.
       getEnvToken: () => "env-bad",
-      getConfig: () => null,
-      // Only the inherited token writes the destination.
-      accept: async (_o, token) => token === "inherited-good",
+      getConfig: () => ({
+        destinationToken: { token: "saved-bad", username: "u", source: "fine-grained" },
+      }),
+      // Only the inherited token writes the destination; env + saved are rejected.
+      accept: async (_o, token) => {
+        acceptOrder.push(token);
+        return token === "inherited-good";
+      },
       getInheritedCredential: async () => {
         detectorCalls += 1;
-        return { token: "inherited-good", login: "octo", source: "classic" };
+        // The detector must not run until env + saved have been tried & rejected.
+        assert.deepEqual(
+          acceptOrder,
+          ["env-bad", "saved-bad"],
+          "inherited detector runs only AFTER env + saved are rejected",
+        );
+        return { token: "inherited-good", source: "classic" };
       },
       getPaste: async () => { pasteCalls += 1; return "would-paste"; },
       saveConfig: () => { saveCalls += 1; },
@@ -737,6 +753,11 @@ test("VAL-AUTH-006 (write): inherited is offered AFTER env/saved are rejected an
   assert.equal(result.fromPaste, false, "inherited is not a fresh paste");
   assert.equal(result.login, "", "inherited (non-paste) makes no extra getAuthenticated");
   assert.equal(detectorCalls, 1, "inherited detector consulted after env/saved");
+  assert.deepEqual(
+    acceptOrder,
+    ["env-bad", "saved-bad", "inherited-good"],
+    "env → saved → inherited precedence; inherited offered last before the paste",
+  );
   assert.equal(pasteCalls, 0, "inherited wins -> paste getter never runs");
   assert.equal(saveCalls, 0, "inherited token is NOT persisted to config");
 });
@@ -786,21 +807,41 @@ test("VAL-AUTH-006 (read): a valid saved sourceToken wins WITHOUT detecting the 
 
 test("VAL-AUTH-006 (read): inherited offered after env/saved/write-reuse, before the paste", async () => {
   let pasteCalls = 0;
+  // Record each read-probe (canRead) in order. The inherited token is consulted
+  // only AFTER a rejecting env token, a rejecting saved slot, AND a non-reading
+  // write token (single-PAT reuse) are all tried — none of which read the source.
+  // Moving the inherited probe ahead of the env+saved+write-reuse candidates in
+  // src/auth.ts makes the probe-order assertion fail.
+  const built: ReadProbe[] = [];
   const result = await resolveReadToken(
     readOptions({
       writeToken: "write-only", // cannot read source -> not single-PAT
-      // Only the inherited token reads the source.
-      makeOctokit: readFactory(new Set(["inherited-reads"])),
-      getInheritedCredential: async () => ({
-        token: "inherited-reads",
-        login: "octo",
-        source: "classic",
+      getEnvToken: () => "env-bad", // present but does NOT read the source
+      getConfig: () => ({
+        sourceToken: { token: "saved-bad", username: "u", source: "fine-grained" },
       }),
+      // Only the inherited token reads the source.
+      makeOctokit: readFactory(new Set(["inherited-reads"]), undefined, built),
+      getInheritedCredential: async () => {
+        // env, saved, and the write-reuse token have all been probed & rejected
+        // (none read the source) before the inherited detector is consulted.
+        assert.deepEqual(
+          built.map((p) => p.token),
+          ["env-bad", "saved-bad", "write-only"],
+          "inherited detector runs only AFTER env + saved + write-reuse are rejected",
+        );
+        return { token: "inherited-reads", source: "classic" };
+      },
       getPaste: async () => { pasteCalls += 1; return "would-paste"; },
     }),
   );
   assert.equal(result.token, "inherited-reads");
   assert.equal(result.fromPaste, false);
+  assert.deepEqual(
+    built.map((p) => p.token),
+    ["env-bad", "saved-bad", "write-only", "inherited-reads"],
+    "env → saved → write-reuse → inherited precedence; inherited offered last before the paste",
+  );
   assert.equal(pasteCalls, 0, "inherited wins -> paste getter never runs");
 });
 

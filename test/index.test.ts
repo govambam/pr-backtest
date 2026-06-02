@@ -46,7 +46,7 @@ import {
   SandboxCreateForbiddenError,
   verifyOrCreateDestination,
 } from "../src/destination.js";
-import { resolveAuthFirstChoice } from "../src/authFirst.js";
+import { resolveAuthFirstChoice, sandboxCreateWarning } from "../src/authFirst.js";
 import type { InheritedCredential } from "../src/inheritedAuth.js";
 import type { RepoRef } from "../src/config.js";
 import { redact, setTtyOverride, setVerbose } from "../src/log.js";
@@ -61,9 +61,15 @@ class ExitError extends Error {
   }
 }
 
-/** Capture stdout AND stderr separately for the duration of `run`. */
+/**
+ * Capture stdout AND stderr separately for the duration of `run`. `onStderr`, if
+ * supplied, is invoked with each stderr chunk AS IT IS WRITTEN — letting a test
+ * record the exact interleaving of a logged line (e.g. the new-sandbox warning)
+ * against other recorded events.
+ */
 async function capture(
   run: () => Promise<void>,
+  onStderr?: (chunk: string) => void,
 ): Promise<{ stdout: string; stderr: string }> {
   const realOut = process.stdout.write.bind(process.stdout);
   const realErr = process.stderr.write.bind(process.stderr);
@@ -74,7 +80,9 @@ async function capture(
     return true;
   }) as typeof process.stdout.write;
   process.stderr.write = ((chunk: string | Uint8Array): boolean => {
-    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    stderr += text;
+    onStderr?.(text);
     return true;
   }) as typeof process.stderr.write;
   try {
@@ -193,8 +201,12 @@ function makeDeps(
 /** Drive `runBacktest`, translating the stubbed `process.exit` into an ExitError. */
 async function run(
   opts: Omit<RunBacktestOptions, "prUrl" | "commit" | "yes"> &
-    Partial<Pick<RunBacktestOptions, "prUrl" | "commit" | "yes">>,
+    Partial<Pick<RunBacktestOptions, "prUrl" | "commit" | "yes">> & {
+      /** Invoked with each stderr chunk as it is written (event-interleave tests). */
+      onStderr?: (chunk: string) => void;
+    },
 ): Promise<{ stdout: string; stderr: string; exit: number }> {
+  const { onStderr, ...runOpts } = opts;
   const realExit = process.exit;
   (process as { exit: unknown }).exit = (code?: number): never => {
     throw new ExitError(code ?? 0);
@@ -208,7 +220,7 @@ async function run(
           prUrl: PR_URL,
           commit: "initial",
           yes: true,
-          ...opts,
+          ...runOpts,
         });
       } catch (err) {
         if (err instanceof ExitError) {
@@ -217,7 +229,7 @@ async function run(
         }
         throw err;
       }
-    });
+    }, onStderr);
   } finally {
     process.exit = realExit;
   }
@@ -1956,6 +1968,9 @@ function makeInheritedSandboxDeps(opts: {
       },
       makeSandboxCreator: () => async (req) => {
         creates.push({ owner: req.owner, name: req.name });
+        // Record the create as a REAL event in the shared order array so the
+        // ordering tests assert against the create itself, not a prompt proxy.
+        order.push(`create:${req.owner}/${req.name}`);
         if (opts.createOutcome === "403") {
           throw new SandboxCreateForbiddenError(
             req.owner,
@@ -1994,15 +2009,35 @@ test("VAL-CREATE-002: the new-sandbox warning is emitted BEFORE the create seam 
   const { deps, order, creates } = makeInheritedSandboxDeps({
     createOutcome: "ok",
   });
-  const { stderr, exit } = await withTty(() => run({ deps }));
+  // Record the warning as a REAL event the instant it is written to stderr, into
+  // the SAME order array the create call records into — so we assert the actual
+  // emission interleaving, not a prompt-index proxy. The warning's first line
+  // (sandboxCreateWarning) is the marker.
+  const warnMarker = sandboxCreateWarning(
+    { owner: SOURCE_OWNER, repo: SOURCE_REPO },
+    `${SOURCE_REPO}-backtest`,
+  ).split("\n")[0]!;
+  const { stderr, exit } = await withTty(() =>
+    run({
+      deps,
+      onStderr: (chunk) => {
+        if (chunk.includes(warnMarker) && !order.includes("warn")) {
+          order.push("warn");
+        }
+      },
+    }),
+  );
   assert.equal(exit, 0);
   // The warning names the repo to be created and the required scope on the owner.
   assert.match(stderr, /acme\/api-backtest/, "warning names <src-owner>/<src-repo>-backtest");
   assert.match(stderr, /create repos in acme/, "warning states repo-creation scope on <src-owner>");
-  // Call order: the editable-name prompt (which fires right after the warning) is
-  // recorded BEFORE the create call, proving the warn-upfront precedes the create.
-  const nameIdx = order.findIndex((o) => o.startsWith("name:"));
-  assert.ok(nameIdx >= 0, "the name prompt fired");
+  // The warning's emission is recorded BEFORE the actual create event — moving the
+  // warning to after the create makes this fail.
+  const warnIdx = order.indexOf("warn");
+  const createIdx = order.findIndex((o) => o.startsWith("create:"));
+  assert.ok(warnIdx >= 0, "the warning was emitted");
+  assert.ok(createIdx >= 0, "the create fired");
+  assert.ok(warnIdx < createIdx, "the warn-upfront precedes the create call");
   assert.equal(creates.length, 1, "the creator ran exactly once");
 });
 
@@ -2100,10 +2135,13 @@ test("VAL-CREATE-004: the create runs BEFORE confirmPlan", async () => {
   const { deps, order } = makeInheritedSandboxDeps({ createOutcome: "ok" });
   const { exit } = await withTty(() => run({ deps }));
   assert.equal(exit, 0);
-  const createIdx = order.findIndex((o) => o.startsWith("name:")); // create is right after the name prompt
+  // Assert against the REAL create event (recorded by the creator fake), not a
+  // prompt-index proxy: firing the create AFTER confirmPlan makes this fail.
+  const createIdx = order.findIndex((o) => o.startsWith("create:"));
   const confirmIdx = order.findIndex((o) => o.startsWith("confirm-plan:"));
-  assert.ok(createIdx >= 0 && confirmIdx >= 0);
-  assert.ok(createIdx < confirmIdx, "the create/name step precedes confirmPlan");
+  assert.ok(createIdx >= 0, "the create fired");
+  assert.ok(confirmIdx >= 0, "confirmPlan fired");
+  assert.ok(createIdx < confirmIdx, "the create precedes confirmPlan");
 });
 
 test("VAL-CREATE-004: 403 + ACCEPT → destination becomes the source; confirmPlan sees dest === source; run proceeds", async () => {

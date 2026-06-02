@@ -79,11 +79,16 @@ export interface ExecResult {
  * or a non-zero exit resolves with `failed: true` so the detector can treat a
  * missing/unauthenticated `gh` as a non-fatal miss. Injected in tests so they run
  * with no real `git`/`gh`.
+ *
+ * `timeoutMs` is an optional hang-guard bound the real {@link defaultExec} honors
+ * (a child still running past it is killed and reported as a miss); it defaults to
+ * the production constant, and the detector never passes it (fake seams ignore it).
  */
 export type ExecSeam = (
   command: string,
   args: readonly string[],
   stdin?: string,
+  timeoutMs?: number,
 ) => Promise<ExecResult>;
 
 /** Options for {@link detectInheritedCredential}. All seams are injectable for tests. */
@@ -131,8 +136,17 @@ const EXEC_TIMEOUT_MS = 10_000;
  *    before reading its stdin, so the write never crashes the process (the
  *    outcome is reported through the exec callback, preserving the never-rejects
  *    contract).
+ *
+ * `timeoutMs` (optional, defaults to {@link EXEC_TIMEOUT_MS}) is the hang guard's
+ * bound. Injectable so a test can pass a tiny value and prove a child that blocks
+ * past the bound resolves `{ failed: true }` without waiting the full real timeout.
  */
-export const defaultExec: ExecSeam = (command, args, stdin) =>
+export const defaultExec: ExecSeam = (
+  command,
+  args,
+  stdin,
+  timeoutMs = EXEC_TIMEOUT_MS,
+) =>
   new Promise<ExecResult>((resolve) => {
     const child = execFile(
       command,
@@ -148,7 +162,7 @@ export const defaultExec: ExecSeam = (command, args, stdin) =>
         },
         // Bound a helper that still blocks despite the env above; on timeout the
         // child is killed and `err` is set → resolves `{ failed: true }` (a miss).
-        timeout: EXEC_TIMEOUT_MS,
+        timeout: timeoutMs,
         killSignal: "SIGKILL",
       },
       (err, stdout) => {
