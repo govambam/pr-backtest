@@ -47,6 +47,105 @@ export class NoTokenNonInteractiveError extends Error {
   }
 }
 
+/**
+ * The two access capabilities a backtest run can require (spec §4):
+ * - `read`  — read the PR + fetch its commits from the SOURCE owner/repo.
+ * - `write` — clone, push branches, open the PR (and create the repo) on the
+ *   DESTINATION owner/repo.
+ */
+export type TokenPurposeKind = "read" | "write";
+
+/**
+ * One required token capability, named by the owner/repo it acts on. This
+ * carries owners/repos and visibility intent only — never a token value.
+ */
+export interface TokenPurpose {
+  kind: TokenPurposeKind;
+  owner: string;
+  repo: string;
+  /**
+   * True only for a `read` purpose whose source is public, i.e. the source
+   * read may be performed anonymously. Such a purpose is informational and is
+   * NOT part of the required set. Omitted (undefined) for every required
+   * purpose. See {@link computeTokenNeeds}.
+   */
+  optional?: boolean;
+}
+
+/**
+ * Input to {@link computeTokenNeeds}. Owners are compared case-insensitively
+ * (GitHub owners are case-insensitive), matching `sameRepo` in destination.ts.
+ *
+ * The "self-owned source" / "new personal sandbox under @login" case (spec
+ * §12.3, VAL-NEED-004) is expressed purely as `destination.owner === source.owner`:
+ * the caller resolving a personal sandbox sets the destination owner to the
+ * authenticated login, so when that login equals the source owner the two
+ * owners simply match and the same-owner rule applies. No separate
+ * `authenticatedLogin` argument is needed here — keeping this function a pure
+ * function of owners + visibility.
+ */
+export interface TokenNeedsInput {
+  source: { owner: string; repo: string };
+  destination: { owner: string; repo: string };
+  /** True when the source repo is private. False = public source. */
+  sourcePrivate: boolean;
+}
+
+/** Case-insensitive owner equality, matching `sameRepo` in src/destination.ts. */
+function sameOwner(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * PURE token-needs rule (spec §4). Given the source repo, the destination repo,
+ * and the source's visibility, return the set of token *purposes* the run
+ * requires. No network, no token values, no resolution, no probing.
+ *
+ * Rules (owners compared case-insensitively):
+ * - destination owner == source owner (Primary, org sandbox, self-owned source)
+ *   → a SINGLE `write` purpose on the shared owner. One token covers read+write
+ *   on one owner, so we model it as one purpose (its `kind` is `write` because a
+ *   write-capable token on an owner can also read that owner). (VAL-NEED-001,
+ *   VAL-NEED-004.)
+ * - destination owner != source owner AND source private → TWO purposes:
+ *   `read` on the source and `write` on the destination. (VAL-NEED-002.)
+ * - destination owner != source owner AND source public → a SINGLE `write`
+ *   purpose on the destination; the source read is anonymous. An additional
+ *   `read` purpose flagged `optional: true` is appended so callers can surface
+ *   the anonymous source read, but the REQUIRED set (entries without
+ *   `optional`) is exactly the one write purpose. (VAL-NEED-003.)
+ *
+ * The required purposes are always the entries with `optional` undefined.
+ */
+export function computeTokenNeeds(input: TokenNeedsInput): TokenPurpose[] {
+  const { source, destination, sourcePrivate } = input;
+
+  // Same owner (incl. self-owned source / personal sandbox under @login):
+  // one token covers both halves. Return exactly one purpose.
+  if (sameOwner(destination.owner, source.owner)) {
+    return [{ kind: "write", owner: destination.owner, repo: destination.repo }];
+  }
+
+  // Cross-owner. Write on the destination is always required.
+  const write: TokenPurpose = {
+    kind: "write",
+    owner: destination.owner,
+    repo: destination.repo,
+  };
+
+  if (sourcePrivate) {
+    // Private source needs a real READ token on the source owner.
+    return [{ kind: "read", owner: source.owner, repo: source.repo }, write];
+  }
+
+  // Public source: the only REQUIRED purpose is the destination write. The
+  // anonymous source read is appended as an optional, non-required entry.
+  return [
+    write,
+    { kind: "read", owner: source.owner, repo: source.repo, optional: true },
+  ];
+}
+
 /** Infer the token source from its prefix. */
 function inferPasteSource(token: string): TokenSource {
   // github_pat_ => fine-grained PAT; ghp_ => classic PAT.

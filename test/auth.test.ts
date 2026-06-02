@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import {
   resolveToken,
   resolveTokenSource,
+  computeTokenNeeds,
   NoTokenNonInteractiveError,
   type TokenResolvers,
+  type TokenPurpose,
 } from "../src/auth.js";
 import type { Config } from "../src/config.js";
 import { makeOctokit } from "../src/github.js";
@@ -40,6 +42,112 @@ function makeResolvers(overrides: Partial<TokenResolvers> = {}): TokenResolvers 
     ...overrides,
   };
 }
+
+// --- computeTokenNeeds: pure token-needs rule (spec §4, VAL-NEED-001..004) ---
+
+/** The required purposes are the entries without an `optional` flag. */
+function required(purposes: TokenPurpose[]): TokenPurpose[] {
+  return purposes.filter((p) => p.optional !== true);
+}
+
+test("VAL-NEED-001: same-owner destination yields one purpose (no read/write split)", () => {
+  const purposes = computeTokenNeeds({
+    source: { owner: "acme", repo: "api" },
+    destination: { owner: "acme", repo: "pr-backtest-sandbox" },
+    sourcePrivate: true,
+  });
+  assert.equal(purposes.length, 1);
+  assert.equal(required(purposes).length, 1);
+  assert.equal(purposes[0]!.kind, "write");
+  assert.equal(purposes[0]!.owner, "acme");
+  assert.equal(purposes[0]!.repo, "pr-backtest-sandbox");
+  assert.equal(purposes[0]!.optional, undefined);
+});
+
+test("VAL-NEED-001: same-owner Primary (destination == source repo) yields one purpose", () => {
+  const purposes = computeTokenNeeds({
+    source: { owner: "acme", repo: "api" },
+    destination: { owner: "acme", repo: "api" },
+    sourcePrivate: true,
+  });
+  assert.equal(purposes.length, 1);
+  assert.equal(purposes[0]!.kind, "write");
+});
+
+test("VAL-NEED-002: cross-owner + private source yields exactly two purposes: read(source) + write(dest)", () => {
+  const purposes = computeTokenNeeds({
+    source: { owner: "acme", repo: "api" },
+    destination: { owner: "alice", repo: "pr-backtest-sandbox" },
+    sourcePrivate: true,
+  });
+  const req = required(purposes);
+  assert.equal(req.length, 2);
+
+  const read = req.find((p) => p.kind === "read");
+  const write = req.find((p) => p.kind === "write");
+  assert.ok(read, "a read purpose on the source is required");
+  assert.ok(write, "a write purpose on the destination is required");
+  assert.deepEqual(
+    { owner: read!.owner, repo: read!.repo },
+    { owner: "acme", repo: "api" },
+  );
+  assert.deepEqual(
+    { owner: write!.owner, repo: write!.repo },
+    { owner: "alice", repo: "pr-backtest-sandbox" },
+  );
+});
+
+test("VAL-NEED-003: cross-owner + public source yields a single required write purpose; source read optional/anonymous", () => {
+  const purposes = computeTokenNeeds({
+    source: { owner: "acme", repo: "api" },
+    destination: { owner: "alice", repo: "pr-backtest-sandbox" },
+    sourcePrivate: false,
+  });
+  const req = required(purposes);
+  assert.equal(req.length, 1, "exactly one REQUIRED purpose");
+  assert.equal(req[0]!.kind, "write");
+  assert.equal(req[0]!.owner, "alice");
+
+  // Any source-read entry that exists must be flagged optional (anonymous).
+  const reads = purposes.filter((p) => p.kind === "read");
+  for (const r of reads) {
+    assert.equal(r.optional, true, "source read for a public source must be optional/anonymous");
+  }
+});
+
+test("VAL-NEED-004: self-owned source (login == source owner) resolves same-owner -> one purpose", () => {
+  // Caller sets the personal-sandbox destination owner to the authenticated
+  // login. When that login IS the source owner, the owners match -> one token.
+  const authenticatedLogin = "alice";
+  const purposes = computeTokenNeeds({
+    source: { owner: "alice", repo: "api" },
+    destination: { owner: authenticatedLogin, repo: "pr-backtest-sandbox" },
+    sourcePrivate: true,
+  });
+  assert.equal(purposes.length, 1);
+  assert.equal(required(purposes).length, 1);
+  assert.equal(purposes[0]!.kind, "write");
+  assert.equal(purposes[0]!.owner, "alice");
+});
+
+test("computeTokenNeeds compares owners case-insensitively (same-owner)", () => {
+  const purposes = computeTokenNeeds({
+    source: { owner: "Acme", repo: "api" },
+    destination: { owner: "acme", repo: "pr-backtest-sandbox" },
+    sourcePrivate: true,
+  });
+  assert.equal(purposes.length, 1, "ACME vs acme must be treated as the same owner");
+  assert.equal(purposes[0]!.kind, "write");
+});
+
+test("computeTokenNeeds case-insensitive: differing case but different owners stays cross-owner", () => {
+  const purposes = computeTokenNeeds({
+    source: { owner: "Acme", repo: "api" },
+    destination: { owner: "Alice", repo: "sandbox" },
+    sourcePrivate: true,
+  });
+  assert.equal(required(purposes).length, 2);
+});
 
 test("env token wins over config, gh, and interactive", async () => {
   const result = await resolveTokenSource(makeResolvers());
