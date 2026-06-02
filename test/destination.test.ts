@@ -15,6 +15,7 @@ import {
   type DestinationResolvers,
   type DestinationFlags,
   type DestinationChoice,
+  type DestinationChoiceKind,
   type DestinationSelection,
   type RepoRef,
 } from "../src/destination.js";
@@ -44,12 +45,23 @@ function makeHarness(opts: {
   verify?: (owner: string, repo: string) => RepoVerification;
   create?: (req: { owner: string; name: string }) => RepoRef;
   prompt?: (choices: DestinationChoice[]) => DestinationSelection;
+  /** Authenticated login for the personal-sandbox row. `"throw"` makes the seam reject. */
+  login?: string | "throw";
 }): Harness {
   const calls: RecordedCall[] = [];
   const resolvers: DestinationResolvers = {
     getFlags: () => opts.flags ?? {},
     getDefaultDestination: () => opts.saved,
     getIsTTY: () => opts.isTTY ?? false,
+    getAuthenticatedLogin:
+      opts.login === undefined
+        ? undefined
+        : async () => {
+            if (opts.login === "throw") {
+              throw new Error("getAuthenticatedLogin failed");
+            }
+            return opts.login as string;
+          },
     verifyDestination: async (owner, repo) => {
       calls.push({ fn: "verify", args: [owner, repo] });
       return opts.verify
@@ -388,11 +400,16 @@ test("primary not writable — write-permission message before clone, non-intera
 // non-vacuous by driving the create-if-missing path — `create` IS a write the
 // resolver performs — and asserting a verify is recorded strictly before it.
 test("verify runs before the create write (non-vacuous call order)", async () => {
+  let created = false;
   const h = makeHarness({
     flags: { sandbox: "me/new", createSandbox: true },
-    // Report missing so the resolver proceeds to create.
-    verify: () => ({ exists: false, canPush: false }),
-    create: (req) => ({ owner: req.owner, repo: req.name }),
+    // Pre-create: report missing so the resolver proceeds to create. Post-create
+    // re-probe: report writable so the run succeeds (re-probe covered elsewhere).
+    verify: () => (created ? { exists: true, canPush: true } : { exists: false, canPush: false }),
+    create: (req) => {
+      created = true;
+      return { owner: req.owner, repo: req.name };
+    },
   });
   await resolveDestination(SOURCE, h.resolvers);
   const firstVerify = h.calls.findIndex((c) => c.fn === "verify");
@@ -448,12 +465,16 @@ test("destination ≠ source → source never an arg to verify/create/write", as
 
 // --- Create paths (supporting the create seam) ---
 test("--sandbox X --create-sandbox creates missing X; missing X alone exits 2", async () => {
-  // With --create-sandbox: missing → create + use.
+  // With --create-sandbox: missing → create + use (post-create re-probe writable).
   {
+    let created = false;
     const h = makeHarness({
       flags: { sandbox: "me/new", createSandbox: true },
-      verify: () => ({ exists: false, canPush: false }),
-      create: (req) => ({ owner: req.owner, repo: req.name }),
+      verify: () => (created ? { exists: true, canPush: true } : { exists: false, canPush: false }),
+      create: (req) => {
+        created = true;
+        return { owner: req.owner, repo: req.name };
+      },
     });
     const result = await resolveDestination(SOURCE, h.resolvers);
     assert.deepEqual(result, { owner: "me", repo: "new", isSandbox: true });
@@ -656,7 +677,7 @@ test("403 — non-interactive exits 2; interactive re-prompts", async () => {
         calls.push({ fn: "prompt", args: [choices] });
         promptCount += 1;
         return promptCount === 1
-          ? { kind: "create-sandbox" }
+          ? { kind: "org-sandbox", repo: { owner: SOURCE.owner, repo: "pr-backtest-sandbox" } }
           : { kind: "primary", repo: SOURCE };
       },
     };
@@ -700,13 +721,16 @@ function useTempConfigHome(): string {
 const SAVED_CHOICES: DestinationChoice[] = [
   { kind: "primary", repo: { owner: "acme", repo: "api" } },
   { kind: "saved-sandbox", repo: { owner: "me", repo: "sandbox" } },
+  { kind: "org-sandbox", repo: { owner: "acme", repo: "pr-backtest-sandbox" } },
+  { kind: "personal-sandbox", repo: { owner: "me", repo: "pr-backtest-sandbox" } },
   { kind: "different-repo" },
 ];
 
 /** Choice set the resolver builds when NO default is saved. */
 const NO_SAVED_CHOICES: DestinationChoice[] = [
   { kind: "primary", repo: { owner: "acme", repo: "api" } },
-  { kind: "create-sandbox" },
+  { kind: "org-sandbox", repo: { owner: "acme", repo: "pr-backtest-sandbox" } },
+  { kind: "personal-sandbox", repo: { owner: "me", repo: "pr-backtest-sandbox" } },
   { kind: "different-repo" },
 ];
 
@@ -727,14 +751,24 @@ test("saved-default menu — picking saved-sandbox returns that kind + repo", as
   // saved-sandbox is already the default: no remember prompt fired (no extra inject consumed).
 });
 
-test("no-default menu — picking create returns create-sandbox kind", async () => {
-  // select create-sandbox; then owner + name sub-prompts (accept defaults via "").
-  prompts.inject(["create-sandbox", "", ""]);
+test("no-default menu — picking org-sandbox returns org-sandbox kind, owner fixed to source", async () => {
+  // select org-sandbox; then ONLY a name sub-prompt (accept default via "").
+  prompts.inject(["org-sandbox", ""]);
   const prompt = makeTestPrompt();
   const sel = await prompt(NO_SAVED_CHOICES);
-  assert.equal(sel.kind, "create-sandbox");
-  // Owner defaults to the source/primary owner; name to the default sandbox name.
+  assert.equal(sel.kind, "org-sandbox");
+  // Owner is FIXED to the source owner (not prompted); name defaults.
   assert.deepEqual(sel.repo, { owner: "acme", repo: "pr-backtest-sandbox" });
+});
+
+test("no-default menu — picking personal-sandbox returns personal-sandbox kind, owner fixed to login", async () => {
+  // select personal-sandbox; then ONLY a name sub-prompt (accept default via "").
+  prompts.inject(["personal-sandbox", ""]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.kind, "personal-sandbox");
+  // Owner is FIXED to the authenticated login carried on the choice; name defaults.
+  assert.deepEqual(sel.repo, { owner: "me", repo: "pr-backtest-sandbox" });
 });
 
 test("interactive: picking primary returns primary kind + the source repo", async () => {
@@ -789,19 +823,28 @@ test("different-repo equal to the saved default skips the remember prompt", asyn
   assert.equal(saved.saved.length, 0, "no persistence for an already-default repo");
 });
 
-// --- create-sandbox owner/name editing (seam limitation noted in handoff) ---
-test("interactive: create-sandbox lets the user edit owner and name", async () => {
-  prompts.inject(["create-sandbox", "myorg", "custom-name"]);
+// --- sandbox creation: the user edits ONLY the name; the owner is FIXED ---
+test("interactive: org-sandbox lets the user edit only the name, owner stays fixed", async () => {
+  prompts.inject(["org-sandbox", "custom-name"]);
   const prompt = makeTestPrompt();
   const sel = await prompt(NO_SAVED_CHOICES);
-  assert.equal(sel.kind, "create-sandbox");
-  assert.deepEqual(sel.repo, { owner: "myorg", repo: "custom-name" });
+  assert.equal(sel.kind, "org-sandbox");
+  // Owner is NOT prompted — it stays the fixed source owner from the choice.
+  assert.deepEqual(sel.repo, { owner: "acme", repo: "custom-name" });
 });
 
-// --- create-sandbox: aborting the owner prompt cancels ---
-test("interactive: aborting the create-sandbox owner prompt throws bad-args", async () => {
-  // select create-sandbox, then Ctrl-C (undefined) at the owner prompt.
-  prompts.inject(["create-sandbox", undefined]);
+test("interactive: personal-sandbox lets the user edit only the name, owner stays the login", async () => {
+  prompts.inject(["personal-sandbox", "custom-name"]);
+  const prompt = makeTestPrompt();
+  const sel = await prompt(NO_SAVED_CHOICES);
+  assert.equal(sel.kind, "personal-sandbox");
+  assert.deepEqual(sel.repo, { owner: "me", repo: "custom-name" });
+});
+
+// --- sandbox creation: aborting the name prompt cancels ---
+test("interactive: aborting the sandbox name prompt throws bad-args", async () => {
+  // select org-sandbox, then Ctrl-C (undefined) at the name prompt.
+  prompts.inject(["org-sandbox", undefined]);
   const prompt = makeTestPrompt();
   await assert.rejects(
     () => prompt(NO_SAVED_CHOICES),
@@ -809,27 +852,16 @@ test("interactive: aborting the create-sandbox owner prompt throws bad-args", as
   );
 });
 
-// --- create-sandbox: aborting the name prompt cancels ---
-test("interactive: aborting the create-sandbox name prompt throws bad-args", async () => {
-  // select create-sandbox, accept owner default (""), then Ctrl-C at the name prompt.
-  prompts.inject(["create-sandbox", "", undefined]);
-  const prompt = makeTestPrompt();
-  await assert.rejects(
-    () => prompt(NO_SAVED_CHOICES),
-    (err: unknown) => err instanceof DestinationArgsError,
-  );
-});
-
-// --- create-sandbox: no owner entered AND no default owner → bad-args ---
-test("interactive: create-sandbox with empty owner and no default owner throws", async () => {
-  // A choice set whose primary has no repo → primaryOwner() is undefined.
+// --- sandbox creation: a create kind with no fixed owner is a builder bug ---
+test("interactive: org-sandbox with no fixed owner on the choice throws bad-args", async () => {
+  // A choice whose org-sandbox carries no repo → no fixed owner.
   const choices: DestinationChoice[] = [
-    { kind: "primary" },
-    { kind: "create-sandbox" },
+    { kind: "primary", repo: { owner: "acme", repo: "api" } },
+    { kind: "org-sandbox" },
     { kind: "different-repo" },
   ];
-  // create-sandbox, empty owner (Enter), name default (Enter).
-  prompts.inject(["create-sandbox", "", ""]);
+  // The select picks org-sandbox; no name prompt is reached.
+  prompts.inject(["org-sandbox"]);
   const prompt = makeTestPrompt();
   await assert.rejects(
     () => prompt(choices),
@@ -854,5 +886,326 @@ test("interactive: aborting the menu throws a bad-args error", async () => {
   await assert.rejects(
     () => prompt(NO_SAVED_CHOICES),
     (err: unknown) => err instanceof DestinationArgsError,
+  );
+});
+
+// =====================================================================
+// menu-and-create-routing — VAL-MENU / VAL-CREATE / VAL-PROBE coverage
+// =====================================================================
+
+/** Capture the choice kinds (in order) the resolver hands the prompt seam. */
+function capturedKinds(calls: RecordedCall[]): DestinationChoiceKind[] {
+  const promptCall = calls.find((c) => c.fn === "prompt");
+  assert.ok(promptCall, "the prompt seam was invoked");
+  const choices = promptCall.args[0] as DestinationChoice[];
+  return choices.map((c) => c.kind);
+}
+
+// --- VAL-MENU-001: exact ordered kind set with NO saved default ---
+test("VAL-MENU-001: no saved default → primary, org-sandbox, personal-sandbox, different-repo in order", async () => {
+  const h = makeHarness({
+    isTTY: true,
+    login: "me",
+    verify: () => ({ exists: true, canPush: true }),
+    // Pick primary so the resolver returns; we only assert the menu it built.
+    prompt: () => ({ kind: "primary", repo: SOURCE }),
+  });
+  await resolveDestination(SOURCE, h.resolvers);
+  assert.deepEqual(capturedKinds(h.calls), [
+    "primary",
+    "org-sandbox",
+    "personal-sandbox",
+    "different-repo",
+  ]);
+  // org-sandbox owner is the source owner; personal-sandbox owner is the login.
+  const choices = h.calls.find((c) => c.fn === "prompt")!.args[0] as DestinationChoice[];
+  assert.equal(choices.find((c) => c.kind === "org-sandbox")?.repo?.owner, "acme");
+  assert.equal(
+    choices.find((c) => c.kind === "personal-sandbox")?.repo?.owner,
+    "me",
+  );
+});
+
+// --- VAL-MENU-002: saved default adds a saved-sandbox row below primary ---
+test("VAL-MENU-002: saved default → saved-sandbox row immediately below primary; others remain", async () => {
+  const h = makeHarness({
+    isTTY: true,
+    login: "me",
+    saved: { owner: "me", repo: "sandbox" },
+    verify: () => ({ exists: true, canPush: true }),
+    prompt: () => ({ kind: "primary", repo: SOURCE }),
+  });
+  await resolveDestination(SOURCE, h.resolvers);
+  assert.deepEqual(capturedKinds(h.calls), [
+    "primary",
+    "saved-sandbox",
+    "org-sandbox",
+    "personal-sandbox",
+    "different-repo",
+  ]);
+});
+
+// --- graceful degradation: no login seam (or it throws) omits personal-sandbox ---
+test("personal-sandbox row omitted when getAuthenticatedLogin is absent", async () => {
+  const h = makeHarness({
+    isTTY: true,
+    // no `login` → seam undefined
+    verify: () => ({ exists: true, canPush: true }),
+    prompt: () => ({ kind: "primary", repo: SOURCE }),
+  });
+  await resolveDestination(SOURCE, h.resolvers);
+  assert.deepEqual(capturedKinds(h.calls), [
+    "primary",
+    "org-sandbox",
+    "different-repo",
+  ]);
+});
+
+test("personal-sandbox row omitted when getAuthenticatedLogin throws (degrade gracefully)", async () => {
+  const h = makeHarness({
+    isTTY: true,
+    login: "throw",
+    verify: () => ({ exists: true, canPush: true }),
+    prompt: () => ({ kind: "primary", repo: SOURCE }),
+  });
+  await resolveDestination(SOURCE, h.resolvers);
+  assert.deepEqual(capturedKinds(h.calls), [
+    "primary",
+    "org-sandbox",
+    "different-repo",
+  ]);
+});
+
+// --- VAL-MENU-003 + VAL-CREATE-001 (org): owner is the SOURCE owner, classified per sameRepo ---
+test("VAL-MENU-003 / VAL-CREATE-001: org-sandbox resolves+creates under the SOURCE owner", async () => {
+  const h = makeHarness({
+    isTTY: true,
+    login: "me",
+    // create reports back what it was asked to create; post-create probe is writable.
+    create: (req) => ({ owner: req.owner, repo: req.name }),
+    verify: () => ({ exists: true, canPush: true }),
+    prompt: () => ({
+      kind: "org-sandbox",
+      repo: { owner: SOURCE.owner, repo: "pr-backtest-sandbox" },
+    }),
+  });
+  const result = await resolveDestination(SOURCE, h.resolvers);
+  // Owner is the source owner; repo name differs → classified isSandbox: true.
+  assert.deepEqual(result, {
+    owner: "acme",
+    repo: "pr-backtest-sandbox",
+    isSandbox: true,
+  });
+  // The create-call owner is the SOURCE owner (VAL-CREATE-001).
+  const createCall = h.calls.find((c) => c.fn === "create");
+  assert.deepEqual(createCall?.args, ["acme", "pr-backtest-sandbox"]);
+});
+
+// --- VAL-MENU-004 + VAL-CREATE-001 (personal): owner is the AUTHENTICATED LOGIN ---
+test("VAL-MENU-004 / VAL-CREATE-001: personal-sandbox resolves+creates under the LOGIN, cross-owner", async () => {
+  const h = makeHarness({
+    isTTY: true,
+    login: "me",
+    create: (req) => ({ owner: req.owner, repo: req.name }),
+    verify: () => ({ exists: true, canPush: true }),
+    prompt: () => ({
+      kind: "personal-sandbox",
+      repo: { owner: "me", repo: "pr-backtest-sandbox" },
+    }),
+  });
+  const result = await resolveDestination(SOURCE, h.resolvers);
+  // Owner is the login (me), differs from the source owner (acme) → cross-owner sandbox.
+  assert.deepEqual(result, {
+    owner: "me",
+    repo: "pr-backtest-sandbox",
+    isSandbox: true,
+  });
+  // The create-call owner is the AUTHENTICATED LOGIN, never the source/primary owner.
+  const createCall = h.calls.find((c) => c.fn === "create");
+  assert.deepEqual(createCall?.args, ["me", "pr-backtest-sandbox"]);
+  assertSourceNeverWritten(h.calls);
+});
+
+// --- VAL-PROBE-002: existing-repo write probe reads permissions.push (canPush) ---
+test("VAL-PROBE-002: existing repo's write probe reads permissions.push (canPush=false blocks)", async () => {
+  // The injected verify reports canPush:false for the existing repo → not writable.
+  const h = makeHarness({
+    flags: { sandbox: "me/exists" },
+    verify: () => ({ exists: true, canPush: false }),
+  });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => {
+      assert.ok(err instanceof DestinationApiError);
+      assert.match(err.message, /me\/exists/);
+      assert.match(err.message, /Contents:write \+ Pull requests:write/);
+      return true;
+    },
+  );
+});
+
+// --- VAL-PROBE-003 (non-interactive): post-create re-probe of --sandbox X --create-sandbox ---
+test("VAL-PROBE-003: --sandbox X --create-sandbox re-probes after create; not-writable → exit 2, no fall-through", async () => {
+  let createdYet = false;
+  const h = makeHarness({
+    flags: { sandbox: "me/new", createSandbox: true },
+    // First verify (pre-create) reports missing; the post-create re-probe reports
+    // exists-but-not-writable. Drive that off whether create has happened.
+    verify: () =>
+      createdYet
+        ? { exists: true, canPush: false }
+        : { exists: false, canPush: false },
+    create: (req) => {
+      createdYet = true;
+      return { owner: req.owner, repo: req.name };
+    },
+  });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => {
+      assert.ok(err instanceof DestinationApiError);
+      assert.match(err.message, /me\/new/);
+      assert.match(err.message, /Contents:write \+ Pull requests:write/);
+      return true;
+    },
+  );
+  // Create happened, then a SECOND verify (the re-probe) ran AFTER it.
+  const idxCreate = h.calls.findIndex((c) => c.fn === "create");
+  const verifyIdxs = h.calls
+    .map((c, i) => (c.fn === "verify" ? i : -1))
+    .filter((i) => i >= 0);
+  assert.ok(idxCreate >= 0, "create ran");
+  assert.ok(
+    verifyIdxs.some((i) => i > idxCreate),
+    "a write re-probe (verify) ran AFTER the create",
+  );
+  assertSourceNeverWritten(h.calls);
+});
+
+test("VAL-PROBE-003: --sandbox X --create-sandbox proceeds when the post-create re-probe is writable", async () => {
+  let createdYet = false;
+  const h = makeHarness({
+    flags: { sandbox: "me/new", createSandbox: true },
+    verify: () =>
+      createdYet
+        ? { exists: true, canPush: true }
+        : { exists: false, canPush: false },
+    create: (req) => {
+      createdYet = true;
+      return { owner: req.owner, repo: req.name };
+    },
+  });
+  const result = await resolveDestination(SOURCE, h.resolvers);
+  assert.deepEqual(result, { owner: "me", repo: "new", isSandbox: true });
+});
+
+// --- VAL-PROBE-003 (interactive): post-create re-probe of a create kind ---
+test("VAL-PROBE-003: interactive create not-writable post-create → re-present menu, never push the source", async () => {
+  let promptCount = 0;
+  let createdYet = false;
+  const calls: RecordedCall[] = [];
+  const resolvers: DestinationResolvers = {
+    getFlags: () => ({}),
+    getDefaultDestination: () => undefined,
+    getIsTTY: () => true,
+    getAuthenticatedLogin: async () => "me",
+    verifyDestination: async (owner, repo) => {
+      calls.push({ fn: "verify", args: [owner, repo] });
+      // The created personal sandbox re-probes not-writable; the primary (acme) is writable.
+      if (owner === "me") {
+        return createdYet
+          ? { exists: true, canPush: false }
+          : { exists: false, canPush: false };
+      }
+      return { exists: true, canPush: true };
+    },
+    createSandbox: async (req) => {
+      calls.push({ fn: "create", args: [req.owner, req.name] });
+      createdYet = true;
+      return { owner: req.owner, repo: req.name };
+    },
+    prompt: async (choices) => {
+      calls.push({ fn: "prompt", args: [choices] });
+      promptCount += 1;
+      return promptCount === 1
+        ? { kind: "personal-sandbox", repo: { owner: "me", repo: "pr-backtest-sandbox" } }
+        : { kind: "primary", repo: SOURCE };
+    },
+  };
+  const result = await resolveDestination(SOURCE, resolvers);
+  // Fell back to NOTHING automatically — the user re-picked primary on the re-presented menu.
+  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.ok(promptCount >= 2, "menu re-presented after a non-writable post-create re-probe");
+  // The create→re-probe order held: create, then a verify on me/* after it.
+  const idxCreate = calls.findIndex((c) => c.fn === "create");
+  const reprobe = calls.findIndex(
+    (c, i) => i > idxCreate && c.fn === "verify" && c.args[0] === "me",
+  );
+  assert.ok(reprobe > idxCreate, "re-probe ran after create");
+  // The source was never a CREATE target (a verify of primary is legitimate once
+  // the user re-picks it; INV-READONLY is about create/push, not the primary probe).
+  assert.ok(
+    !calls.some((c) => c.fn === "create" && c.args[0] === SOURCE.owner && c.args[1] === SOURCE.repo),
+    "source was never a create target",
+  );
+});
+
+// --- VAL-CREATE-002: both create paths request a private repo (via createPrivateRepo) ---
+test("VAL-CREATE-002: org and personal creation both go through createPrivateRepo (private:true)", async () => {
+  // org sandbox: owner != authed login → createInOrg, private true.
+  {
+    const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
+    const create = makeSandboxCreator(octokit);
+    await create({ owner: "acme", name: "pr-backtest-sandbox" });
+    const c = calls.find((x) => x.method === "createInOrg");
+    assert.ok(c, "org path used createInOrg");
+    assert.equal((c.args as { private: unknown }).private, true);
+  }
+  // personal sandbox: owner == authed login → createForAuthenticatedUser, private true.
+  {
+    const { octokit, calls } = makeFakeOctokit({ authedLogin: "me" });
+    const create = makeSandboxCreator(octokit);
+    await create({ owner: "me", name: "pr-backtest-sandbox" });
+    const c = calls.find((x) => x.method === "createForAuthenticatedUser");
+    assert.ok(c, "personal path used createForAuthenticatedUser");
+    assert.equal((c.args as { private: unknown }).private, true);
+  }
+});
+
+// --- VAL-CREATE-004: interactive create 403 re-prompts; never writes source ---
+test("VAL-CREATE-004: interactive personal-sandbox create 403 re-presents the menu, never writes source", async () => {
+  const failingCreate = makeSandboxCreator(
+    makeFakeOctokit({ authedLogin: "me", failStatus: 403 }).octokit,
+  );
+  let promptCount = 0;
+  const calls: RecordedCall[] = [];
+  const resolvers: DestinationResolvers = {
+    getFlags: () => ({}),
+    getDefaultDestination: () => undefined,
+    getIsTTY: () => true,
+    getAuthenticatedLogin: async () => "me",
+    verifyDestination: async (owner, repo) => {
+      calls.push({ fn: "verify", args: [owner, repo] });
+      return { exists: true, canPush: true };
+    },
+    createSandbox: async (req) => {
+      calls.push({ fn: "create", args: [req.owner, req.name] });
+      return failingCreate(req); // 403
+    },
+    prompt: async (choices) => {
+      calls.push({ fn: "prompt", args: [choices] });
+      promptCount += 1;
+      return promptCount === 1
+        ? { kind: "personal-sandbox", repo: { owner: "me", repo: "pr-backtest-sandbox" } }
+        : { kind: "primary", repo: SOURCE };
+    },
+  };
+  const result = await resolveDestination(SOURCE, resolvers);
+  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.ok(promptCount >= 2, "menu re-presented after a create 403");
+  // The source was never a CREATE target (the only create attempt was me/*).
+  assert.ok(
+    !calls.some((c) => c.fn === "create" && c.args[0] === SOURCE.owner && c.args[1] === SOURCE.repo),
+    "source was never a create target",
   );
 });

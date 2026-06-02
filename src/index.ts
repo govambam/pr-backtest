@@ -245,6 +245,12 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
           deps.verifyRepo(octokit, vOwner, vRepo),
         createSandbox: deps.makeSandboxCreator(octokit),
         prompt: deps.makeInteractivePrompt(),
+        // Minimal seam wiring: back the personal-sandbox menu row with the
+        // authenticated login. Per-purpose token routing is finalized by the
+        // later routing feature; here a single octokit suffices. The resolver
+        // degrades gracefully if this throws.
+        getAuthenticatedLogin: async () =>
+          (await octokit.users.getAuthenticated()).data.login,
       },
     );
     destOwner = resolved.owner;
