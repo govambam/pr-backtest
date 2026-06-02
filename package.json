@@ -22,8 +22,8 @@
     "test": "node --import tsx --test test/*.test.ts",
     "prepare": "tsc",
     "prepublishOnly": "tsc",
-    "reinstall": "npm run build && npm install -g .",
-    "update": "git pull --ff-only && npm install && npm run reinstall"
+    "reinstall": "npm run build && npm install -g . && echo \"pr-backtest installed from $(git branch --show-current) @ $(git rev-parse --short HEAD)\"",
+    "update": "git checkout main && git pull --ff-only && npm install && npm run reinstall"
   },
   "dependencies": {
     "@octokit/rest": "^21.1.1",

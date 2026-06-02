@@ -24,14 +24,18 @@ If you installed from a local clone (`npm install -g .`), the global copy is a
 snapshot — a `git pull` alone does not update it. From the repo root:
 
 ```bash
-npm run update     # git pull --ff-only, install deps, rebuild, reinstall globally
+npm run update     # switch to main, pull, install deps, rebuild, reinstall globally
 ```
 
-Or, when you already have the changes locally and only need to rebuild and
-reinstall the global copy:
+`npm run update` always installs the latest `main` — it checks out `main` first,
+so it works no matter which branch you're currently on — and prints the branch
+and commit it installed so you can confirm.
+
+To rebuild and reinstall from whatever you have checked out **right now** (e.g.
+to test a feature branch before it merges), use:
 
 ```bash
-npm run reinstall  # rebuild dist/ and reinstall globally
+npm run reinstall  # rebuild dist/ and reinstall globally from the current branch
 ```
 
 ## Setup
