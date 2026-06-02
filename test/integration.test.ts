@@ -5,9 +5,10 @@
  * --------------
  * When `GITHUB_TOKEN` is set, this test drives the built CLI end-to-end against
  * a public fixture PR and asserts three properties:
- *   1. The created PR's diff matches the target commit's diff.
+ *   1. The created PR's diff matches the FULL PR diff (merge-base..head), since
+ *      the tool recreates the whole PR by default.
  *   2. The pushed branches are named `backtest-pr<N>-<shortSha>-base` /
- *      `backtest-pr<N>-<shortSha>-head` (the target commit's short SHA).
+ *      `backtest-pr<N>-<shortSha>-head` (the PR head/tip short SHA).
  *   3. Cleanup happened — no leftover `/tmp/pr-backtest-*` directory remains.
  *
  * It shells out to `node dist/cli.js <fixture-pr> -y` (rather than importing
@@ -38,8 +39,6 @@ import { fileURLToPath } from "node:url";
 import { Octokit } from "@octokit/rest";
 
 import { parseUrl } from "../src/parseUrl.js";
-import { resolveTarget } from "../src/resolveCommit.js";
-import type { PrCommit } from "../src/resolveCommit.js";
 
 // Default public fixture PR. Override with TEST_FIXTURE_REPO to point at a repo
 // you control (required for a real run, since the tool needs push access).
@@ -72,19 +71,23 @@ test(
     const { owner, repo, number } = parseUrl(FIXTURE_PR);
     const octokit = new Octokit({ auth: token });
 
-    // Pre-compute the target commit (default `initial`) the way the tool does,
-    // so we can compare the resulting PR's diff against the target's diff.
-    const commits = await octokit.paginate(octokit.pulls.listCommits, {
+    // Pre-compute the expected head/base the way the tool does (no --commit ->
+    // recreate the WHOLE PR), so we can compare the resulting PR against it.
+    // Head is the PR tip (prData.head.sha); base is the PR's merge-base, the
+    // commit GitHub diffs the PR against.
+    const prData = await octokit.pulls.get({
       owner,
       repo,
       pull_number: number,
-      per_page: 100,
     });
-    const prCommits: PrCommit[] = commits.map((c) => ({
-      sha: c.sha,
-      parents: c.parents.map((p) => ({ sha: p.sha })),
-    }));
-    const target = resolveTarget("initial", prCommits);
+    const headSha = prData.data.head.sha;
+    const compareBase = await octokit.repos.compareCommits({
+      owner,
+      repo,
+      base: prData.data.base.sha,
+      head: headSha,
+    });
+    const mergeBase = compareBase.data.merge_base_commit.sha;
 
     const beforeTemp = leftoverTempDirs();
 
@@ -97,9 +100,9 @@ test(
     const prUrl = lines[lines.length - 1];
     assert.match(prUrl, /\/pull\/\d+$/, "final stdout line should be the created PR URL");
 
-    // 2. Branch names follow the backtest-pr<N>-<shortSha>-{head,base} convention
-    //    (the (PR, commit) pair is the backtest identity).
-    const shortSha = target.sha.slice(0, 7);
+    // 2. Branch names follow the backtest-pr<N>-<shortSha>-{head,base} convention,
+    //    where <shortSha> is the PR HEAD (tip) short SHA.
+    const shortSha = headSha.slice(0, 7);
     const headBranch = `backtest-pr${number}-${shortSha}-head`;
     const baseBranch = `backtest-pr${number}-${shortSha}-base`;
     const createdNumber = Number(prUrl.split("/").pop());
@@ -110,28 +113,32 @@ test(
     });
     assert.equal(created.data.head.ref, headBranch, "head branch name");
     assert.equal(created.data.base.ref, baseBranch, "base branch name");
-    // head must point at the target commit; base at its parent.
-    assert.equal(created.data.head.sha, target.sha, "head is at the target commit");
+    // The default recreation spans the WHOLE PR: head at the PR tip, base at the
+    // PR's merge-base.
+    assert.equal(created.data.head.sha, headSha, "head is at the PR tip (full PR)");
+    assert.equal(created.data.base.sha, mergeBase, "base is at the PR merge-base");
 
-    // 1. The created PR's diff matches the target commit's diff. Compare the set
-    //    of changed files between base..head against the target commit's files.
+    // 1. The created PR's diff matches the FULL PR diff. Compare the set of
+    //    changed files of the backtest PR against the file set of the original
+    //    PR's full diff (merge-base..head).
     const prFiles = await octokit.paginate(octokit.pulls.listFiles, {
       owner,
       repo,
       pull_number: createdNumber,
       per_page: 100,
     });
-    const targetCommit = await octokit.repos.getCommit({
+    const fullDiff = await octokit.repos.compareCommits({
       owner,
       repo,
-      ref: target.sha,
+      base: mergeBase,
+      head: headSha,
     });
     const prFileSet = new Set(prFiles.map((f) => f.filename).sort());
-    const targetFileSet = new Set((targetCommit.data.files ?? []).map((f) => f.filename).sort());
+    const fullDiffFileSet = new Set((fullDiff.data.files ?? []).map((f) => f.filename).sort());
     assert.deepEqual(
       [...prFileSet],
-      [...targetFileSet],
-      "changed-file set of the backtest PR matches the target commit",
+      [...fullDiffFileSet],
+      "changed-file set of the backtest PR matches the full PR diff",
     );
 
     // 3. Cleanup: the run must not leave a new /tmp/pr-backtest-* dir behind.

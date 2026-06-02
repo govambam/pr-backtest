@@ -45,7 +45,7 @@ import {
 import {
   createPullRequest,
   findExistingPr,
-  getCommitParentSha,
+  getMergeBase,
   getPullRequest,
   isStatus,
   listPullRequestCommits,
@@ -81,7 +81,7 @@ import type { InheritedCredential } from "./inheritedAuth.js";
 import { error, info, setVerbose, success, traceOp } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, type PlanInput } from "./plan.js";
-import { resolveBase, resolveTarget } from "./resolveCommit.js";
+import { countCommitsUpToHead, resolveHead } from "./resolveCommit.js";
 import { shortSha } from "./util.js";
 
 /** The tool's own repository, linked from the generated PR body. */
@@ -153,7 +153,7 @@ export interface RunBacktestDeps {
   readConfig: typeof readConfig;
   getPullRequest: typeof getPullRequest;
   listPullRequestCommits: typeof listPullRequestCommits;
-  getCommitParentSha: typeof getCommitParentSha;
+  getMergeBase: typeof getMergeBase;
   findExistingPr: typeof findExistingPr;
   createPullRequest: typeof createPullRequest;
   confirmPlan: typeof confirmPlan;
@@ -191,7 +191,7 @@ const defaultDeps: RunBacktestDeps = {
   readConfig,
   getPullRequest,
   listPullRequestCommits,
-  getCommitParentSha,
+  getMergeBase,
   findExistingPr,
   createPullRequest,
   confirmPlan,
@@ -207,7 +207,8 @@ const defaultDeps: RunBacktestDeps = {
 /** Options for a single backtest run, as parsed by the CLI. */
 export interface RunBacktestOptions {
   prUrl: string;
-  commit: string;
+  /** `--commit <sha>`: cutoff head; omit to recreate the full PR (all commits). */
+  commit?: string;
   yes: boolean;
   /** `--primary`: land the backtest in the PR's own repo (no prompt). */
   primary?: boolean;
@@ -576,12 +577,18 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //    maps to exit 2.
   let prTitle: string;
   let prAuthor: string;
+  let prHeadSha: string;
+  let prBaseSha: string;
+  let prBaseRef: string;
   let prCommits: Awaited<ReturnType<typeof listPullRequestCommits>>;
   const readTrace = traceOp(`Read PR ${redactedRepoRef(owner, repo)}#${number}`);
   try {
     const pr = await deps.getPullRequest(readOctokit, owner, repo, number);
     prTitle = pr.title;
     prAuthor = pr.user;
+    prHeadSha = pr.headSha;
+    prBaseSha = pr.baseSha;
+    prBaseRef = pr.baseRef;
     prCommits = await deps.listPullRequestCommits(readOctokit, owner, repo, number);
   } catch (err) {
     readTrace.fail();
@@ -590,24 +597,30 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   readTrace.done(`"${prTitle}"`);
 
-  // 8. Resolve the target commit and its base (first parent). An invalid
-  //    --commit value is a bad-args failure (exit 1). Pre-fetch the parent via
-  //    GitHub (READ Octokit) only when the listed commit carries no parent of
-  //    its own, so the synchronous `resolveBase` callback never does I/O.
+  // 8. Resolve the backtest head (the PR head by default, or the --commit
+  //    cutoff) and base. An invalid --commit value is a bad-args failure
+  //    (exit 1). The base is the PR's merge-base — the commit GitHub diffs
+  //    against — so the recreation spans EVERY commit from the branch point up
+  //    to the head, matching the original PR's full change set rather than a
+  //    single commit. A `--commit <sha>` cutoff keeps the same merge-base and
+  //    only moves the head earlier, reproducing the PR as it stood at that
+  //    point (all commits up to there).
   let targetSha: string;
-  let baseSha: string;
   try {
-    const target = resolveTarget(opts.commit, prCommits);
-    let prefetchedParent: string | null = null;
-    if (!target.parents[0]) {
-      prefetchedParent = await deps.getCommitParentSha(readOctokit, owner, repo, target.sha);
-    }
-    baseSha = resolveBase(target, () => prefetchedParent ?? "");
-    targetSha = target.sha;
+    targetSha = resolveHead(opts.commit, prCommits, prHeadSha);
   } catch (err) {
     error(messageOf(err));
     process.exit(EXIT.BAD_ARGS);
   }
+  let baseSha: string;
+  try {
+    baseSha = await deps.getMergeBase(readOctokit, owner, repo, prBaseSha, prHeadSha);
+  } catch (err) {
+    error(messageOf(err));
+    process.exit(EXIT.API_ERROR);
+  }
+  const commitCount = countCommitsUpToHead(prCommits, targetSha);
+  const isFullPr = targetSha === prHeadSha;
 
   // 9. Branch names include the SHORT SHA of the target commit,
   //    so the (PR, commit) pair is the backtest identity: the same PR at
@@ -647,15 +660,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
 
   // 11. Show the plan and confirm (unless -y). A decline is a clean exit 0. The
   //     plan's two-token annotation is driven off the run's resolved token count.
-  const targetLabel = opts.commit === "initial" ? "initial commit" : "selected commit";
+  const commits = `${commitCount} commit${commitCount === 1 ? "" : "s"}`;
+  const headLabel = isFullPr ? `PR head — ${commits}` : `cutoff — ${commits} up to here`;
   const planInput: PlanInput = {
     ownerRepo: `${owner}/${repo}`,
     prNumber: number,
     prTitle,
     prAuthor,
-    targetSha,
-    targetLabel,
+    headSha: targetSha,
+    headLabel,
     baseSha,
+    baseLabel: `merge-base with ${prBaseRef}`,
     headBranch,
     baseBranch,
     targetRepo: `${destOwner}/${destRepo}`,
@@ -729,11 +744,14 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //      (exit 4) or reports a no-diff (exit 2); any other API error → exit 2.
   //      Open-PR has no git-layer trace, so narrate its ✓ completion here.
   const openTrace = traceOp("Opened backtest PR");
+  const scope = isFullPr
+    ? `(${commitCount} commit${commitCount === 1 ? "" : "s"})`
+    : `up to \`${targetSha}\` (${commitCount} commit${commitCount === 1 ? "" : "s"})`;
   const body = [
-    `Backtest of ${owner}/${repo}#${number} at \`${targetSha}\`.`,
+    `Backtest of ${owner}/${repo}#${number} ${scope}.`,
     "",
     `Recreated by [pr-backtest](${PROJECT_URL}) so a PR-review bot can ` +
-      `review the code as it existed at the target commit.`,
+      `review the original change set.`,
   ].join("\n");
   try {
     prUrl = await deps.createPullRequest(

@@ -22,12 +22,14 @@ export interface PlanInput {
   prTitle: string;
   /** The original PR author's login (no leading @ — added during render). */
   prAuthor: string;
-  /** Full target SHA (rendered short). */
-  targetSha: string;
-  /** Human label for the target, e.g. "initial commit" or a commit subject. */
-  targetLabel: string;
-  /** Full base SHA (rendered short). */
+  /** Full head SHA (rendered short) — the PR head, or the chosen cutoff. */
+  headSha: string;
+  /** Human label for the head, e.g. "PR head — 17 commits" or "cutoff — 10 commits up to here". */
+  headLabel: string;
+  /** Full base SHA (rendered short) — the PR's merge-base. */
   baseSha: string;
+  /** Human label for the base, e.g. "merge-base with main". */
+  baseLabel: string;
   /** The head branch name, e.g. "backtest-pr123-head". */
   headBranch: string;
   /** The base branch name, e.g. "backtest-pr123-base". */
@@ -55,7 +57,7 @@ export interface PlanInput {
  * Returns the full plan as a string (caller decides where to print it).
  */
 export function renderPlan(input: PlanInput): string {
-  const target = shortSha(input.targetSha);
+  const head = shortSha(input.headSha);
   const base = shortSha(input.baseSha);
   const cloneDest = "a temp directory";
   const dest = input.targetRepo ?? input.ownerRepo;
@@ -85,8 +87,8 @@ export function renderPlan(input: PlanInput): string {
     (destDiffers ? `   (read-only — source is never written${sourceTokenTag})` : "");
   const header = [
     prLine,
-    `Target:  ${target} (${input.targetLabel})`,
-    `Base:    ${base} (parent of target)`,
+    `Head:    ${head} (${input.headLabel})`,
+    `Base:    ${base} (${input.baseLabel})`,
   ];
   if (destDiffers) {
     header.push(
@@ -99,9 +101,9 @@ export function renderPlan(input: PlanInput): string {
     "",
     "Plan:",
     `  1. Clone ${dest} into ${cloneDest}`,
-    `  2. Fetch commits ${target} and ${base} from ${fetchFrom}`,
+    `  2. Fetch commits ${head} and ${base} from ${fetchFrom}`,
     `  3. Push ${base} → ${dest}:${input.baseBranch}`,
-    `  4. Push ${target} → ${dest}:${input.headBranch}`,
+    `  4. Push ${head} → ${dest}:${input.headBranch}`,
     `  5. Open PR in ${dest}: ${input.headBranch} → ${input.baseBranch}`,
   ];
 

@@ -8,9 +8,10 @@ const input: PlanInput = {
   prNumber: 123,
   prTitle: "Add retry logic to webhook handler",
   prAuthor: "stevem",
-  targetSha: "a1b2c3d4e5f6071829",
-  targetLabel: "initial commit",
+  headSha: "a1b2c3d4e5f6071829",
+  headLabel: "PR head — 3 commits",
   baseSha: "f0e9d8c7b6a5040312",
+  baseLabel: "merge-base with main",
   headBranch: "backtest-pr123-head",
   baseBranch: "backtest-pr123-base",
 };
@@ -30,6 +31,15 @@ test("renderPlan uses short (7-char) SHAs", () => {
   // full SHAs must not leak into the rendered plan
   assert.ok(!out.includes("a1b2c3d4e5f6071829"));
   assert.ok(!out.includes("f0e9d8c7b6a5040312"));
+});
+
+test("renderPlan labels Head and Base lines (not Target)", () => {
+  const out = renderPlan(input);
+  assert.match(out, /Head:\s+a1b2c3d \(PR head — 3 commits\)/);
+  assert.match(out, /Base:\s+f0e9d8c \(merge-base with main\)/);
+  // The old "Target:" label and hardcoded "(parent of target)" are gone.
+  assert.doesNotMatch(out, /Target:/);
+  assert.doesNotMatch(out, /parent of target/);
 });
 
 test("renderPlan has a Plan: header and numbered steps", () => {
