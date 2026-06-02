@@ -156,72 +156,12 @@ export async function canWrite(
   }
 }
 
-/** Validate a token against a capability (read source / write dest). */
-async function validates(
-  octokit: ResolverOctokit,
-  capability: "read" | "write",
-  source: RepoRef,
-  destination: RepoRef,
-): Promise<boolean> {
-  return capability === "read"
-    ? canRead(octokit, source)
-    : canWrite(octokit, destination);
-}
-
-/**
- * The per-capability tokens a run needs, returned to the orchestrator. They may
- * be the SAME string (Primary, or single-PAT Sandbox), in which case `twoToken`
- * is false and the orchestrator builds a single Octokit.
- */
-export interface RunTokens {
-  /** Authenticates source reads + the source-remote fetch. */
-  readToken: string;
-  /** Authenticates clone/push/create/open-PR on the destination. */
-  writeToken: string;
-  /** True only when the read and write tokens are distinct strings. */
-  twoToken: boolean;
-}
-
 /** A resolved candidate token plus its provenance (pre-persistence). */
 interface Candidate {
   token: string;
   source: TokenSource;
   /** True only when this token came from a fresh interactive paste. */
   fromPaste: boolean;
-}
-
-/**
- * Injected getters for {@link resolveRunTokens} (mirror the existing
- * test-injection style). Every seam is overridable so tests drive resolution with
- * no network and no TTY; defaults wire the real env/config/paste paths.
- */
-export interface ResolveRunTokensOptions {
-  /** The source repo (read capability target). */
-  source: RepoRef;
-  /** The destination repo (write capability target). */
-  destination: RepoRef;
-  /**
-   * True for a Primary run (destination === source). Chooses the Primary
-   * read+write prompt copy over the Sandbox two-step copy. This is a LOCAL
-   * destination fact (NOT owner logic).
-   */
-  isPrimary: boolean;
-  /** Octokit factory; injected in tests. Defaults to {@link makeOctokit}. */
-  makeOctokit?: MakeOctokit;
-  /** Read GITHUB_TOKEN (write env). Defaults to the process env. */
-  getWriteEnvToken?: () => string | undefined;
-  /** Read GITHUB_SOURCE_TOKEN (read env). Defaults to the process env. */
-  getSourceEnvToken?: () => string | undefined;
-  /** Read the persisted config (for the saved slots). Defaults to {@link readConfig}. */
-  getConfig?: () => Config | null;
-  /** Persist a slot update. Defaults to {@link mergeConfig}. */
-  saveConfig?: (update: Partial<Config>) => void;
-  /** Interactive paste for the Primary read+write source token. TTY-only; null off-TTY. */
-  getPrimaryPaste?: (source: RepoRef) => Promise<string | null>;
-  /** Interactive paste for the Sandbox read-only source token (#1). TTY-only; null off-TTY. */
-  getSandboxReadPaste?: (source: RepoRef) => Promise<string | null>;
-  /** Interactive paste for the Sandbox write destination token (#2). TTY-only; null off-TTY. */
-  getSandboxWritePaste?: (destination: RepoRef) => Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,65 +262,6 @@ async function captureLogin(octokit: ResolverOctokit): Promise<string> {
   }
 }
 
-/**
- * Resolve one capability through its fixed precedence. `candidates` are the
- * non-interactive sources in order (env, saved slot, optional write-reuse); each
- * is tried and accepted on the first that validates. If none validate, the
- * bounded interactive paste loop runs (TTY only). Each candidate is registered
- * with the scrubber the instant it is read, BEFORE its first request.
- *
- * Returns the resolved token plus whether it came from a fresh paste (so the
- * caller can persist + capture @login). Throws when nothing validates and there
- * is no interactive path — the caller maps to the right non-interactive error.
- */
-async function resolveCapability(
-  capability: "read" | "write",
-  candidates: Array<Candidate | null>,
-  getPaste: () => Promise<string | null>,
-  make: MakeOctokit,
-  source: RepoRef,
-  destination: RepoRef,
-): Promise<Candidate> {
-  for (const candidate of candidates) {
-    if (!candidate || candidate.token.length === 0) {
-      continue;
-    }
-    registerSecret(candidate.token);
-    const octokit = make(candidate.token);
-    if (await validates(octokit, capability, source, destination)) {
-      return candidate;
-    }
-  }
-
-  // Bounded interactive paste loop. Off-TTY the getter returns null on the first
-  // call, so the loop exits immediately and the caller throws the clear error.
-  for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
-    const pasted = await getPaste();
-    if (!pasted || pasted.length === 0) {
-      break;
-    }
-    registerSecret(pasted);
-    const octokit = make(pasted);
-    if (await validates(octokit, capability, source, destination)) {
-      return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
-    }
-    if (attempt < PASTE_MAX_ATTEMPTS - 1) {
-      info(
-        capability === "read"
-          ? `That token cannot read ${source.owner}/${source.repo}. Check it has ` +
-              "Contents: Read + Pull requests: Read on that repo, then try again."
-          : `That token cannot write ${destination.owner}/${destination.repo}. ` +
-              "Check it has Contents + Pull requests: Read & write on that repo, then try again.",
-      );
-    }
-  }
-
-  // Exhausted with no validating token and no interactive path.
-  throw capability === "read"
-    ? new NoSourceTokenNonInteractiveError(source.owner, source.repo)
-    : new NoTokenNonInteractiveError();
-}
-
 /** Look up a saved slot as a non-paste candidate (null when absent). */
 function slotCandidate(slot: TokenSlot | undefined): Candidate | null {
   if (!slot || slot.token.length === 0) {
@@ -397,124 +278,14 @@ function envCandidate(value: string | undefined): Candidate | null {
   return { token: value, source: inferPasteSource(value), fromPaste: false };
 }
 
-/**
- * Resolve a token per capability (spec §5) and return the run's read/write
- * tokens. This is the single entry the orchestrator (index.ts) calls for the
- * common existing-repo path.
- *
- * Write precedence: GITHUB_TOKEN env -> saved destinationToken -> interactive
- * paste. Read precedence: GITHUB_SOURCE_TOKEN env -> saved sourceToken -> the
- * already-resolved write token IFF it reads the source (single-PAT detection) ->
- * interactive paste.
- *
- * Single-PAT detection (spec §4.3): the write token is re-offered as the read
- * candidate; when it reads the source it fills both slots and NO read prompt is
- * shown. `twoToken = (readToken !== writeToken)`.
- *
- * Persistence: a freshly pasted write token persists to `destinationToken`; a
- * freshly pasted read token to `sourceToken` — each via the injected
- * `saveConfig`, storing `{ token, username: @login, source }`. In the single-PAT
- * case the same value already fills both slots (the write paste persists it; the
- * read reuse needs no second write).
- *
- * Each token is registered with the secret scrubber before its first request.
- * Throws {@link NoTokenNonInteractiveError} (write) or
- * {@link NoSourceTokenNonInteractiveError} (read) when a capability cannot be
- * covered and there is no interactive path.
- */
-export async function resolveRunTokens(
-  options: ResolveRunTokensOptions,
-): Promise<RunTokens> {
-  const { source, destination, isPrimary } = options;
-  const make = options.makeOctokit ?? makeOctokit;
-  const getWriteEnv =
-    options.getWriteEnvToken ?? (() => process.env.GITHUB_TOKEN);
-  const getSourceEnv =
-    options.getSourceEnvToken ?? (() => process.env.GITHUB_SOURCE_TOKEN);
-  const getConfig = options.getConfig ?? (() => readConfig());
-  const saveConfig = options.saveConfig ?? mergeConfig;
-  const getPrimaryPaste = options.getPrimaryPaste ?? defaultGetPrimaryPaste;
-  const getSandboxReadPaste =
-    options.getSandboxReadPaste ?? defaultGetSandboxReadPaste;
-  const getSandboxWritePaste =
-    options.getSandboxWritePaste ?? defaultGetSandboxWritePaste;
-
-  const cfg = getConfig();
-
-  // ----- WRITE capability: GITHUB_TOKEN -> saved destinationToken -> paste -----
-  // For Primary the destination IS the source, so the single paste is framed as
-  // read+write on the source; for Sandbox it is framed as write on the dest.
-  const writePaste = isPrimary
-    ? () => getPrimaryPaste(source)
-    : () => getSandboxWritePaste(destination);
-
-  const write = await resolveCapability(
-    "write",
-    [envCandidate(getWriteEnv()), slotCandidate(cfg?.destinationToken)],
-    writePaste,
-    make,
-    source,
-    destination,
-  );
-
-  if (write.fromPaste) {
-    const login = await captureLogin(make(write.token));
-    success(`Authenticated as @${login}`);
-    saveConfig({
-      destinationToken: { token: write.token, username: login, source: write.source },
-    });
-    success(`Token saved (mode 0600).`);
-  }
-
-  // ----- READ capability: GITHUB_SOURCE_TOKEN -> saved sourceToken -----
-  // -----   -> the resolved write token IFF it reads the source -> paste -----
-  // The write token is offered as a (non-paste) read candidate AFTER the env and
-  // saved slot: single-PAT detection. When it validates, no read prompt fires.
-  const writeReuse: Candidate = {
-    token: write.token,
-    source: write.source,
-    fromPaste: false,
-  };
-
-  const read = await resolveCapability(
-    "read",
-    [
-      envCandidate(getSourceEnv()),
-      slotCandidate(cfg?.sourceToken),
-      writeReuse,
-    ],
-    () => getSandboxReadPaste(source),
-    make,
-    source,
-    destination,
-  );
-
-  if (read.fromPaste) {
-    const login = await captureLogin(make(read.token));
-    success(`Authenticated as @${login}`);
-    saveConfig({
-      sourceToken: { token: read.token, username: login, source: read.source },
-    });
-    success(`Token saved (mode 0600).`);
-  }
-
-  return {
-    readToken: read.token,
-    writeToken: write.token,
-    twoToken: read.token !== write.token,
-  };
-}
-
 // ===========================================================================
-// Standalone per-capability resolvers (additive).
+// Standalone per-capability resolvers.
 //
-// `resolveRunTokens` above is the common EXISTING-repo path. The orchestration
-// feature needs to compose the SANDBOX-CREATION path, where the destination does
-// not exist yet so `canWrite` (which validates an existing repo) cannot judge a
-// candidate. These resolvers take an injected `accept` predicate so the CALLER
-// decides validity — e.g. the write `accept` can run verify-or-CREATE and accept
-// a token that can create the missing repo. Each shares the same precedence +
-// bounded-paste + scrubber discipline as `resolveCapability`.
+// Each resolver takes an injected `accept` predicate so the CALLER decides
+// validity — e.g. the write `accept` can run verify-or-CREATE and accept a token
+// that can create a missing destination, which a plain existing-repo `canWrite`
+// check could not judge. Each shares the same precedence + bounded-paste +
+// scrubber discipline.
 // ===========================================================================
 
 /** A token resolved by a standalone resolver, with its captured `@login`. */
