@@ -82,6 +82,18 @@ test("--help documents GITHUB_TOKEN and GITHUB_SOURCE_TOKEN env vars", () => {
   );
 });
 
+test("--help includes a worked cross-owner Examples section", () => {
+  const { status, stdout } = runCli(["--help"]);
+  assert.equal(status, 0, "--help exits 0");
+  assert.match(stdout, /Examples:/, "an Examples heading is present");
+  // The cross-owner sandbox invocation appears verbatim (both flags on one line).
+  assert.match(
+    stdout,
+    /--sandbox myuser\/pr-backtest-sandbox --create-sandbox/,
+    "the cross-owner --sandbox + --create-sandbox example is shown",
+  );
+});
+
 test("--help adds NO new destination flag — the set is exactly --primary, --sandbox, --create-sandbox", () => {
   const { status, stdout } = runCli(["--help"]);
   assert.equal(status, 0, "--help exits 0");

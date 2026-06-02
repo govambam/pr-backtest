@@ -65,6 +65,14 @@ program
       "  GITHUB_SOURCE_TOKEN  Optional read-only token for the source PR, used non-interactively",
       "                       when the --sandbox owner differs from the source owner and the",
       "                       default token cannot read the source.",
+      "",
+      "Examples:",
+      "  Basic run (land in the PR's own repo):",
+      "    pr-backtest https://github.com/acme/api/pull/123 --primary",
+      "",
+      "  Cross-owner sandbox run (land in a repo you control, creating it if missing):",
+      "    pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox --create-sandbox",
+      "  For a private source, set GITHUB_SOURCE_TOKEN (read-only) and GITHUB_TOKEN (write).",
     ].join("\n"),
   )
   .action(

@@ -334,8 +334,8 @@ function choiceTitle(choice: DestinationChoice): string {
         : "Sandbox in the PR's owner (same org as the PR)";
     case "personal-sandbox":
       return choice.repo
-        ? `New sandbox in your account — @${choice.repo.owner}/${choice.repo.repo}`
-        : "New sandbox in your account";
+        ? `New sandbox in your account — @${choice.repo.owner}/${choice.repo.repo}  (may need a read-only source token)`
+        : "New sandbox in your account  (may need a read-only source token)";
     case "different-repo":
       return "A different repo…";
   }
