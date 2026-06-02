@@ -18,6 +18,17 @@ npm install -g pr-backtest
 npx pr-backtest <pr-url>
 ```
 
+## Setup
+
+There is no separate setup step. The first time you run `pr-backtest <pr-url>` in an interactive terminal, it resolves a GitHub token in this order:
+
+1. **`GITHUB_TOKEN`** — if set, it is used and nothing is saved. This is the path for CI and scripting (non-interactive runs require it).
+2. **Saved config** — a token you saved on a previous run (`~/.config/pr-backtest/config.json`, mode `0600`).
+3. **`gh` CLI** — if you already use the [GitHub CLI](https://cli.github.com) and are logged in, pr-backtest offers to reuse that login, so you don't have to create a token at all.
+4. **Paste a token** — otherwise it prompts you to paste one (input is masked) and offers to save it for next time.
+
+So if you already have `gh` authed or `GITHUB_TOKEN` exported, you're ready with zero token setup. Otherwise, create a fine-grained token with the permissions in [Recommendations](#recommendations). Run `pr-backtest logout` to clear a saved token (and any saved default destination).
+
 ## Usage
 
 ```bash

@@ -39,8 +39,9 @@ export class NoTokenNonInteractiveError extends Error {
   constructor() {
     super(
       "No GitHub token configured and stdin is not a TTY. " +
-        "Set GITHUB_TOKEN, run `pr-backtest` interactively to configure one, " +
-        "or see the setup instructions in the README.",
+        "Set GITHUB_TOKEN, run `pr-backtest <pr-url>` in an interactive terminal " +
+        "to configure one (it can reuse your `gh` login), or see the setup " +
+        "instructions in the README.",
     );
     this.name = "NoTokenNonInteractiveError";
   }
