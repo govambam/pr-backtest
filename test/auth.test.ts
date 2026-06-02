@@ -488,6 +488,59 @@ test("resolvePurposeToken falls through to paste when nothing else passes the pr
   assert.equal(resolved.fromPaste, true);
 });
 
+// --- F7: guided paste retries on a probe failure (TTY) instead of hard-exit ---
+
+test("F7: a pasted token that fails the probe once then succeeds resolves without throwing", async () => {
+  // Only the SECOND paste can read the source; the first one fails the probe.
+  const { factory } = makeFakeOctokitFactory({ readable: new Set(["good-paste"]) });
+  let pasteCalls = 0;
+  const resolvers = makePurposeResolvers({
+    getInteractivePaste: async () => {
+      pasteCalls += 1;
+      return pasteCalls === 1 ? "bad-paste" : "good-paste";
+    },
+  });
+  const resolved = await quiet(() =>
+    resolvePurposeToken(READ_PURPOSE, resolvers, factory),
+  );
+  assert.equal(resolved.token, "good-paste");
+  assert.equal(resolved.via, "paste");
+  assert.equal(resolved.fromPaste, true);
+  assert.equal(pasteCalls, 2, "re-prompted once after the first probe failure");
+});
+
+test("F7: a paste that keeps failing the probe gives up with the clear error after the bound", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set() });
+  let pasteCalls = 0;
+  const resolvers = makePurposeResolvers({
+    getInteractivePaste: async () => {
+      pasteCalls += 1;
+      return "always-bad";
+    },
+  });
+  await assert.rejects(
+    () => quiet(() => resolvePurposeToken(READ_PURPOSE, resolvers, factory)),
+    (e: unknown) => e instanceof NoTokenNonInteractiveError,
+  );
+  assert.ok(pasteCalls >= 2 && pasteCalls <= 3, "bounded retry (2-3 attempts), not infinite");
+});
+
+test("F7: non-TTY paste (getter returns null) throws immediately, no retry loop", async () => {
+  const { factory } = makeFakeOctokitFactory({ readable: new Set() });
+  let pasteCalls = 0;
+  const resolvers = makePurposeResolvers({
+    getInteractivePaste: async () => {
+      pasteCalls += 1;
+      return null; // off-TTY
+    },
+  });
+  await assert.rejects(
+    () => resolvePurposeToken(READ_PURPOSE, resolvers, factory),
+    (e: unknown) => e instanceof NoTokenNonInteractiveError,
+  );
+  assert.equal(pasteCalls, 1, "non-TTY does not loop");
+});
+
 test("resolvePurposeToken throws NoTokenNonInteractiveError when no candidate passes and no paste", async () => {
   const { factory } = makeFakeOctokitFactory({ readable: new Set() });
   const resolvers = makePurposeResolvers({

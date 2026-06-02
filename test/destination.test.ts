@@ -47,12 +47,18 @@ function makeHarness(opts: {
   prompt?: (choices: DestinationChoice[]) => DestinationSelection;
   /** Authenticated login for the personal-sandbox row. `"throw"` makes the seam reject. */
   login?: string | "throw";
+  /** Record each post-create reprobe backoff (ms). Sleep is always a no-op in tests. */
+  sleeps?: number[];
 }): Harness {
   const calls: RecordedCall[] = [];
   const resolvers: DestinationResolvers = {
     getFlags: () => opts.flags ?? {},
     getDefaultDestination: () => opts.saved,
     getIsTTY: () => opts.isTTY ?? false,
+    // Never actually sleep in tests; record requested backoffs for assertions.
+    sleep: async (ms: number) => {
+      opts.sleeps?.push(ms);
+    },
     getAuthenticatedLogin:
       opts.login === undefined
         ? undefined
@@ -1099,6 +1105,85 @@ test("VAL-PROBE-003: --sandbox X --create-sandbox proceeds when the post-create 
   assert.deepEqual(result, { owner: "me", repo: "new", isSandbox: true });
 });
 
+// --- F3: post-create write probe BOUNDED retry for eventual consistency ---
+test("F3: post-create reprobe retries — push:false then push:true succeeds (no throw)", async () => {
+  let createdYet = false;
+  let postCreateProbes = 0;
+  const sleeps: number[] = [];
+  const h = makeHarness({
+    flags: { sandbox: "me/new", createSandbox: true },
+    sleeps,
+    verify: () => {
+      if (!createdYet) {
+        // Pre-create: missing.
+        return { exists: false, canPush: false };
+      }
+      // Post-create: first probe not yet writable, second probe writable.
+      postCreateProbes += 1;
+      return postCreateProbes >= 2
+        ? { exists: true, canPush: true }
+        : { exists: true, canPush: false };
+    },
+    create: (req) => {
+      createdYet = true;
+      return { owner: req.owner, repo: req.name };
+    },
+  });
+  const result = await resolveDestination(SOURCE, h.resolvers);
+  assert.deepEqual(result, { owner: "me", repo: "new", isSandbox: true });
+  assert.equal(postCreateProbes, 2, "retried once, then succeeded");
+  assert.equal(sleeps.length, 1, "one backoff between the two attempts");
+});
+
+test("F3: post-create reprobe stays push:false through all retries → exit 2 (no fall-through)", async () => {
+  let createdYet = false;
+  let postCreateProbes = 0;
+  const sleeps: number[] = [];
+  const h = makeHarness({
+    flags: { sandbox: "me/new", createSandbox: true },
+    sleeps,
+    verify: () => {
+      if (!createdYet) return { exists: false, canPush: false };
+      postCreateProbes += 1;
+      return { exists: true, canPush: false }; // never becomes writable
+    },
+    create: (req) => {
+      createdYet = true;
+      return { owner: req.owner, repo: req.name };
+    },
+  });
+  await assert.rejects(
+    () => resolveDestination(SOURCE, h.resolvers),
+    (err: unknown) => {
+      assert.ok(err instanceof DestinationApiError);
+      assert.match(err.message, /me\/new/);
+      assert.match(err.message, /Contents:write \+ Pull requests:write/);
+      return true;
+    },
+  );
+  assert.ok(postCreateProbes >= 4, "retries were exhausted (>= max attempts)");
+  assertSourceNeverWritten(h.calls);
+});
+
+test("F3: clearly-writable first probe returns immediately with NO retry delay", async () => {
+  let createdYet = false;
+  const sleeps: number[] = [];
+  const h = makeHarness({
+    flags: { sandbox: "me/new", createSandbox: true },
+    sleeps,
+    verify: () =>
+      createdYet
+        ? { exists: true, canPush: true }
+        : { exists: false, canPush: false },
+    create: (req) => {
+      createdYet = true;
+      return { owner: req.owner, repo: req.name };
+    },
+  });
+  await resolveDestination(SOURCE, h.resolvers);
+  assert.equal(sleeps.length, 0, "no backoff when the first post-create probe is writable");
+});
+
 // --- VAL-PROBE-003 (interactive): post-create re-probe of a create kind ---
 test("VAL-PROBE-003: interactive create not-writable post-create → re-present menu, never push the source", async () => {
   let promptCount = 0;
@@ -1109,6 +1194,7 @@ test("VAL-PROBE-003: interactive create not-writable post-create → re-present 
     getDefaultDestination: () => undefined,
     getIsTTY: () => true,
     getAuthenticatedLogin: async () => "me",
+    sleep: async () => {},
     verifyDestination: async (owner, repo) => {
       calls.push({ fn: "verify", args: [owner, repo] });
       // The created personal sandbox re-probes not-writable; the primary (acme) is writable.

@@ -18,7 +18,7 @@ import {
   type TokenSource,
 } from "./config.js";
 import { isHttpStatus, makeOctokit } from "./github.js";
-import { info, registerSecret, step, success } from "./log.js";
+import { info, registerSecret, step, success, warn } from "./log.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -281,32 +281,12 @@ async function defaultGetInteractiveToken(): Promise<string | null> {
   info("  • Pull requests: Read & write   (read PR data, open the simulated PR)");
   info("  • Metadata:      Read           (required for all tokens)");
   info("");
-  info("If you land the backtest in a sandbox (a different repo), the run needs two");
-  info("capabilities, split across at most two tokens:");
-  info("  • READ on the source repo  — read the PR + fetch its commits (read-only,");
-  info("    no write access anywhere), and");
-  info("  • WRITE on the sandbox     — Contents + Pull requests write on the destination.");
-  info("");
-  info("A single token covers both when it spans both owners (a classic PAT, or a");
-  info("fine-grained token scoped to all the repos involved). When the source and the");
-  info("sandbox sit under DIFFERENT owners, no one fine-grained token can cover both —");
-  info("set GITHUB_SOURCE_TOKEN to a read-only token for the source owner. GITHUB_TOKEN");
-  info("is then the WRITE/destination token and GITHUB_SOURCE_TOKEN reads the source.");
-  info("(If the source repo is public, the read is anonymous — a write token is enough.)");
-  info("");
-  info("Sandbox under your personal account vs your org — a trade-off:");
-  info("  • Personal — lowest fuss, but the company's code lands in a repo under your");
-  info("    personal account (an egress consideration to weigh).");
-  info("  • Org      — the code stays inside the org, but you need org rights to create");
-  info("    the sandbox repo there.");
-  info("");
   info("Recommended: create a fine-grained token scoped to just the repo(s) you need:");
   info("  https://github.com/settings/personal-access-tokens/new");
   info("");
   info(
-    "(If you prefer a classic token, use " +
-      "https://github.com/settings/tokens/new?scopes=repo&description=pr-backtest" +
-      " — note this grants access to all your private repos.)",
+    "Landing in a separate sandbox? You may be prompted for a second, read-only " +
+      "source token — see the README / GITHUB_SOURCE_TOKEN.",
   );
   info("");
 
@@ -422,6 +402,16 @@ export async function resolveToken(
 
 /** The pre-fillable fine-grained-PAT creation URL, shown in every guided paste. */
 const PAT_CREATE_URL = "https://github.com/settings/personal-access-tokens/new";
+
+/**
+ * How many times a guided interactive paste is re-prompted when the pasted
+ * token fails its capability probe (read can't read the source / write can't
+ * write the destination). Mirrors `promptForSlug`'s loop-on-error pattern in
+ * destination.ts: a fat-fingered or wrong-scope paste should re-prompt rather
+ * than fall straight through to a hard {@link NoTokenNonInteractiveError}.
+ * Non-TTY paths never enter the loop (the paste getter returns null at once).
+ */
+const PASTE_MAX_ATTEMPTS = 3;
 
 /**
  * The minimal Octokit surface the probes + paste validation need: read a repo
@@ -592,9 +582,16 @@ export async function resolvePurposeToken(
     }
   }
 
-  // (4) interactive guided paste.
-  const pasted = await resolvers.getInteractivePaste();
-  if (pasted && pasted.length > 0) {
+  // (4) interactive guided paste — bounded retry loop. On a TTY, a pasted token
+  // that fails the probe RE-PROMPTS (up to PASTE_MAX_ATTEMPTS) rather than
+  // throwing straight away (matches promptForSlug's loop). Off-TTY the getter
+  // returns null on the first call, so the loop exits immediately and we throw
+  // the clear non-interactive error unchanged.
+  for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
+    const pasted = await resolvers.getInteractivePaste();
+    if (!pasted || pasted.length === 0) {
+      break; // no paste (off-TTY / aborted) → give up with the clear error.
+    }
     registerSecret(pasted);
     if (await candidatePasses(pasted, purpose, makeProbeOctokit, probe)) {
       return {
@@ -603,6 +600,16 @@ export async function resolvePurposeToken(
         fromPaste: true,
         via: "paste",
       };
+    }
+    // Failed the probe: tell the user what went wrong, then loop to re-prompt.
+    if (attempt < PASTE_MAX_ATTEMPTS - 1) {
+      warn(
+        purpose.kind === "read"
+          ? `That token cannot read ${purpose.owner}/${purpose.repo}. ` +
+              "Check it has Contents: Read + Pull requests: Read on that repo, then try again."
+          : `That token cannot write ${purpose.owner}/${purpose.repo}. ` +
+              "Check it has Contents + Pull requests: Read & write on that owner, then try again.",
+      );
     }
   }
 

@@ -197,6 +197,14 @@ export interface DestinationResolvers {
    * the production wiring; non-interactive paths never need it.
    */
   getAuthenticatedLogin?: () => Promise<string>;
+  /**
+   * Injectable delay between post-create write-probe retries (eventual
+   * consistency, see {@link reprobeCreatedOrThrow}). Defaults to a small real
+   * sleep ({@link DEFAULT_REPROBE_DELAY_MS}); tests pass a no-op so they never
+   * actually sleep. ONLY the post-create reprobe uses it — the pre-existing-repo
+   * verify is unaffected.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -258,6 +266,56 @@ export function makeSandboxCreator(octokit: Octokit): SandboxCreator {
 
 /** The default name a fresh sandbox is created under (matches the resolver). */
 const DEFAULT_SANDBOX_NAME = "pr-backtest-sandbox";
+
+/**
+ * How many times the POST-CREATE write probe checks `permissions.push` before
+ * concluding a just-created sandbox is not writable. GitHub may not report
+ * `push: true` on the very first read of a freshly created repo (or while a
+ * fine-grained PAT's scoped grant propagates), so a spurious first
+ * `push: false` should not block a legitimately-writable sandbox. The
+ * pre-existing-repo verify does NOT retry.
+ */
+const REPROBE_MAX_ATTEMPTS = 4;
+
+/** Default real backoff between post-create write-probe attempts (ms). */
+const DEFAULT_REPROBE_DELAY_MS = 500;
+
+/** Real sleep used when no `sleep` seam is injected. */
+function realSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Run the POST-CREATE write probe with a BOUNDED retry for eventual
+ * consistency. Returns the first verification whose `exists && canPush` is true,
+ * or — if every attempt (up to {@link REPROBE_MAX_ATTEMPTS}) reports
+ * not-writable — the LAST verification (the caller turns that into the
+ * write-permission failure). A short, injectable delay separates attempts; the
+ * clearly-writable case returns on the first probe with NO delay. ONLY the
+ * post-create reprobe uses this; the pre-existing verify is unchanged.
+ */
+async function probeCreatedWithRetry(
+  created: RepoRef,
+  resolvers: DestinationResolvers,
+): Promise<RepoVerification> {
+  const sleep = resolvers.sleep ?? realSleep;
+  let last: RepoVerification = { exists: false, canPush: false };
+  for (let attempt = 0; attempt < REPROBE_MAX_ATTEMPTS; attempt += 1) {
+    last = await verifyDestination(
+      resolvers.verifyDestination,
+      created.owner,
+      created.repo,
+    );
+    if (last.exists && last.canPush) {
+      return last; // clearly writable → proceed immediately, no delay.
+    }
+    // Not (yet) writable. Back off and retry unless this was the last attempt.
+    if (attempt < REPROBE_MAX_ATTEMPTS - 1) {
+      await sleep(DEFAULT_REPROBE_DELAY_MS);
+    }
+  }
+  return last; // retries exhausted → caller surfaces the write-permission failure.
+}
 
 /** A human-readable label for a single menu choice. */
 function choiceTitle(choice: DestinationChoice): string {
@@ -692,11 +750,10 @@ async function reprobeCreatedOrThrow(
   created: RepoRef,
   resolvers: DestinationResolvers,
 ): Promise<void> {
-  const ver = await verifyDestination(
-    resolvers.verifyDestination,
-    created.owner,
-    created.repo,
-  );
+  // Bounded retry for eventual consistency (a fresh repo / propagating grant may
+  // not report push:true on the first read). A clearly-writable first probe
+  // returns immediately with no delay.
+  const ver = await probeCreatedWithRetry(created, resolvers);
   // A just-created repo should exist; treat a missing/not-writable re-probe the
   // same — not writable → surface the write-permission message, never push.
   if (!ver.exists || !ver.canPush) {
@@ -716,11 +773,8 @@ async function reprobeCreatedOrReprompt(
   created: RepoRef,
   resolvers: DestinationResolvers,
 ): Promise<boolean> {
-  const ver = await verifyDestination(
-    resolvers.verifyDestination,
-    created.owner,
-    created.repo,
-  );
+  // Same bounded retry as the non-interactive path (eventual consistency).
+  const ver = await probeCreatedWithRetry(created, resolvers);
   if (!ver.exists || !ver.canPush) {
     warn(writePermissionMessage(created, null));
     return false;
