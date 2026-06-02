@@ -291,6 +291,15 @@ export interface RepoVerification {
   exists: boolean;
   /** True only when `data.permissions.push === true` (the token can write). */
   canPush: boolean;
+  /**
+   * The repo's REAL visibility flag (`data.private`) when `repos.get` succeeds —
+   * `true` when the repo is genuinely private, `false` when public. Omitted
+   * (undefined) when the probe 404s (the repo is not visible to this token, so
+   * its visibility is unknown). Used by the source-visibility probe to decide
+   * whether the run needs a separate read token. Backward compatible: existing
+   * destination callers ignore it.
+   */
+  private?: boolean;
 }
 
 /**
@@ -308,7 +317,11 @@ export async function verifyRepo(
 ): Promise<RepoVerification> {
   try {
     const { data } = await octokit.repos.get({ owner, repo });
-    return { exists: true, canPush: data.permissions?.push === true };
+    return {
+      exists: true,
+      canPush: data.permissions?.push === true,
+      private: data.private === true,
+    };
   } catch (err: unknown) {
     if (isStatus(err, 404)) {
       return { exists: false, canPush: false };

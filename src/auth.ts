@@ -326,6 +326,13 @@ async function defaultGetInteractiveToken(): Promise<string | null> {
 /** The validated, ready-to-use result returned to callers. */
 export interface AuthResult {
   token: string;
+  /**
+   * Where the token came from (env / config / gh CLI / paste), as computed by
+   * {@link resolveTokenSource}. Threaded through so callers can reuse the REAL
+   * provenance instead of fabricating one (e.g. when this default token becomes
+   * the WRITE-purpose candidate in {@link resolveTokensForRun}).
+   */
+  source: TokenSource;
 }
 
 /** Options for {@link resolveToken} (primarily for testing / injection). */
@@ -390,7 +397,7 @@ export async function resolveToken(
     success(`Token saved (mode 0600).`);
   }
 
-  return { token: resolved.token };
+  return { token: resolved.token, source: resolved.source };
 }
 
 // ---------------------------------------------------------------------------

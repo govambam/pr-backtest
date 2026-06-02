@@ -236,29 +236,33 @@ export async function addSourceRemote(
  * On any failure we throw {@link UnfetchableCommitError}; the raw git stderr is
  * swallowed (it is not user-actionable).
  *
- * Per-operation credential routing (two-token model): when `token` is supplied,
- * THIS fetch authenticates with that specific token by overriding the askpass
- * {@link TOKEN_ENV} variable on the git child for this call only — leaving the
- * clone's baked-in (write) token untouched for clone/push. This lets a
- * `source`-remote fetch use the READ token while clone/push keep the WRITE
- * token. The token still travels ONLY via the askpass env var — never in the
- * URL, on the command line, or in `.git/config`. When `token` is omitted the
- * fetch reuses whatever credential the `git` instance already carries (the
- * one-token / origin path, byte-for-byte as before).
+ * Per-operation credential routing (two-token model): `token` is REQUIRED and
+ * explicit at every call site, so no fetch silently inherits whatever credential
+ * the `git` instance last carried. THIS fetch authenticates with the given token
+ * by overriding the askpass {@link TOKEN_ENV} variable on the git child for this
+ * call only — leaving the clone's baked-in (write) token untouched for
+ * clone/push. This lets a `source`-remote fetch use the READ token while
+ * clone/push keep the WRITE token. The token still travels ONLY via the askpass
+ * env var — never in the URL, on the command line, or in `.git/config`.
+ *
+ * An EMPTY string means an anonymous fetch (a public source read over https with
+ * no credentials): TOKEN_ENV is set to `""`, so the askpass helper supplies no
+ * password and git proceeds unauthenticated.
  */
 export async function fetchCommit(
   git: SimpleGit,
   sha: string,
   prNumber: number,
-  remote = "origin",
-  token?: string,
+  remote: string,
+  token: string,
 ): Promise<void> {
   const trace = log.traceOp(`Fetching ${shortSha(sha)} from ${remote}`);
   const start = Date.now();
   // Scope the credential to THIS fetch: `.env(name, value)` returns the same
-  // instance with one env var overridden, so we set the read token only for the
-  // source fetch without mutating the clone's write-token env used by push.
-  const fetchGit = token !== undefined ? git.env(TOKEN_ENV, token) : git;
+  // instance with one env var overridden, so we set the per-op token (the read
+  // token for a source fetch, the write token for an origin fetch, or "" for an
+  // anonymous public-source fetch) without depending on the instance's prior env.
+  const fetchGit = git.env(TOKEN_ENV, token);
   try {
     await fetchGit.fetch(remote, sha);
   } catch {
@@ -280,25 +284,25 @@ export async function fetchCommit(
  * Errors are caught and rethrown token-free; raw git stderr (which can echo the
  * credential header) never escapes.
  *
- * Per-operation credential routing (two-token model): when `token` is supplied,
- * THIS push re-asserts that specific (write) token on the askpass
- * {@link TOKEN_ENV} variable for this call. Passing it explicitly here keeps the
- * write credential authoritative for the push even if a prior `source`-remote
- * fetch on the same instance overrode {@link TOKEN_ENV} with the read token —
- * the read token can never authenticate a push (INV-READTOKEN-NOWRITE). The
- * token travels ONLY via the askpass env var. When omitted, the push reuses the
- * instance's existing credential (the one-token path, unchanged).
+ * Per-operation credential routing (two-token model): `token` is REQUIRED and
+ * explicit at every call site, so no push silently inherits whatever credential
+ * the `git` instance last carried. THIS push re-asserts the given (write) token
+ * on the askpass {@link TOKEN_ENV} variable for this call. Passing it explicitly
+ * keeps the write credential authoritative for the push even if a prior
+ * `source`-remote fetch on the same instance overrode {@link TOKEN_ENV} with the
+ * read token — the read token can never authenticate a push
+ * (INV-READTOKEN-NOWRITE). The token travels ONLY via the askpass env var.
  */
 export async function pushBranchFromSha(
   git: SimpleGit,
   sha: string,
   branch: string,
-  token?: string,
+  token: string,
 ): Promise<void> {
   const refspec = `${sha}:refs/heads/${branch}`;
   const trace = log.traceOp(`Pushing ${shortSha(sha)} → ${branch}`);
   const start = Date.now();
-  const pushGit = token !== undefined ? git.env(TOKEN_ENV, token) : git;
+  const pushGit = git.env(TOKEN_ENV, token);
   try {
     await pushGit.push("origin", refspec);
   } catch {

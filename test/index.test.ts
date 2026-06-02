@@ -526,8 +526,12 @@ function makeRoutingDeps(opts: {
         ? { owner: SANDBOX_OWNER, repo: SANDBOX_REPO, isSandbox: true }
         : { owner: source.owner, repo: source.repo, isSandbox: false },
     // verifyRepo is used by the source-visibility probe (default token) AND by
-    // the destination resolver. Tag-record nothing here; it always succeeds.
-    verifyRepo: async () => ({ exists: true, canPush: true }),
+    // the destination resolver. Report the source as PRIVATE (private: true) so
+    // the cross-owner routing tests exercise the genuine two-token path (a
+    // resolved READ token authenticates source reads) — NOT the public anonymous
+    // read path (which is covered separately below). The destination is writable
+    // (canPush: true), which is all the resolver checks.
+    verifyRepo: async () => ({ exists: true, canPush: true, private: true }),
     getPullRequest: async (octokit) => {
       apiCalls.push({ op: "getPullRequest", token: tokenOf(octokit) });
       return { title: "Add retry to fetch", user: "octocat" };
@@ -631,6 +635,58 @@ test("VAL-ROUTE-003: identical tokens construct exactly one Octokit and one git 
   // Every git op authenticates with that one token — byte-for-byte one-token.
   for (const c of gitCalls) {
     assert.equal(c.token, WRITE_TOKEN, `${c.op} uses the single token`);
+  }
+});
+
+test("F2: a public cross-owner source is read anonymously (no token) while clone/push use the write token", async () => {
+  // The source-visibility probe reports the source as PUBLIC (private:false);
+  // computeTokenNeeds then yields a single write purpose, so readToken collapses
+  // to the write token. But because the source is public AND cross-owner, the
+  // run must read the source through an ANONYMOUS Octokit (token "") and fetch
+  // the `source` remote with NO credential — never the write token, which (as a
+  // destination-scoped PAT) could 404 a public repo in another org.
+  const { deps, apiCalls, gitCalls } = makeRoutingDeps({
+    readToken: WRITE_TOKEN, // one-token collapse (write purpose only)
+    writeToken: WRITE_TOKEN,
+    isSandbox: true, // cross-owner: source acme, dest octocat/sandbox
+    overrides: {
+      // PUBLIC source; destination still writable.
+      verifyRepo: async () => ({ exists: true, canPush: true, private: false }),
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+
+  // Source reads run on the ANONYMOUS Octokit (empty token), never the write token.
+  for (const c of apiCalls.filter((a) =>
+    ["getPullRequest", "listPullRequestCommits", "getCommitParentSha"].includes(a.op),
+  )) {
+    assert.equal(c.token, "", `${c.op} must read the public source anonymously`);
+    assert.notEqual(c.token, WRITE_TOKEN, `${c.op} must not use the write token`);
+  }
+  assert.ok(
+    apiCalls.some((c) => c.op === "getPullRequest" && c.token === ""),
+    "the PR read happened anonymously",
+  );
+
+  // The source fetch is anonymous (empty token); clone + push use the write token.
+  for (const c of gitCalls.filter((g) => g.op === "fetch:source")) {
+    assert.equal(c.token, "", "the public source fetch is anonymous");
+  }
+  assert.equal(
+    gitCalls.find((c) => c.op === "clone")?.token,
+    WRITE_TOKEN,
+    "clone uses the write token",
+  );
+  for (const c of gitCalls.filter((g) => g.op.startsWith("push:"))) {
+    assert.equal(c.token, WRITE_TOKEN, "push uses the write token");
+  }
+
+  // Destination API calls still use the write Octokit.
+  for (const c of apiCalls.filter((a) =>
+    ["findExistingPr", "createPullRequest"].includes(a.op),
+  )) {
+    assert.equal(c.token, WRITE_TOKEN, `${c.op} uses the write Octokit`);
   }
 });
 

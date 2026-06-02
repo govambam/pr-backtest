@@ -27,9 +27,15 @@ import {
 
 /** A fake `SimpleGit` whose `fetch` resolves — enough to drive `traceOp`. */
 function fakeGitOk(): SimpleGit {
-  return {
+  // `.env()` mutates in place and returns the same instance (real simple-git
+  // semantics); `fetchCommit` now always re-asserts the per-op token via it.
+  const git = {
+    env(): SimpleGit {
+      return git as unknown as SimpleGit;
+    },
     fetch: async () => ({}) as never,
-  } as unknown as SimpleGit;
+  };
+  return git as unknown as SimpleGit;
 }
 
 /**
@@ -186,7 +192,7 @@ test("default mode (verbose off) prints zero per-request lines", async () => {
 test("on a TTY a git op rewrites its start line in place (carriage return)", async () => {
   setTtyOverride(true);
   const out = await captureStderr(async () => {
-    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
+    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source", "ghp_trace_test_token_xxx");
   });
   // TTY: the in-progress line is overwritten in place — a `\r` is present and
   // the completion marker (`✓`) appears.
@@ -197,7 +203,7 @@ test("on a TTY a git op rewrites its start line in place (carriage return)", asy
 test("with no TTY a git op prints only the completion line, no carriage returns", async () => {
   setTtyOverride(false);
   const out = await captureStderr(async () => {
-    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
+    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source", "ghp_trace_test_token_xxx");
   });
   assert.ok(!out.includes("\r"), `expected no carriage return off-TTY, got: ${JSON.stringify(out)}`);
   assert.match(out, /✓/);
@@ -222,7 +228,7 @@ test("a sentinel token never appears across a full traced flow (API + git, verbo
       request: { fetch: fakeFetch(200, { number: 123 }, calls) },
     });
     // A git op trace line (constructed argv) in the same captured stderr.
-    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source");
+    await fetchCommit(fakeGitOk(), "9f3c1a2", 123, "source", "ghp_trace_test_token_xxx");
   });
 
   // Across BOTH the API hook line and the git op line, the token never appears.

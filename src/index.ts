@@ -176,6 +176,11 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Case-insensitive owner equality (GitHub owners are case-insensitive). */
+function sameOwner(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
 /**
  * Run a full backtest: read the PR, resolve the commit pair, confirm the plan,
  * then clone/fetch/push and open the simulated PR. Owns all exit codes.
@@ -217,9 +222,11 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //    is resolved BEFORE the destination because the resolver needs the Octokit
   //    instance to verify (and possibly create) the destination repo.
   let token: string;
+  let tokenSource: AuthResult["source"];
   try {
     const auth: AuthResult = await deps.resolveToken();
     token = auth.token;
+    tokenSource = auth.source;
   } catch (err) {
     if (err instanceof NoTokenNonInteractiveError) {
       error(messageOf(err));
@@ -237,21 +244,29 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   const defaultOctokit: Octokit = deps.makeOctokit(token);
 
   // 2a. Source-visibility probe (RESOLUTION, not the run's source-read). Attempt
-  //     repos.get(source) with the DEFAULT token via `verifyRepo`. This decides
-  //     whether the run needs a SEPARATE read token: when the default token can
-  //     read the source (`exists` true), no second token is required, so we mark
-  //     `sourcePrivate = false` (computeTokenNeeds keeps the source read on the
-  //     default token). On a 403/404 (verifyRepo → `exists: false`) or any probe
-  //     error the default token cannot read the source, so we assume it is
-  //     private/unreadable and force a read purpose, which resolves a scoped read
-  //     token (GITHUB_SOURCE_TOKEN / owner-scoped / guided paste). Using the
+  //     repos.get(source) with the DEFAULT token via `verifyRepo`, which now
+  //     reports the source repo's REAL `private` flag. `sourcePrivate` means
+  //     exactly "the source repo is private" — the value computeTokenNeeds
+  //     consumes.
+  //       - probe SUCCEEDS → trust the reported visibility: `sourcePrivate =
+  //         verification.private === true`. A genuinely PUBLIC source then takes
+  //         the anonymous source-read path (F2); a private source forces a read
+  //         purpose, resolving a scoped read token (GITHUB_SOURCE_TOKEN /
+  //         owner-scoped / guided paste).
+  //       - probe 404s (`exists: false` — repo not found / not visible to the
+  //         default token) → assume PRIVATE (`sourcePrivate = true`).
+  //     A non-404 / transient error from the probe is NOT collapsed into
+  //     "private": it surfaces as an API error (exit 2) so a healthy repo behind
+  //     a blip is never silently forced down the read-token path. Using the
   //     default token HERE is allowed — this is resolution, not a run source-read.
-  let sourcePrivate = true;
+  let sourcePrivate: boolean;
   try {
     const verification = await deps.verifyRepo(defaultOctokit, owner, repo);
-    sourcePrivate = !verification.exists;
-  } catch {
-    sourcePrivate = true;
+    // exists:false means a 404 (not visible to the default token) → assume private.
+    sourcePrivate = verification.exists ? verification.private === true : true;
+  } catch (err) {
+    error(messageOf(err));
+    process.exit(EXIT.API_ERROR);
   }
 
   // 2b. Resolve where writes go. The source PR is always READ from `owner/repo`;
@@ -332,7 +347,10 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       makeOctokit: deps.makeOctokit,
       // The write purpose's default candidate is the already-resolved default
       // token — reuse it directly so the gh-CLI / paste prompt never re-fires.
-      getDefaultToken: async () => ({ token, source: "classic", fromPaste: false }),
+      // Thread the REAL token source (env/config/gh/paste) computed by
+      // resolveToken instead of fabricating "classic". `fromPaste` stays false:
+      // this default token is already persisted as the primary token.
+      getDefaultToken: async () => ({ token, source: tokenSource, fromPaste: false }),
     });
   } catch (err) {
     if (err instanceof NoTokenNonInteractiveError) {
@@ -344,16 +362,31 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     process.exit(EXIT.API_ERROR);
   }
 
+  // A PUBLIC cross-owner source is read ANONYMOUSLY (no token). For such a run
+  // computeTokenNeeds returns a single WRITE purpose, so the resolved read token
+  // collapses to the write token — but that write token may be a fine-grained PAT
+  // scoped only to the destination owner, which 404s a public repo in another
+  // org. Reading the public source with NO credential is strictly safer and
+  // always works. Same-owner runs (incl. public same-owner) keep the one-token
+  // path: the source is read with the same credential, exactly as today. Private
+  // sources always use the resolved read token/Octokit (unchanged).
+  const sourcePublicCrossOwner =
+    sourcePrivate === false && !sameOwner(owner, destOwner);
+
   // Build the per-owner Octokit instances. When the read and write tokens are
   // IDENTICAL, construct exactly ONE instance and use it for both — observable
   // behavior identical to a one-token run today (VAL-ROUTE-003). When they
   // differ, source reads use `readOctokit` and destination calls use
   // `writeOctokit`; neither token ever crosses to the other's operations
-  // (INV-READTOKEN-NOWRITE / INV-WRITETOKEN-PURPOSE).
+  // (INV-READTOKEN-NOWRITE / INV-WRITETOKEN-PURPOSE). For a public cross-owner
+  // source the source reads run through an ANONYMOUS Octokit (empty token →
+  // makeOctokit sends no Authorization header).
   const writeOctokit: Octokit = deps.makeOctokit(runTokens.writeToken);
-  const readOctokit: Octokit = runTokens.twoToken
-    ? deps.makeOctokit(runTokens.readToken)
-    : writeOctokit;
+  const readOctokit: Octokit = sourcePublicCrossOwner
+    ? deps.makeOctokit("")
+    : runTokens.twoToken
+      ? deps.makeOctokit(runTokens.readToken)
+      : writeOctokit;
 
   // 3. Fetch the PR and its commits. Any GitHub/API error maps to exit 2.
   let prTitle: string;
@@ -462,12 +495,20 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const git = await deps.cloneRepo(destOwner, destRepo, runTokens.writeToken, tmpDir);
 
     // In sandbox mode the commits live in the PR's repo, not the sandbox —
-    // fetch them from a `source` remote with the READ token. Otherwise origin
-    // (the clone) already has them and authenticates with the write token.
+    // fetch them from a `source` remote. Otherwise origin (the clone) already
+    // has them and authenticates with the WRITE token.
     const commitRemote = isSandbox ? "source" : "origin";
-    // The source fetch uses the READ token; the origin fetch uses the WRITE
-    // token (the clone's baked-in credential, re-asserted for clarity).
-    const fetchToken = isSandbox ? runTokens.readToken : runTokens.writeToken;
+    // Per-op git credential routing:
+    //  - origin fetch (one-token / same-owner path): the WRITE token.
+    //  - source fetch, PRIVATE source: the resolved READ token.
+    //  - source fetch, PUBLIC cross-owner source: NO token ("" → anonymous
+    //    https fetch), strictly safer and immune to a destination-scoped PAT
+    //    404ing the public source.
+    const fetchToken = !isSandbox
+      ? runTokens.writeToken
+      : sourcePublicCrossOwner
+        ? ""
+        : runTokens.readToken;
     if (isSandbox) {
       await deps.addSourceRemote(git, owner, repo);
     }
