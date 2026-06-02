@@ -3,12 +3,17 @@ import assert from "node:assert/strict";
 
 import {
   resolveRunTokens,
+  resolveWriteToken,
+  resolveReadToken,
   canRead,
   canWrite,
   NoTokenNonInteractiveError,
   NoSourceTokenNonInteractiveError,
   type ResolveRunTokensOptions,
+  type ResolveWriteTokenOptions,
+  type ResolveReadTokenOptions,
   type ResolverOctokit,
+  type AcceptToken,
   type RepoRef,
 } from "../src/auth.js";
 import type { Config } from "../src/config.js";
@@ -717,3 +722,328 @@ test("VAL-TOKEN-002: read-only source token + separate write token resolves two 
   assert.equal(result.writeToken, "rw-dest");
   assert.equal(result.twoToken, true);
 });
+
+// ===========================================================================
+// Standalone resolvers: resolveWriteToken / resolveReadToken (sandbox-create path)
+// ===========================================================================
+
+/** A factory whose only behavior is users.getAuthenticated (token -> login). */
+function loginFactory(login: (token: string) => string) {
+  return (token: string): ResolverOctokit =>
+    ({
+      repos: { get: async () => { throw httpError(404); } },
+      users: {
+        getAuthenticated: async () => ({ data: { login: login(token) } }),
+      },
+    }) as unknown as ResolverOctokit;
+}
+
+/** Base resolveWriteToken options with interactive/persist seams disabled. */
+function writeOptions(
+  overrides: Partial<ResolveWriteTokenOptions>,
+): ResolveWriteTokenOptions {
+  return {
+    destination: DEST,
+    isPrimary: false,
+    makeOctokit: loginFactory((t) => `u-${t}`),
+    getEnvToken: () => undefined,
+    getConfig: () => null,
+    saveConfig: () => { throw new Error("saveConfig must NOT fire"); },
+    getPaste: async () => { throw new Error("paste must NOT fire"); },
+    accept: async () => false,
+    ...overrides,
+  };
+}
+
+test("resolveWriteToken: env GITHUB_TOKEN wins over saved destinationToken when both accepted", async () => {
+  const cfg: Config = {
+    destinationToken: { token: "saved-dest", username: "u", source: "fine-grained" },
+  };
+  const seen: string[] = [];
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "write-env",
+      getConfig: () => cfg,
+      accept: async (_o, token) => { seen.push(token); return true; },
+    }),
+  );
+  assert.equal(result.token, "write-env");
+  assert.equal(result.fromPaste, false);
+  assert.equal(result.login, "u-write-env");
+  assert.deepEqual(seen, ["write-env"], "saved slot is not tried once env is accepted");
+});
+
+test("resolveWriteToken: falls to saved destinationToken when env is not accepted", async () => {
+  const cfg: Config = {
+    destinationToken: { token: "saved-dest", username: "u", source: "classic" },
+  };
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "write-env",
+      getConfig: () => cfg,
+      accept: async (_o, token) => token === "saved-dest",
+    }),
+  );
+  assert.equal(result.token, "saved-dest");
+  assert.equal(result.source, "classic");
+});
+
+test("resolveWriteToken: accept on the CREATE path accepts a token canWrite would reject (sandbox creation)", async () => {
+  // The destination does not exist yet (canWrite would 404 -> false), but the
+  // caller's accept (verify-or-create) accepts the env token.
+  let createAttempted = false;
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "creator-token",
+      makeOctokit: loginFactory(() => "creator"),
+      accept: async () => { createAttempted = true; return true; },
+    }),
+  );
+  assert.equal(result.token, "creator-token");
+  assert.equal(result.login, "creator");
+  assert.equal(createAttempted, true);
+});
+
+test("resolveWriteToken: a caller's wrapped accept (false on rejection) falls through to the next candidate", async () => {
+  // Contract: the CALLER wraps its verify-or-create check so a rejected candidate
+  // returns false (not throws). Here the wrapped accept returns false for the env
+  // token and true for the saved one, so resolution falls through correctly.
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "bad-token",
+      getConfig: () => ({
+        destinationToken: { token: "good-token", username: "u", source: "fine-grained" },
+      }),
+      accept: async (_o, token) => token === "good-token",
+    }),
+  );
+  assert.equal(result.token, "good-token");
+});
+
+test("resolveWriteToken: a fresh accepted paste persists to destinationToken with @login", async () => {
+  const saved: Array<Partial<Config>> = [];
+  const result = await quiet(() =>
+    resolveWriteToken(
+      writeOptions({
+        isPrimary: true,
+        destination: SOURCE,
+        makeOctokit: loginFactory(() => "writer"),
+        getPaste: async () => "pasted-write",
+        accept: async (_o, token) => token === "pasted-write",
+        saveConfig: (u) => saved.push(u),
+      }),
+    ),
+  );
+  assert.equal(result.token, "pasted-write");
+  assert.equal(result.fromPaste, true);
+  assert.equal(result.login, "writer");
+  const slot = saved.find((s) => s.destinationToken)?.destinationToken;
+  assert.ok(slot, "destinationToken persisted");
+  assert.equal(slot!.token, "pasted-write");
+  assert.equal(slot!.username, "writer");
+});
+
+test("resolveWriteToken: bounded 3 paste attempts then throws NoTokenNonInteractiveError naming GITHUB_TOKEN", async () => {
+  let pasteCalls = 0;
+  await assert.rejects(
+    () =>
+      quiet(() =>
+        resolveWriteToken(
+          writeOptions({
+            getPaste: async () => { pasteCalls += 1; return "always-bad"; },
+            accept: async () => false,
+            saveConfig: () => {},
+          }),
+        ),
+      ),
+    (e: unknown) =>
+      e instanceof NoTokenNonInteractiveError &&
+      !(e instanceof NoSourceTokenNonInteractiveError) &&
+      /GITHUB_TOKEN/.test((e as Error).message),
+  );
+  assert.equal(pasteCalls, 3);
+});
+
+test("resolveWriteToken: non-interactive (paste returns null) throws immediately naming GITHUB_TOKEN", async () => {
+  await assert.rejects(
+    () =>
+      resolveWriteToken(
+        writeOptions({
+          getPaste: async () => null,
+          accept: async () => false,
+          saveConfig: () => {},
+        }),
+      ),
+    (e: unknown) =>
+      e instanceof NoTokenNonInteractiveError &&
+      /GITHUB_TOKEN/.test((e as Error).message),
+  );
+});
+
+/** A factory keyed on canRead(source): tokens in `readable` read the source. */
+function readFactory(readable: Set<string>, login?: (t: string) => string) {
+  return (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource = args.owner === SOURCE.owner && args.repo === SOURCE.repo;
+          if (isSource && readable.has(token)) {
+            return { data: { permissions: { push: false } } };
+          }
+          throw httpError(404);
+        },
+      },
+      users: {
+        getAuthenticated: async () => ({
+          data: { login: login ? login(token) : `u-${token}` },
+        }),
+      },
+    }) as unknown as ResolverOctokit;
+}
+
+/** Base resolveReadToken options with interactive/persist seams disabled. */
+function readOptions(
+  overrides: Partial<ResolveReadTokenOptions>,
+): ResolveReadTokenOptions {
+  return {
+    source: SOURCE,
+    writeToken: "",
+    makeOctokit: readFactory(new Set()),
+    getEnvToken: () => undefined,
+    getConfig: () => null,
+    saveConfig: () => { throw new Error("saveConfig must NOT fire"); },
+    getPaste: async () => { throw new Error("paste must NOT fire"); },
+    ...overrides,
+  };
+}
+
+test("resolveReadToken: env GITHUB_SOURCE_TOKEN wins over saved sourceToken and write-reuse", async () => {
+  const cfg: Config = {
+    sourceToken: { token: "saved-src", username: "u", source: "fine-grained" },
+  };
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "write-token",
+      makeOctokit: readFactory(new Set(["src-env", "saved-src", "write-token"])),
+      getEnvToken: () => "src-env",
+      getConfig: () => cfg,
+    }),
+  );
+  assert.equal(result.token, "src-env");
+  assert.equal(result.fromPaste, false);
+});
+
+test("resolveReadToken: saved sourceToken used over write-reuse when env absent", async () => {
+  const cfg: Config = {
+    sourceToken: { token: "saved-src", username: "u", source: "fine-grained" },
+  };
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "write-token",
+      makeOctokit: readFactory(new Set(["saved-src", "write-token"])),
+      getConfig: () => cfg,
+    }),
+  );
+  assert.equal(result.token, "saved-src");
+});
+
+test("resolveReadToken: reuses the write token iff it reads the source (single-PAT)", async () => {
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "one-pat",
+      makeOctokit: readFactory(new Set(["one-pat"]), () => "owner"),
+    }),
+  );
+  assert.equal(result.token, "one-pat");
+  assert.equal(result.fromPaste, false);
+  assert.equal(result.login, "owner");
+});
+
+test("resolveReadToken: a fresh accepted paste persists to sourceToken with @login", async () => {
+  const saved: Array<Partial<Config>> = [];
+  const result = await quiet(() =>
+    resolveReadToken(
+      readOptions({
+        writeToken: "write-only", // cannot read source -> falls to paste
+        makeOctokit: readFactory(new Set(["pasted-read"]), (t) =>
+          t === "pasted-read" ? "reader" : "writer",
+        ),
+        getPaste: async () => "pasted-read",
+        saveConfig: (u) => saved.push(u),
+      }),
+    ),
+  );
+  assert.equal(result.token, "pasted-read");
+  assert.equal(result.fromPaste, true);
+  assert.equal(result.login, "reader");
+  const slot = saved.find((s) => s.sourceToken)?.sourceToken;
+  assert.ok(slot, "sourceToken persisted");
+  assert.equal(slot!.username, "reader");
+});
+
+test("resolveReadToken: bounded 3 paste attempts then throws NoSourceTokenNonInteractiveError naming GITHUB_SOURCE_TOKEN", async () => {
+  let pasteCalls = 0;
+  await assert.rejects(
+    () =>
+      quiet(() =>
+        resolveReadToken(
+          readOptions({
+            writeToken: "write-only",
+            makeOctokit: readFactory(new Set()), // nothing reads the source
+            getPaste: async () => { pasteCalls += 1; return "always-bad"; },
+            saveConfig: () => {},
+          }),
+        ),
+      ),
+    (e: unknown) =>
+      e instanceof NoSourceTokenNonInteractiveError &&
+      e instanceof NoTokenNonInteractiveError &&
+      /GITHUB_SOURCE_TOKEN/.test((e as Error).message),
+  );
+  assert.equal(pasteCalls, 3);
+});
+
+test("resolveReadToken: non-interactive (paste null) with unreadable source throws naming GITHUB_SOURCE_TOKEN", async () => {
+  await assert.rejects(
+    () =>
+      resolveReadToken(
+        readOptions({
+          writeToken: "write-only",
+          makeOctokit: readFactory(new Set()),
+          getPaste: async () => null,
+          saveConfig: () => {},
+        }),
+      ),
+    (e: unknown) =>
+      e instanceof NoSourceTokenNonInteractiveError &&
+      /GITHUB_SOURCE_TOKEN/.test((e as Error).message),
+  );
+});
+
+test("resolveReadToken: each candidate is scrubbed before its first request", async () => {
+  const sentinel = "ghp_read_only_sentinel_0123456789ab";
+  let redactedAtRequest = "";
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: async () => {
+          redactedAtRequest = redact(`auth=${token}`);
+          return { data: { permissions: { push: false } } };
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "u" } }) },
+    }) as unknown as ResolverOctokit;
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "",
+      makeOctokit: factory,
+      getEnvToken: () => sentinel,
+    }),
+  );
+  assert.equal(result.token, sentinel);
+  assert.equal(redactedAtRequest, "auth=***");
+});
+
+// Type-only: confirm AcceptToken is exported and shaped as documented.
+const _acceptTypeCheck: AcceptToken = async (_octokit, _token) => true;
+void _acceptTypeCheck;

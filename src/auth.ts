@@ -504,3 +504,247 @@ export async function resolveRunTokens(
     twoToken: read.token !== write.token,
   };
 }
+
+// ===========================================================================
+// Standalone per-capability resolvers (additive).
+//
+// `resolveRunTokens` above is the common EXISTING-repo path. The orchestration
+// feature needs to compose the SANDBOX-CREATION path, where the destination does
+// not exist yet so `canWrite` (which validates an existing repo) cannot judge a
+// candidate. These resolvers take an injected `accept` predicate so the CALLER
+// decides validity — e.g. the write `accept` can run verify-or-CREATE and accept
+// a token that can create the missing repo. Each shares the same precedence +
+// bounded-paste + scrubber discipline as `resolveCapability`.
+// ===========================================================================
+
+/** A token resolved by a standalone resolver, with its captured `@login`. */
+export interface ResolvedToken {
+  token: string;
+  source: TokenSource;
+  /** The authenticated `@login` (captured via users.getAuthenticated). */
+  login: string;
+  /** True only when this token came from a fresh interactive paste. */
+  fromPaste: boolean;
+}
+
+/**
+ * Whether a candidate token is acceptable. The caller wraps its real check (e.g.
+ * verify-or-create the destination) so a thrown rejection just means "not
+ * accepted". Receives the candidate's Octokit and the raw token (the token is
+ * only used to key per-token caller state — it must never be logged).
+ */
+export type AcceptToken = (
+  octokit: ResolverOctokit,
+  token: string,
+) => Promise<boolean>;
+
+/**
+ * Run the env → saved → [extra] → paste precedence with an injected `accept`
+ * predicate. `candidates` are the ordered non-paste sources; each is registered
+ * with the scrubber and offered to `accept` (first accepted wins). On exhaustion
+ * the bounded paste loop runs (TTY only); off-TTY the getter returns null on the
+ * first call so the loop exits at once. Returns the accepted candidate (without
+ * `@login` — the caller captures it for a fresh paste).
+ *
+ * `onPasteReject` renders the per-attempt scope hint between failed pastes.
+ * Throws `notInteractiveError()` when nothing is accepted and there is no
+ * interactive path.
+ */
+async function resolveWithAccept(
+  candidates: Array<Candidate | null>,
+  accept: AcceptToken,
+  make: MakeOctokit,
+  getPaste: () => Promise<string | null>,
+  onPasteReject: () => void,
+  notInteractiveError: () => NoTokenNonInteractiveError,
+): Promise<Candidate> {
+  for (const candidate of candidates) {
+    if (!candidate || candidate.token.length === 0) {
+      continue;
+    }
+    registerSecret(candidate.token);
+    if (await accept(make(candidate.token), candidate.token)) {
+      return candidate;
+    }
+  }
+
+  for (let attempt = 0; attempt < PASTE_MAX_ATTEMPTS; attempt += 1) {
+    const pasted = await getPaste();
+    if (!pasted || pasted.length === 0) {
+      break;
+    }
+    registerSecret(pasted);
+    if (await accept(make(pasted), pasted)) {
+      return { token: pasted, source: inferPasteSource(pasted), fromPaste: true };
+    }
+    if (attempt < PASTE_MAX_ATTEMPTS - 1) {
+      onPasteReject();
+    }
+  }
+
+  throw notInteractiveError();
+}
+
+/** Options for {@link resolveWriteToken}. */
+export interface ResolveWriteTokenOptions {
+  /** The destination repo the write token must cover (existing OR to-be-created). */
+  destination: RepoRef;
+  /**
+   * True for a Primary run (destination === source): the paste copy asks for
+   * read + write on the source. False (Sandbox): the copy asks for write on the
+   * destination. A LOCAL destination fact, NOT owner logic.
+   */
+  isPrimary: boolean;
+  /** Octokit factory; injected in tests. Defaults to {@link makeOctokit}. */
+  makeOctokit?: MakeOctokit;
+  /** Read GITHUB_TOKEN. Defaults to the process env. */
+  getEnvToken?: () => string | undefined;
+  /** Read the persisted config (for the saved destinationToken slot). Defaults to {@link readConfig}. */
+  getConfig?: () => Config | null;
+  /** Persist the destinationToken slot on a fresh accepted paste. Defaults to {@link mergeConfig}. */
+  saveConfig?: (update: Partial<Config>) => void;
+  /** Interactive paste getter. Defaults to the Primary/Sandbox-write copy per `isPrimary`. */
+  getPaste?: (destination: RepoRef, isPrimary: boolean) => Promise<string | null>;
+  /**
+   * Accept a candidate write token. The caller wraps its verify-or-create check
+   * so a thrown rejection means "not accepted" — this lets a token that can
+   * CREATE a missing destination be accepted even though `canWrite` (existing
+   * repo) would reject it.
+   */
+  accept: AcceptToken;
+}
+
+/**
+ * Resolve a DESTINATION/write token (spec §5) via an injected `accept` predicate.
+ *
+ * Precedence: `GITHUB_TOKEN` env → saved `destinationToken` → interactive paste
+ * (bounded 3 attempts; copy per §4.2 Primary / §4.3 Sandbox-write). Each
+ * candidate is registered with the scrubber before its first request and offered
+ * to `accept`; the first accepted wins. A freshly pasted accepted token is
+ * validated via `users.getAuthenticated` for its `@login` and persisted to the
+ * `destinationToken` slot. Throws {@link NoTokenNonInteractiveError} (names
+ * `GITHUB_TOKEN`) when nothing is accepted and there is no interactive path.
+ */
+export async function resolveWriteToken(
+  options: ResolveWriteTokenOptions,
+): Promise<ResolvedToken> {
+  const { destination, isPrimary, accept } = options;
+  const make = options.makeOctokit ?? makeOctokit;
+  const getEnv = options.getEnvToken ?? (() => process.env.GITHUB_TOKEN);
+  const getConfig = options.getConfig ?? (() => readConfig());
+  const saveConfig = options.saveConfig ?? mergeConfig;
+  const getPaste =
+    options.getPaste ??
+    ((dest: RepoRef, primary: boolean) =>
+      primary ? defaultGetPrimaryPaste(dest) : defaultGetSandboxWritePaste(dest));
+
+  const cfg = getConfig();
+
+  const resolved = await resolveWithAccept(
+    [envCandidate(getEnv()), slotCandidate(cfg?.destinationToken)],
+    accept,
+    make,
+    () => getPaste(destination, isPrimary),
+    () =>
+      info(
+        `That token cannot write ${destination.owner}/${destination.repo}. Check ` +
+          "it has Contents + Pull requests: Read & write on that repo (and " +
+          "creation rights if the repo does not exist yet), then try again.",
+      ),
+    () => new NoTokenNonInteractiveError(),
+  );
+
+  const login = await captureLogin(make(resolved.token));
+  if (resolved.fromPaste) {
+    success(`Authenticated as @${login}`);
+    saveConfig({
+      destinationToken: {
+        token: resolved.token,
+        username: login,
+        source: resolved.source,
+      },
+    });
+    success(`Token saved (mode 0600).`);
+  }
+
+  return { token: resolved.token, source: resolved.source, login, fromPaste: resolved.fromPaste };
+}
+
+/** Options for {@link resolveReadToken}. */
+export interface ResolveReadTokenOptions {
+  /** The source repo the read token must be able to read. */
+  source: RepoRef;
+  /** The already-resolved write token — the single-PAT reuse candidate. */
+  writeToken: string;
+  /** Octokit factory; injected in tests. Defaults to {@link makeOctokit}. */
+  makeOctokit?: MakeOctokit;
+  /** Read GITHUB_SOURCE_TOKEN. Defaults to the process env. */
+  getEnvToken?: () => string | undefined;
+  /** Read the persisted config (for the saved sourceToken slot). Defaults to {@link readConfig}. */
+  getConfig?: () => Config | null;
+  /** Persist the sourceToken slot on a fresh accepted paste. Defaults to {@link mergeConfig}. */
+  saveConfig?: (update: Partial<Config>) => void;
+  /** Interactive paste getter (read-only copy). Defaults to {@link defaultGetSandboxReadPaste}. */
+  getPaste?: (source: RepoRef) => Promise<string | null>;
+}
+
+/**
+ * Resolve a SOURCE/read token (spec §5). `accept` is fixed to {@link canRead} on
+ * the source — a read token is valid iff `repos.get(source)` succeeds.
+ *
+ * Precedence: `GITHUB_SOURCE_TOKEN` env → saved `sourceToken` → reuse the
+ * already-resolved `writeToken` IFF it reads the source (single-PAT detection) →
+ * interactive paste (bounded 3 attempts; read-only copy per §4.3 token #1). Each
+ * candidate is registered with the scrubber before its first request. A freshly
+ * pasted accepted token is validated via `users.getAuthenticated` for its
+ * `@login` and persisted to the `sourceToken` slot. Throws
+ * {@link NoSourceTokenNonInteractiveError} (names `GITHUB_SOURCE_TOKEN`) when
+ * nothing reads the source and there is no interactive path.
+ */
+export async function resolveReadToken(
+  options: ResolveReadTokenOptions,
+): Promise<ResolvedToken> {
+  const { source, writeToken } = options;
+  const make = options.makeOctokit ?? makeOctokit;
+  const getEnv = options.getEnvToken ?? (() => process.env.GITHUB_SOURCE_TOKEN);
+  const getConfig = options.getConfig ?? (() => readConfig());
+  const saveConfig = options.saveConfig ?? mergeConfig;
+  const getPaste = options.getPaste ?? defaultGetSandboxReadPaste;
+
+  const cfg = getConfig();
+  const accept: AcceptToken = (octokit) => canRead(octokit, source);
+
+  // The write token is offered AFTER env + saved slot: single-PAT detection.
+  const writeReuse: Candidate | null =
+    writeToken.length > 0
+      ? { token: writeToken, source: inferPasteSource(writeToken), fromPaste: false }
+      : null;
+
+  const resolved = await resolveWithAccept(
+    [envCandidate(getEnv()), slotCandidate(cfg?.sourceToken), writeReuse],
+    accept,
+    make,
+    () => getPaste(source),
+    () =>
+      info(
+        `That token cannot read ${source.owner}/${source.repo}. Check it has ` +
+          "Contents: Read + Pull requests: Read on that repo, then try again.",
+      ),
+    () => new NoSourceTokenNonInteractiveError(source.owner, source.repo),
+  );
+
+  const login = await captureLogin(make(resolved.token));
+  if (resolved.fromPaste) {
+    success(`Authenticated as @${login}`);
+    saveConfig({
+      sourceToken: {
+        token: resolved.token,
+        username: login,
+        source: resolved.source,
+      },
+    });
+    success(`Token saved (mode 0600).`);
+  }
+
+  return { token: resolved.token, source: resolved.source, login, fromPaste: resolved.fromPaste };
+}
