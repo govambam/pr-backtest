@@ -77,6 +77,61 @@ test("UnfetchableCommitError.message equals buildUnfetchableMessage and carries 
   assert.equal(err.prNumber, 7);
 });
 
+test("VAL-HONEST-009: buildUnfetchableMessage uses the threaded real branch names", () => {
+  // The tool's real branches embed the target short SHA; when threaded in, the
+  // recovery `git push` lines name exactly those branches so a user who follows
+  // the hint reconnects to the run's own scheme.
+  const head = "backtest-pr42-a1b2c3d-head";
+  const base = "backtest-pr42-a1b2c3d-base";
+  const msg = buildUnfetchableMessage("a1b2c3d4e5", 42, "origin", { head, base });
+  assert.match(msg, /git push origin a1b2c3d4e5:refs\/heads\/backtest-pr42-a1b2c3d-head/);
+  assert.match(msg, /git push origin a1b2c3d4e5\^:refs\/heads\/backtest-pr42-a1b2c3d-base/);
+  // The bare (pre-SHA) form must not appear once real names are supplied.
+  assert.doesNotMatch(msg, /refs\/heads\/backtest-pr42-head/);
+  assert.doesNotMatch(msg, /refs\/heads\/backtest-pr42-base/);
+});
+
+test("VAL-HONEST-009: UnfetchableCommitError threads branch names into its message", () => {
+  const branches = {
+    head: "backtest-pr7-deadbee-head",
+    base: "backtest-pr7-deadbee-base",
+  };
+  const err = new UnfetchableCommitError("deadbeef", 7, "origin", branches);
+  assert.equal(
+    err.message,
+    buildUnfetchableMessage("deadbeef", 7, "origin", branches),
+  );
+  assert.match(err.message, /refs\/heads\/backtest-pr7-deadbee-head/);
+  assert.match(err.message, /refs\/heads\/backtest-pr7-deadbee-base/);
+});
+
+test("a fetch failure threads the run's branch names into the recovery hint", async () => {
+  const git = fakeGit({
+    fetch: (async () => {
+      throw new Error("fatal: boom");
+    }) as unknown as SimpleGit["fetch"],
+  });
+  const branches = {
+    head: "backtest-pr123-9f3c1a2-head",
+    base: "backtest-pr123-9f3c1a2-base",
+  };
+  let thrown: unknown;
+  try {
+    await fetchCommit(git, "9f3c1a2", 123, "source", READ_TOK, branches);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown instanceof UnfetchableCommitError);
+  assert.equal(
+    (thrown as UnfetchableCommitError).message,
+    buildUnfetchableMessage("9f3c1a2", 123, "source", branches),
+  );
+  assert.match(
+    (thrown as Error).message,
+    /refs\/heads\/backtest-pr123-9f3c1a2-head/,
+  );
+});
+
 test("the unfetchable message names origin by default and the source repo in fork mode", () => {
   assert.match(buildUnfetchableMessage("abc1234", 1), /from origin\./);
   assert.match(

@@ -50,11 +50,18 @@ export interface DestinationFlags {
  * `isSandbox` is true ONLY when the destination differs from the source. A
  * `--sandbox` value equal to the source resolves with `isSandbox` false,
  * equivalent to `--primary`.
+ *
+ * `offerRemember` is true only for an interactively-entered Sandbox that is not
+ * already the saved default. The choice flow no longer persists anything; the
+ * orchestrator carries this flag to the SUCCESS path and offers remember-as-
+ * default only after the run actually succeeds, so a destination that later
+ * fails to verify/create is never saved as the default.
  */
 export interface DestinationChoice {
   owner: string;
   repo: string;
   isSandbox: boolean;
+  offerRemember: boolean;
 }
 
 /**
@@ -135,8 +142,6 @@ export interface ChoiceResolvers {
   prompt: MenuPrompt;
   /** Interactive `owner/repo`-or-URL prompt, re-prompting on a parse error (TTY only). */
   promptForSlug: SlugPrompt;
-  /** Offer remember-as-default; persists on yes. */
-  promptRemember: RememberPrompt;
 }
 
 /**
@@ -201,16 +206,32 @@ export async function resolveDestinationChoice(
   // --- Flag tier (highest precedence) ---
 
   if (flags.primary === true) {
-    return { owner: source.owner, repo: source.repo, isSandbox: false };
+    return {
+      owner: source.owner,
+      repo: source.repo,
+      isSandbox: false,
+      offerRemember: false,
+    };
   }
 
   if (typeof flags.sandbox === "string") {
     const slug = parseSandboxSlug(flags.sandbox);
     // --sandbox == source behaves like --primary.
     if (sameRepo(slug, source)) {
-      return { owner: source.owner, repo: source.repo, isSandbox: false };
+      return {
+        owner: source.owner,
+        repo: source.repo,
+        isSandbox: false,
+        offerRemember: false,
+      };
     }
-    return { owner: slug.owner, repo: slug.repo, isSandbox: true };
+    // A flag-supplied sandbox is explicit each run; never offer to remember it.
+    return {
+      owner: slug.owner,
+      repo: slug.repo,
+      isSandbox: true,
+      offerRemember: false,
+    };
   }
 
   // --- No flag: interactive (TTY) vs saved-default (non-TTY) ---
@@ -222,10 +243,12 @@ export async function resolveDestinationChoice(
   // Non-interactive, no flag: use the saved default if present.
   const saved = resolvers.getDefaultDestination();
   if (saved) {
+    // Already the saved default → nothing to re-remember.
     return {
       owner: saved.owner,
       repo: saved.repo,
       isSandbox: !sameRepo(saved, source),
+      offerRemember: false,
     };
   }
 
@@ -249,8 +272,9 @@ export async function resolveDestinationChoice(
  *    Sandbox (a different repo).
  *
  * Choosing the no-default Sandbox row or the "a different repo" row prompts for
- * an `owner/repo`-or-URL (re-prompting on a parse error), then offers
- * remember-as-default.
+ * an `owner/repo`-or-URL (re-prompting on a parse error) and flags it for a
+ * remember-as-default offer — which the orchestrator makes only AFTER the run
+ * succeeds (so an unverifiable destination is never saved).
  */
 async function resolveInteractiveChoice(
   source: RepoRef,
@@ -285,7 +309,12 @@ async function resolveInteractiveChoice(
   const chosen = await resolvers.prompt(rows);
 
   if (chosen.kind === "primary") {
-    return { owner: source.owner, repo: source.repo, isSandbox: false };
+    return {
+      owner: source.owner,
+      repo: source.repo,
+      isSandbox: false,
+      offerRemember: false,
+    };
   }
 
   if (chosen.kind === "saved-sandbox") {
@@ -300,19 +329,22 @@ async function resolveInteractiveChoice(
       owner: dest.owner,
       repo: dest.repo,
       isSandbox: !sameRepo(dest, source),
+      offerRemember: false,
     };
   }
 
   // "sandbox" → prompt for a free-form owner/repo or URL (re-prompt on parse error).
   const dest = await resolvers.promptForSlug();
-  // Offer remember-as-default unless it already equals the saved default.
-  if (!(saved && sameRepo(saved, dest))) {
-    await resolvers.promptRemember(dest);
-  }
+  const isSandbox = !sameRepo(dest, source);
+  // Flag remember-as-default unless it already equals the saved default or it
+  // collapses to the source (not a sandbox). The orchestrator makes the offer on
+  // the SUCCESS path only — nothing is persisted here.
+  const offerRemember = isSandbox && !(saved && sameRepo(saved, dest));
   return {
     owner: dest.owner,
     repo: dest.repo,
-    isSandbox: !sameRepo(dest, source),
+    isSandbox,
+    offerRemember,
   };
 }
 
@@ -389,9 +421,10 @@ export interface RememberPromptOptions {
 }
 
 /**
- * Build the real remember-as-default prompt — injected as
- * `resolvers.promptRemember`. Asks once and, on yes, persists via the injected
- * `saveDefault` (defaulting to {@link mergeConfig}).
+ * Build the real remember-as-default prompt. The orchestrator invokes it on the
+ * SUCCESS path only (after the PR is opened) for a non-default Sandbox run, so a
+ * destination that fails to verify/create is never saved. Asks once and, on yes,
+ * persists via the injected `saveDefault` (defaulting to {@link mergeConfig}).
  */
 export function makeRememberPrompt(
   options: RememberPromptOptions = {},
@@ -420,10 +453,24 @@ export function makeRememberPrompt(
  * off-TTY call (it should never happen — {@link verifyOrCreateDestination} only
  * invokes this on the `isTTY` branch) returns false rather than hanging on
  * stdin.
+ *
+ * The answer is MEMOIZED per `owner/repo` (lowercased) for the life of the
+ * returned closure. The write resolver may probe several candidates for the same
+ * missing sandbox, each re-entering the create flow; without this cache the user
+ * would be asked "Create it as a private sandbox?" once per candidate. With it,
+ * the question is asked at most once per destination and every later candidate
+ * reuses the same answer.
  */
 export function makeConfirmCreate(): ConfirmCreate {
+  const answers = new Map<string, boolean>();
   return async (dest: RepoRef): Promise<boolean> => {
+    const key = `${dest.owner.toLowerCase()}/${dest.repo.toLowerCase()}`;
+    const cached = answers.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
     if (process.stdin.isTTY !== true) {
+      answers.set(key, false);
       return false;
     }
     const { create } = await prompts({
@@ -432,7 +479,9 @@ export function makeConfirmCreate(): ConfirmCreate {
       message: `${dest.owner}/${dest.repo} does not exist. Create it as a private sandbox?`,
       initial: true,
     });
-    return create === true;
+    const answer = create === true;
+    answers.set(key, answer);
+    return answer;
   };
 }
 

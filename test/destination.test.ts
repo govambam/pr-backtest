@@ -9,6 +9,7 @@ import {
   resolveDestinationChoice,
   verifyOrCreateDestination,
   makeSandboxCreator,
+  makeConfirmCreate,
   makeMenuPrompt,
   makeSlugPrompt,
   makeRememberPrompt,
@@ -51,14 +52,10 @@ function makeChoiceHarness(opts: {
   pick?: MenuRow["kind"];
   /** The slug the slug-prompt returns. */
   slug?: RepoRef;
-  /** Whether the remember prompt answers yes. */
-  remember?: boolean;
-  /** Records remember-prompt persistence targets. */
-  remembered?: RepoRef[];
 }): ChoiceHarness {
   let rows: MenuRow[] | null = null;
   let promptCount = 0;
-  let loginInvoked = false;
+  const loginInvoked = false;
   const resolvers: ChoiceResolvers = {
     getFlags: () => opts.flags ?? {},
     getDefaultDestination: () => {
@@ -79,11 +76,6 @@ function makeChoiceHarness(opts: {
       if (!opts.slug) throw new DestinationArgsError("no slug fake");
       return opts.slug;
     },
-    promptRemember: async (dest) => {
-      if (opts.remember) {
-        opts.remembered?.push(dest);
-      }
-    },
   };
   return {
     resolvers,
@@ -96,27 +88,48 @@ function makeChoiceHarness(opts: {
 test("--primary → source, isSandbox false, no prompt (VAL-DEST-002)", async () => {
   const h = makeChoiceHarness({ flags: { primary: true } });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.deepEqual(result, {
+    owner: "acme",
+    repo: "api",
+    isSandbox: false,
+    offerRemember: false,
+  });
   assert.equal(h.promptCount(), 0);
 });
 
 test("--sandbox <owner/repo> → that repo, isSandbox true (VAL-DEST-004)", async () => {
   const h = makeChoiceHarness({ flags: { sandbox: "me/sandbox" } });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "me", repo: "sandbox", isSandbox: true });
+  // A flag-supplied sandbox is explicit each run → never offered to remember.
+  assert.deepEqual(result, {
+    owner: "me",
+    repo: "sandbox",
+    isSandbox: true,
+    offerRemember: false,
+  });
   assert.equal(h.promptCount(), 0);
 });
 
 test("--sandbox equal to source resolves like --primary (isSandbox false)", async () => {
   const h = makeChoiceHarness({ flags: { sandbox: "acme/api" } });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.deepEqual(result, {
+    owner: "acme",
+    repo: "api",
+    isSandbox: false,
+    offerRemember: false,
+  });
 });
 
 test("--sandbox with different case than source resolves like --primary", async () => {
   const h = makeChoiceHarness({ flags: { sandbox: "Acme/API" } });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.deepEqual(result, {
+    owner: "acme",
+    repo: "api",
+    isSandbox: false,
+    offerRemember: false,
+  });
 });
 
 test("--primary + --sandbox → bad-args, before any seam (VAL-DEST-004)", async () => {
@@ -167,7 +180,13 @@ test("non-interactive, no flag, saved default → returns saved (isSandbox by sa
       saved: { owner: "me", repo: "sandbox" },
     });
     const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-    assert.deepEqual(result, { owner: "me", repo: "sandbox", isSandbox: true });
+    // The saved default is already remembered → no re-offer.
+    assert.deepEqual(result, {
+      owner: "me",
+      repo: "sandbox",
+      isSandbox: true,
+      offerRemember: false,
+    });
     assert.equal(h.promptCount(), 0);
   }
   // Saved equals source → isSandbox false.
@@ -234,22 +253,28 @@ test("VAL-DEST-001: saved default → Primary, saved-sandbox, a-different-repo (
 test("VAL-DEST-002: choosing Primary from the menu → source, isSandbox false", async () => {
   const h = makeChoiceHarness({ isTTY: true, pick: "primary" });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
+  assert.deepEqual(result, {
+    owner: "acme",
+    repo: "api",
+    isSandbox: false,
+    offerRemember: false,
+  });
 });
 
 test("interactive: choosing the saved-sandbox row returns that repo, no remember re-offer", async () => {
-  const remembered: RepoRef[] = [];
   const h = makeChoiceHarness({
     isTTY: true,
     saved: { owner: "me", repo: "sandbox" },
     pick: "saved-sandbox",
-    remember: true,
-    remembered,
   });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "me", repo: "sandbox", isSandbox: true });
-  // VAL-DEST-005: already the saved default → never re-offered.
-  assert.equal(remembered.length, 0);
+  // VAL-DEST-005: already the saved default → never re-offered (offerRemember false).
+  assert.deepEqual(result, {
+    owner: "me",
+    repo: "sandbox",
+    isSandbox: true,
+    offerRemember: false,
+  });
 });
 
 test("VAL-DEST-003: choosing Sandbox prompts for a slug and returns it", async () => {
@@ -259,36 +284,41 @@ test("VAL-DEST-003: choosing Sandbox prompts for a slug and returns it", async (
     slug: { owner: "you", repo: "other" },
   });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.deepEqual(result, { owner: "you", repo: "other", isSandbox: true });
+  assert.deepEqual(result, {
+    owner: "you",
+    repo: "other",
+    isSandbox: true,
+    offerRemember: true,
+  });
 });
 
-test("VAL-DEST-005: non-default Sandbox choice offers remember, persists on yes", async () => {
-  const remembered: RepoRef[] = [];
+test("VAL-DEST-005: non-default Sandbox choice flags offerRemember (offer deferred to success)", async () => {
   const h = makeChoiceHarness({
     isTTY: true,
     pick: "sandbox",
     slug: { owner: "you", repo: "other" },
-    remember: true,
-    remembered,
   });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
   assert.equal(result.isSandbox, true);
-  assert.deepEqual(remembered, [{ owner: "you", repo: "other" }]);
+  // The choice flow no longer persists anything — it only flags the offer; the
+  // orchestrator makes it on the success path.
+  assert.equal(result.offerRemember, true);
 });
 
-test("VAL-DEST-005: Sandbox slug equal to the saved default is NOT re-offered", async () => {
-  const remembered: RepoRef[] = [];
+test("VAL-DEST-005: Sandbox slug equal to the saved default does NOT flag offerRemember", async () => {
   const h = makeChoiceHarness({
     isTTY: true,
     saved: { owner: "me", repo: "sandbox" },
     pick: "sandbox", // "a different repo" row
     slug: { owner: "Me", repo: "Sandbox" }, // same as saved, mixed case
-    remember: true,
-    remembered,
   });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
   assert.equal(result.isSandbox, true);
-  assert.equal(remembered.length, 0, "equal-to-default → no remember offer");
+  assert.equal(
+    result.offerRemember,
+    false,
+    "equal-to-default → no remember offer",
+  );
 });
 
 // --- VAL-DEST-006: the choice flow never invokes a login/getAuthenticated seam ---
@@ -409,6 +439,38 @@ test("makeRememberPrompt: declining does not persist", async () => {
   });
   await rememberPrompt({ owner: "you", repo: "other" });
   assert.equal(persisted.length, 0);
+});
+
+test("VAL-CORR-005: makeConfirmCreate memoizes the answer per owner/repo (asked ≤ 1 time)", async () => {
+  const realIsTTY = process.stdin.isTTY;
+  Object.defineProperty(process.stdin, "isTTY", {
+    value: true,
+    configurable: true,
+  });
+  try {
+    // Queue answers so we can prove the SECOND same-dest call consumed none:
+    //   1st inject (true)  → the one prompt for octocat/sb
+    //   2nd inject (false) → only reached if a DIFFERENT dest prompts
+    prompts.inject([true, false]);
+    const confirm = makeConfirmCreate();
+    const dest: RepoRef = { owner: "octocat", repo: "sb" };
+
+    const first = await confirm(dest);
+    // A second candidate for the SAME dest (case-insensitive) must NOT re-prompt.
+    const second = await confirm({ owner: "OctoCat", repo: "SB" });
+    assert.equal(first, true);
+    assert.equal(second, true, "the memoized answer is reused, no second prompt");
+
+    // A genuinely different dest DOES prompt — it consumes the queued `false`,
+    // proving the same-dest second call above consumed nothing.
+    const other = await confirm({ owner: "octocat", repo: "other" });
+    assert.equal(other, false);
+  } finally {
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: realIsTTY,
+      configurable: true,
+    });
+  }
 });
 
 // =====================================================================

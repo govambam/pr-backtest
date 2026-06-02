@@ -38,6 +38,8 @@ import {
   NoSourceTokenNonInteractiveError,
   NoTokenNonInteractiveError,
 } from "../src/auth.js";
+import { DestinationApiError } from "../src/destination.js";
+import type { RepoRef } from "../src/config.js";
 import { setTtyOverride, setVerbose } from "../src/log.js";
 
 /** An `Error` tagged with the exit code a stubbed `process.exit` was given. */
@@ -336,6 +338,29 @@ test("VAL-EXIT-002: an unfetchable commit maps to exit 3 (git failure)", async (
   assert.match(stderr, /Could not fetch commit/);
 });
 
+test("VAL-HONEST-009: index threads the run's real branch names into fetchCommit", async () => {
+  // index.ts step 9 names branches backtest-pr<N>-<shortSha>-{head,base} (target
+  // short SHA = a1b2c3d). The same names must be threaded into fetchCommit so the
+  // unfetchable recovery hint reconnects to the tool's own scheme.
+  let captured: { head: string; base: string } | undefined;
+  const { deps } = makeDeps({
+    fetchCommit: async (_git, _sha, _prNumber, _remote, _token, branches) => {
+      if (branches) captured = branches;
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+  assert.deepEqual(captured, {
+    head: "backtest-pr123-a1b2c3d-head",
+    base: "backtest-pr123-a1b2c3d-base",
+  });
+  // And the message the user would see embeds exactly those names.
+  const { buildUnfetchableMessage } = await import("../src/git.js");
+  const msg = buildUnfetchableMessage("a1b2c3d", 123, "source", captured!);
+  assert.match(msg, /refs\/heads\/backtest-pr123-a1b2c3d-head/);
+  assert.match(msg, /refs\/heads\/backtest-pr123-a1b2c3d-base/);
+});
+
 test("VAL-EXIT-002: a clone failure maps to exit 3", async () => {
   const { deps } = makeDeps({
     cloneRepo: async () => {
@@ -476,6 +501,89 @@ test("VAL-BRANCH-003: a CLOSED prior backtest PR does NOT block — the run proc
   assert.ok(order.includes("open-pr"), "the run reached create");
 });
 
+// --- VAL-CORR-001: remember-as-default only after a successful run ----------
+
+const REMEMBER_SANDBOX = { owner: SANDBOX_OWNER, repo: SANDBOX_REPO };
+
+/**
+ * Build deps for a non-default interactive Sandbox run that flags
+ * `offerRemember`, recording every remember-prompt invocation. The recorded
+ * array is empty unless the orchestrator actually offers remember.
+ */
+function makeRememberDeps(
+  overrides: Partial<RunBacktestDeps> = {},
+): { deps: Partial<RunBacktestDeps>; remembered: RepoRef[] } {
+  const remembered: RepoRef[] = [];
+  const { deps } = makeDeps(
+    {
+      resolveDestinationChoice: async () => ({
+        owner: SANDBOX_OWNER,
+        repo: SANDBOX_REPO,
+        isSandbox: true,
+        offerRemember: true,
+      }),
+      // In sandbox mode the source fetch needs a read remote; keep it inert.
+      addSourceRemote: async () => {},
+      makeRememberPrompt:
+        () =>
+        async (dest: RepoRef): Promise<void> => {
+          remembered.push(dest);
+        },
+      ...overrides,
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+  return { deps, remembered };
+}
+
+test("VAL-CORR-001: a successful non-default Sandbox run offers remember after success", async () => {
+  const { deps, remembered } = makeRememberDeps();
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+  assert.deepEqual(
+    remembered,
+    [REMEMBER_SANDBOX],
+    "remember is offered exactly once, on the success path",
+  );
+});
+
+test("VAL-CORR-001: a Sandbox run that fails verify/create never offers remember", async () => {
+  const { deps, remembered } = makeRememberDeps({
+    // The write resolver's accept rejects every candidate → terminal exit 2,
+    // never reaching the success path.
+    resolveWriteToken: async () => {
+      throw new DestinationApiError("sandbox not writable / cannot create");
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 2, "an unverifiable destination is exit 2");
+  assert.deepEqual(
+    remembered,
+    [],
+    "no remember/persist on a non-success exit path",
+  );
+});
+
+test("VAL-CORR-001: a declined plan never offers remember", async () => {
+  const { deps, remembered } = makeRememberDeps({
+    confirmPlan: async () => false,
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0, "a decline is a clean exit 0");
+  assert.deepEqual(remembered, [], "a decline does not persist a default");
+});
+
+test("VAL-CORR-001: a git failure never offers remember", async () => {
+  const { deps, remembered } = makeRememberDeps({
+    pushBranchFromSha: async () => {
+      throw new Error("push failed");
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 3, "a git failure is exit 3");
+  assert.deepEqual(remembered, [], "a git failure does not persist a default");
+});
+
 // --- VAL-BRANCH-004: 422 backstop -------------------------------------------
 
 test("VAL-BRANCH-004: a 422 with a matching OPEN PR re-queries and exits 4", async () => {
@@ -515,6 +623,40 @@ test("VAL-BRANCH-004: a 422 with NO matching PR exits 2 (no-diff message)", asyn
   const { stderr, exit } = await run({ deps });
   assert.equal(exit, 2, "a 422 with no matching PR is exit 2");
   assert.match(stderr, /no difference between the target commit and its parent/);
+});
+
+test("VAL-HONEST-006: a 422 whose re-query REJECTS does not misreport a no-diff", async () => {
+  // The pre-flight resolves to null (proceed); createPullRequest 422s; the
+  // post-422 re-query itself REJECTS (network/5xx). A failed re-query must NOT be
+  // coerced to "no match" → the user must not see the no-diff message.
+  let preflightDone = false;
+  const { deps } = makeDeps({
+    findExistingPr: async () => {
+      if (!preflightDone) {
+        preflightDone = true;
+        return null; // pre-flight: proceed.
+      }
+      throw new Error("GitHub list PRs failed (502)"); // post-422 re-query rejects.
+    },
+    createPullRequest: async () => {
+      const err = new Error("Validation Failed") as Error & { status: number };
+      err.status = 422;
+      throw err;
+    },
+  });
+  const { stdout, stderr, exit } = await run({ deps });
+  assert.equal(exit, 2, "a failed re-query is still an API error exit 2");
+  assert.equal(stdout, "", "no PR URL on stdout for a failed run");
+  assert.doesNotMatch(
+    stderr,
+    /no difference between the target commit and its parent/,
+    "a failed re-query must NOT be reported as a no-diff condition",
+  );
+  assert.match(
+    stderr,
+    /follow-up check for an existing backtest PR could not complete/,
+    "the message says the existence check could not complete",
+  );
 });
 
 // --- Sandbox write-target invariants (VAL-ROUTE-003) ------------------------

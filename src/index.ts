@@ -218,6 +218,10 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   let destOwner: string;
   let destRepo: string;
   let isSandbox: boolean;
+  // Whether to offer remember-as-default — but only on the SUCCESS path (step
+  // 13). Persisting here, before the destination is verified/created and before
+  // the run succeeds, would poison the saved default with an unusable repo.
+  let offerRemember = false;
   try {
     const choiceResolvers: ChoiceResolvers = {
       getFlags: () => ({
@@ -229,7 +233,6 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       getIsTTY: () => isTTY,
       prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
       promptForSlug: deps.makeSlugPrompt(),
-      promptRemember: deps.makeRememberPrompt(),
     };
     const choice = await deps.resolveDestinationChoice(
       { owner, repo },
@@ -238,6 +241,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     destOwner = choice.owner;
     destRepo = choice.repo;
     isSandbox = choice.isSandbox;
+    offerRemember = choice.offerRemember;
   } catch (err) {
     if (err instanceof DestinationArgsError) {
       error(messageOf(err));
@@ -317,11 +321,13 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // 5. Resolve the READ token. Reuses the write token IFF it reads the source
   //    (single-PAT); else GITHUB_SOURCE_TOKEN / saved sourceToken / paste. A
   //    missing source-read token non-interactively → exit 1 naming
-  //    GITHUB_SOURCE_TOKEN, BEFORE any branch/PR write to the destination
-  //    (VAL-TOKEN-005/008). NOTE: with `--create-sandbox`, step 4 may already
-  //    have CREATED the destination sandbox (a reusable repo, by design — spec
-  //    §5 "reuse one sandbox forever"); that create is the only write that can
-  //    precede this check, and the source is never written either way.
+  //    GITHUB_SOURCE_TOKEN, BEFORE any source read or any branch/PR write to the
+  //    destination. Creating the reusable destination sandbox in step 4 (with
+  //    `--create-sandbox`) is the single write permitted before this check: the
+  //    sandbox is reused forever (one create, then every run reuses it), so the
+  //    create is benign and idempotent in effect. The source is never written,
+  //    and this source-token check still precedes any source read and any
+  //    branch/PR write.
   let readToken: string;
   try {
     const resolved = await deps.resolveReadToken({
@@ -483,9 +489,13 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       await deps.addSourceRemote(git, owner, repo);
     }
 
+    // Both manual-recovery push lines in the unfetchable message target the same
+    // target-SHA-named branches this run creates (step 9), so an unfetchable
+    // commit prints a hint the tool can actually match on a re-run.
+    const recoveryBranches = { head: headBranch, base: baseBranch };
     try {
-      await deps.fetchCommit(git, baseSha, number, commitRemote, fetchToken);
-      await deps.fetchCommit(git, targetSha, number, commitRemote, fetchToken);
+      await deps.fetchCommit(git, baseSha, number, commitRemote, fetchToken, recoveryBranches);
+      await deps.fetchCommit(git, targetSha, number, commitRemote, fetchToken, recoveryBranches);
     } catch (err) {
       if (err instanceof UnfetchableCommitError) {
         error(err.message);
@@ -530,9 +540,30 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     // the open-only pre-flight didn't catch). Re-query the SAME branches: a
     // matching OPEN PR surfaces its URL + exit 4; otherwise exit 2 (no-diff).
     if (isStatus(err, 422)) {
-      const racedUrl = await deps
-        .findExistingPr(writeOctokit, destOwner, destRepo, headBranch, baseBranch, "open")
-        .catch(() => null);
+      // Re-query the SAME branches to recover a raced OPEN PR. A re-query that
+      // REJECTS (network/5xx) must NOT be coerced to "no match" — that would
+      // misreport a failed check as a no-diff condition. Only a re-query that
+      // RESOLVES to no match is genuinely "no difference".
+      let racedUrl: string | null;
+      try {
+        racedUrl = await deps.findExistingPr(
+          writeOctokit,
+          destOwner,
+          destRepo,
+          headBranch,
+          baseBranch,
+          "open",
+        );
+      } catch {
+        // The PR creation failed and we could not complete the existence check —
+        // surface that honestly rather than claiming there is no diff.
+        error(
+          "GitHub rejected the PR (422) and the follow-up check for an existing " +
+            "backtest PR could not complete. Retry; if it persists, check the " +
+            "destination repository's open PRs manually.",
+        );
+        process.exit(EXIT.API_ERROR);
+      }
       if (racedUrl) {
         process.stdout.write(racedUrl + "\n");
         error(
@@ -543,7 +574,8 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         );
         process.exit(EXIT.EXISTING_PR);
       }
-      // 422 without a matching PR (e.g. no diff between the two commits).
+      // 422 with a re-query that resolved to no matching PR (e.g. no diff between
+      // the two commits).
       error(
         "GitHub rejected the PR: there may be no difference between the " +
           "target commit and its parent for these branches.",
@@ -557,7 +589,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   openTrace.done();
   deps.cleanup(tmpDir);
 
-  // 13. Success: the PR URL is the final line on stdout (pipe-friendly).
+  // 13. Success. Offer remember-as-default ONLY now — after the PR is created and
+  //     the run has actually succeeded. This is the single place
+  //     `defaultDestination` may be persisted, so no non-success exit path (verify
+  //     /create failure, read-token exit 1, git failure, decline, dup exit 4) can
+  //     save a destination the run never proved usable. Gated on a non-default
+  //     interactively-chosen Sandbox (`offerRemember`).
+  if (offerRemember && isSandbox) {
+    await deps.makeRememberPrompt()({ owner: destOwner, repo: destRepo });
+  }
+
+  // The PR URL is the final line on stdout (pipe-friendly).
   success("Backtest PR created.");
   process.stdout.write(prUrl + "\n");
   process.exit(EXIT.SUCCESS);
