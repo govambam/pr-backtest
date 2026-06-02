@@ -28,8 +28,6 @@ export interface PlanInput {
   targetLabel: string;
   /** Full base SHA (rendered short). */
   baseSha: string;
-  /** Optional note about the temp directory used for the clone. */
-  tmpDirNote?: string;
   /** The head branch name, e.g. "backtest-pr123-head". */
   headBranch: string;
   /** The base branch name, e.g. "backtest-pr123-base". */
@@ -59,7 +57,7 @@ export interface PlanInput {
 export function renderPlan(input: PlanInput): string {
   const target = shortSha(input.targetSha);
   const base = shortSha(input.baseSha);
-  const cloneDest = input.tmpDirNote ?? "a temp directory";
+  const cloneDest = "a temp directory";
   const dest = input.targetRepo ?? input.ownerRepo;
   // When the destination differs from the source, the source is only ever read
   // (a sandbox destination); the writes land in `dest`. When they match, the one
@@ -69,11 +67,11 @@ export function renderPlan(input: PlanInput): string {
   // remote; otherwise they come straight from the clone's origin.
   const fetchFrom = destDiffers ? `source (${input.ownerRepo})` : "origin";
 
-  // Two-token annotation. ONLY when the run uses two distinct tokens (§11) do we
+  // Two-token annotation. ONLY when the run uses two distinct tokens do we
   // surface the trust boundary: a read-only token reads the source, a separate
   // write token writes the destination. Gated strictly on the flag so a
   // one-token run (the common case) renders byte-identical to today — no token
-  // word appears. These annotations name no token value (INV-TOKEN); they only
+  // word appears. These annotations name no token value; they only
   // state which *kind* of token authenticates each side.
   const twoToken = input.twoToken === true;
   const sourceTokenTag = twoToken ? " (read-only token)" : "";

@@ -22,7 +22,7 @@ function httpError(status: number): Error & { status: number } {
  * `{ data }`; if `throws` is set, the call rejects with it instead.
  */
 function makeFakeOctokit(opts: {
-  result?: { permissions?: { push?: boolean }; private?: boolean };
+  result?: { permissions?: { push?: boolean } };
   throws?: unknown;
 }): Octokit {
   const fake = {
@@ -36,41 +36,22 @@ function makeFakeOctokit(opts: {
   return fake as unknown as Octokit;
 }
 
-test("verifyRepo: permissions.push === true → { exists: true, canPush: true, private: false }", async () => {
+test("verifyRepo: permissions.push === true → { exists: true, canPush: true }", async () => {
   const octokit = makeFakeOctokit({ result: { permissions: { push: true } } });
   const result = await verifyRepo(octokit, "me", "sandbox");
-  assert.deepEqual(result, { exists: true, canPush: true, private: false });
+  assert.deepEqual(result, { exists: true, canPush: true });
 });
 
-test("verifyRepo: permissions.push === false → { exists: true, canPush: false, private: false }", async () => {
+test("verifyRepo: permissions.push === false → { exists: true, canPush: false }", async () => {
   const octokit = makeFakeOctokit({ result: { permissions: { push: false } } });
   const result = await verifyRepo(octokit, "me", "ro");
-  assert.deepEqual(result, { exists: true, canPush: false, private: false });
+  assert.deepEqual(result, { exists: true, canPush: false });
 });
 
 test("verifyRepo: missing permissions object → exists true, canPush false", async () => {
   const octokit = makeFakeOctokit({ result: {} });
   const result = await verifyRepo(octokit, "me", "no-perms");
-  assert.deepEqual(result, { exists: true, canPush: false, private: false });
-});
-
-test("verifyRepo: reports the repo's real private flag (F4 source-visibility probe)", async () => {
-  // A private repo visible to the token reports private:true; a public repo
-  // reports private:false. This is what the source-visibility probe reads to
-  // decide whether the run needs a separate read token (vs an anonymous read).
-  const priv = await verifyRepo(
-    makeFakeOctokit({ result: { permissions: { push: false }, private: true } }),
-    "acme",
-    "secret",
-  );
-  assert.deepEqual(priv, { exists: true, canPush: false, private: true });
-
-  const pub = await verifyRepo(
-    makeFakeOctokit({ result: { permissions: { push: true }, private: false } }),
-    "acme",
-    "open",
-  );
-  assert.deepEqual(pub, { exists: true, canPush: true, private: false });
+  assert.deepEqual(result, { exists: true, canPush: false });
 });
 
 test("verifyRepo: 404 → { exists: false, canPush: false }", async () => {

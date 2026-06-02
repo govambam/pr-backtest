@@ -174,9 +174,10 @@ export async function getCommitParentSha(
  * Pre-flight: detect an existing backtest PR for the planned head/base pair via
  * `pulls.list`. Returns the existing PR's `html_url`, or `null`.
  *
- * Defaults to open PRs for the pre-flight check. Pass `state: "all"` to also
- * surface a closed/merged PR — used to recover the URL when `pulls.create`
- * reports a duplicate (422).
+ * Defaults to OPEN PRs only: a closed/merged prior backtest PR no longer blocks
+ * a re-run, since the SHA-named branches make the (PR, commit) pair the backtest
+ * identity. The `state` argument is left injectable (defaulting to open) for the
+ * post-create 422 backstop, which queries the same branches.
  */
 export async function findExistingPr(
   octokit: Octokit,
@@ -194,11 +195,6 @@ export async function findExistingPr(
     state,
   });
   return data.length > 0 ? data[0]!.html_url : null;
-}
-
-/** True when `err` is an Octokit-style HTTP error with the given status. */
-export function isHttpStatus(err: unknown, status: number): boolean {
-  return isStatus(err, status);
 }
 
 /**
@@ -291,15 +287,6 @@ export interface RepoVerification {
   exists: boolean;
   /** True only when `data.permissions.push === true` (the token can write). */
   canPush: boolean;
-  /**
-   * The repo's REAL visibility flag (`data.private`) when `repos.get` succeeds —
-   * `true` when the repo is genuinely private, `false` when public. Omitted
-   * (undefined) when the probe 404s (the repo is not visible to this token, so
-   * its visibility is unknown). Used by the source-visibility probe to decide
-   * whether the run needs a separate read token. Backward compatible: existing
-   * destination callers ignore it.
-   */
-  private?: boolean;
 }
 
 /**
@@ -320,7 +307,6 @@ export async function verifyRepo(
     return {
       exists: true,
       canPush: data.permissions?.push === true,
-      private: data.private === true,
     };
   } catch (err: unknown) {
     if (isStatus(err, 404)) {
@@ -331,7 +317,7 @@ export async function verifyRepo(
 }
 
 /** Narrow an unknown thrown value to an Octokit-style HTTP error of a status. */
-function isStatus(err: unknown, status: number): boolean {
+export function isStatus(err: unknown, status: number): boolean {
   return (
     typeof err === "object" &&
     err !== null &&

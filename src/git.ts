@@ -30,6 +30,18 @@ import { shortSha } from "./util.js";
 export const TOKEN_ENV = "PR_BACKTEST_GIT_TOKEN";
 
 /**
+ * The exact head/base branch names the tool creates for this run. When threaded
+ * into the unfetchable-commit message, the manual `git push` recovery lines name
+ * the same branches the collision pre-flight and PR-open match against, so a
+ * user who follows the hint reconnects to the tool's own scheme. The names embed
+ * the target commit's short SHA (`backtest-pr<N>-<shortSha>-{head,base}`).
+ */
+export interface UnfetchableBranchNames {
+  head: string;
+  base: string;
+}
+
+/**
  * Thrown when a specific commit SHA cannot be fetched from origin.
  *
  * Carries an actionable message including both manual fallback `git push`
@@ -39,8 +51,13 @@ export class UnfetchableCommitError extends Error {
   readonly sha: string;
   readonly prNumber: number;
 
-  constructor(sha: string, prNumber: number, remote = "origin") {
-    super(buildUnfetchableMessage(sha, prNumber, remote));
+  constructor(
+    sha: string,
+    prNumber: number,
+    remote = "origin",
+    branches?: UnfetchableBranchNames,
+  ) {
+    super(buildUnfetchableMessage(sha, prNumber, remote, branches));
     this.name = "UnfetchableCommitError";
     this.sha = sha;
     this.prNumber = prNumber;
@@ -52,13 +69,21 @@ export class UnfetchableCommitError extends Error {
  *
  * `remote` names where the fetch was attempted: `origin` (same-repo runs) or
  * `source` (sandbox mode, where commits come from the PR's original repo).
+ *
+ * When `branches` is supplied, the manual `git push` recovery lines use the
+ * tool's real branch names (which embed the target short SHA) so the hint
+ * actually reconnects to the run's branches; otherwise they fall back to the
+ * bare `backtest-pr<N>-{head,base}` form.
  */
 export function buildUnfetchableMessage(
   sha: string,
   prNumber: number,
   remote = "origin",
+  branches?: UnfetchableBranchNames,
 ): string {
   const from = remote === "source" ? "the source repository" : "origin";
+  const headBranch = branches?.head ?? `backtest-pr${prNumber}-head`;
+  const baseBranch = branches?.base ?? `backtest-pr${prNumber}-base`;
   return [
     `Could not fetch commit ${sha} from ${from}.`,
     "",
@@ -70,8 +95,8 @@ export function buildUnfetchableMessage(
     "If the commit still exists locally somewhere (e.g., on a developer's machine),",
     "you can manually push it as a branch and re-run:",
     "",
-    `  git push origin ${sha}:refs/heads/backtest-pr${prNumber}-head`,
-    `  git push origin ${sha}^:refs/heads/backtest-pr${prNumber}-base`,
+    `  git push origin ${sha}:refs/heads/${headBranch}`,
+    `  git push origin ${sha}^:refs/heads/${baseBranch}`,
     "",
     "Then open a PR between those branches in the GitHub UI.",
   ].join("\n");
@@ -243,11 +268,9 @@ export async function addSourceRemote(
  * call only — leaving the clone's baked-in (write) token untouched for
  * clone/push. This lets a `source`-remote fetch use the READ token while
  * clone/push keep the WRITE token. The token still travels ONLY via the askpass
- * env var — never in the URL, on the command line, or in `.git/config`.
- *
- * An EMPTY string means an anonymous fetch (a public source read over https with
- * no credentials): TOKEN_ENV is set to `""`, so the askpass helper supplies no
- * password and git proceeds unauthenticated.
+ * env var — never in the URL, on the command line, or in `.git/config`. The
+ * token is always a real credential (the read or write token); the two-token
+ * orchestrator never passes an empty/anonymous token.
  */
 export async function fetchCommit(
   git: SimpleGit,
@@ -255,20 +278,22 @@ export async function fetchCommit(
   prNumber: number,
   remote: string,
   token: string,
+  branches?: UnfetchableBranchNames,
 ): Promise<void> {
   const trace = log.traceOp(`Fetching ${shortSha(sha)} from ${remote}`);
   const start = Date.now();
   // Scope the credential to THIS fetch: `.env(name, value)` returns the same
   // instance with one env var overridden, so we set the per-op token (the read
-  // token for a source fetch, the write token for an origin fetch, or "" for an
-  // anonymous public-source fetch) without depending on the instance's prior env.
+  // token for a source fetch, the write token for an origin fetch) without
+  // depending on the instance's prior env.
   const fetchGit = git.env(TOKEN_ENV, token);
   try {
     await fetchGit.fetch(remote, sha);
   } catch {
     trace.fail();
     // Deliberately do not surface raw git stderr — it leaks little and confuses.
-    throw new UnfetchableCommitError(sha, prNumber, remote);
+    // The recovery message names the run's real branches so the hint reconnects.
+    throw new UnfetchableCommitError(sha, prNumber, remote, branches);
   }
   trace.done();
   log.verboseLine(`$ ${fetchDisplayCommand(remote, sha)}  ${log.formatElapsed(Date.now() - start)}`);
@@ -290,8 +315,8 @@ export async function fetchCommit(
  * on the askpass {@link TOKEN_ENV} variable for this call. Passing it explicitly
  * keeps the write credential authoritative for the push even if a prior
  * `source`-remote fetch on the same instance overrode {@link TOKEN_ENV} with the
- * read token — the read token can never authenticate a push
- * (INV-READTOKEN-NOWRITE). The token travels ONLY via the askpass env var.
+ * read token — the read token can never authenticate a push. The token travels
+ * ONLY via the askpass env var.
  */
 export async function pushBranchFromSha(
   git: SimpleGit,

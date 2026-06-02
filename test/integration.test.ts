@@ -6,7 +6,8 @@
  * When `GITHUB_TOKEN` is set, this test drives the built CLI end-to-end against
  * a public fixture PR and asserts three properties:
  *   1. The created PR's diff matches the target commit's diff.
- *   2. The pushed branches are named `backtest-pr<N>-base` / `backtest-pr<N>-head`.
+ *   2. The pushed branches are named `backtest-pr<N>-<shortSha>-base` /
+ *      `backtest-pr<N>-<shortSha>-head` (the target commit's short SHA).
  *   3. Cleanup happened — no leftover `/tmp/pr-backtest-*` directory remains.
  *
  * It shells out to `node dist/cli.js <fixture-pr> -y` (rather than importing
@@ -96,9 +97,11 @@ test(
     const prUrl = lines[lines.length - 1];
     assert.match(prUrl, /\/pull\/\d+$/, "final stdout line should be the created PR URL");
 
-    // 2. Branch names follow the backtest-pr<N>-{head,base} convention.
-    const headBranch = `backtest-pr${number}-head`;
-    const baseBranch = `backtest-pr${number}-base`;
+    // 2. Branch names follow the backtest-pr<N>-<shortSha>-{head,base} convention
+    //    (the (PR, commit) pair is the backtest identity).
+    const shortSha = target.sha.slice(0, 7);
+    const headBranch = `backtest-pr${number}-${shortSha}-head`;
+    const baseBranch = `backtest-pr${number}-${shortSha}-base`;
     const createdNumber = Number(prUrl.split("/").pop());
     const created = await octokit.pulls.get({
       owner,
