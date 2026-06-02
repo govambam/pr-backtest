@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseRepoSlug } from "../src/parseUrl.js";
+import { parseRepoName, parseRepoSlug } from "../src/parseUrl.js";
 
 test("parses a plain owner/repo slug", () => {
   assert.deepEqual(parseRepoSlug("myuser/myfork"), {
@@ -29,5 +29,16 @@ test("allows dots, hyphens, and underscores in names", () => {
 test("rejects empty, single-segment, three-segment, and dot-only-segment input", () => {
   for (const bad of ["", "   ", "noslash", "a/b/c", "/", "owner/", "../x", "a/..", "./x"]) {
     assert.throws(() => parseRepoSlug(bad), /Invalid repository/);
+  }
+});
+
+test("parseRepoName accepts a valid bare name (same rule as the repo segment)", () => {
+  assert.equal(parseRepoName("my-sandbox"), "my-sandbox");
+  assert.equal(parseRepoName("  api_backtest.js  "), "api_backtest.js");
+});
+
+test("parseRepoName rejects empty, dot-only, slashed, and bad-char names", () => {
+  for (const bad of ["", "   ", ".", "..", "owner/name", "bad name", "x!y"]) {
+    assert.throws(() => parseRepoName(bad), /Invalid repository name/);
   }
 });

@@ -54,7 +54,8 @@ import {
   type InheritedCredential,
 } from "./inheritedAuth.js";
 import type { RepoRef } from "./config.js";
-import { info } from "./log.js";
+import { info, warn } from "./log.js";
+import { parseRepoName } from "./parseUrl.js";
 
 // Re-export the shared repo coordinate so importers can reference it from here.
 export type { RepoRef };
@@ -403,9 +404,15 @@ export function makeLandingChoicePrompt(
 /**
  * Build the real inherited new-sandbox NAME prompt, pre-filled with the default
  * `<src-repo>-backtest` and editable (VAL-CREATE-003). The user can accept the
- * default (Enter) or type a new name; the trimmed result flows straight to the
- * creator. An empty/aborted entry falls back to the default. Off-TTY it returns
- * the default unchanged rather than hanging.
+ * default (Enter) or type a new name; the trimmed result flows to the creator.
+ *
+ * The edited name is VALIDATED against the same repo-name rule every other
+ * destination input is held to ({@link parseRepoName}, reusing `parseRepoSlug`'s
+ * repo-segment check). An invalid name (e.g. a slash, `.`/`..`, or a character
+ * outside `[\w.-]`) RE-PROMPTS — the way {@link makeSlugPrompt} loops on a parse
+ * error — rather than flowing unchecked into `createPrivateRepo` /
+ * `repoHttpsUrl`. An empty/blank/aborted entry keeps the default. Off-TTY it
+ * returns the default unchanged rather than hanging.
  */
 export function makeSandboxNamePrompt(
   options: AuthOfferPromptOptions = {},
@@ -415,17 +422,28 @@ export function makeSandboxNamePrompt(
     if (!isTTY()) {
       return defaultName;
     }
-    const { name } = await prompts({
-      type: "text",
-      name: "name",
-      message: "New sandbox repo name:",
-      initial: defaultName,
-    });
-    if (typeof name !== "string") {
-      return defaultName;
+    for (;;) {
+      const { name } = await prompts({
+        type: "text",
+        name: "name",
+        message: "New sandbox repo name:",
+        initial: defaultName,
+      });
+      if (typeof name !== "string") {
+        return defaultName;
+      }
+      const trimmed = name.trim();
+      // Empty/blank → keep the default (the documented fall-back).
+      if (trimmed.length === 0) {
+        return defaultName;
+      }
+      try {
+        return parseRepoName(trimmed);
+      } catch (err: unknown) {
+        warn(err instanceof Error ? err.message : "Invalid repository name.");
+        // Loop to re-prompt rather than pass an invalid name downstream.
+      }
     }
-    const trimmed = name.trim();
-    return trimmed.length > 0 ? trimmed : defaultName;
   };
 }
 

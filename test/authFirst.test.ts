@@ -10,7 +10,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import prompts from "prompts";
+
 import {
+  makeSandboxNamePrompt,
   resolveAuthFirstChoice,
   SANDBOX_NAME_SUFFIX,
   type AuthFirstResolvers,
@@ -261,4 +264,49 @@ test("VAL-FLOW-003: scoped + no with slug equal to the saved default does NOT fl
   const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
   assert.equal(choice.isSandbox, true);
   assert.equal(choice.offerRemember, false, "equal-to-default → no remember offer");
+});
+
+// --- VAL-CREATE-003: the EDITED new-sandbox name is VALIDATED, re-prompting ---
+// (consistency with parseRepoSlug: an invalid name never flows downstream).
+
+test("makeSandboxNamePrompt: a valid edited name passes straight through", async () => {
+  prompts.inject(["my-sandbox"]);
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => true });
+  assert.equal(await namePrompt("api-backtest"), "my-sandbox");
+});
+
+test("makeSandboxNamePrompt: an INVALID name re-prompts; the next valid name is used", async () => {
+  // First entry has a forbidden char (space), second is valid → loop re-prompts.
+  prompts.inject(["bad name!", "good-name"]);
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => true });
+  assert.equal(await namePrompt("api-backtest"), "good-name");
+});
+
+test("makeSandboxNamePrompt: a dot-only name (..) is rejected and re-prompted", async () => {
+  prompts.inject(["..", "ok-name"]);
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => true });
+  assert.equal(await namePrompt("api-backtest"), "ok-name");
+});
+
+test("makeSandboxNamePrompt: a name containing a slash is rejected and re-prompted", async () => {
+  prompts.inject(["owner/name", "name-only"]);
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => true });
+  assert.equal(await namePrompt("api-backtest"), "name-only");
+});
+
+test("makeSandboxNamePrompt: an empty entry keeps the default unchanged", async () => {
+  prompts.inject([""]);
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => true });
+  assert.equal(await namePrompt("api-backtest"), "api-backtest");
+});
+
+test("makeSandboxNamePrompt: aborting (Esc) keeps the default unchanged", async () => {
+  prompts.inject([undefined]);
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => true });
+  assert.equal(await namePrompt("api-backtest"), "api-backtest");
+});
+
+test("makeSandboxNamePrompt: off-TTY returns the default without prompting", async () => {
+  const namePrompt = makeSandboxNamePrompt({ isTTY: () => false });
+  assert.equal(await namePrompt("api-backtest"), "api-backtest");
 });

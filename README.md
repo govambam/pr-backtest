@@ -20,9 +20,25 @@ npx pr-backtest <pr-url>
 
 ## Setup
 
-There is no separate setup step. **The tool asks where the backtest PR goes before it asks for any token** — Primary (the PR's own repo) or Sandbox (a separate repo you control). Only then does it resolve the exact token(s) the chosen destination needs. The source is only ever *read* for a Sandbox; see [Destination](#destination).
+There is no separate setup step. **In a terminal the tool asks about your GitHub login first**, then asks where the backtest PR lands — see [Guided setup](#guided-setup-auth-first) below. Only then does it resolve the exact token(s) the chosen destination needs. The source is only ever *read* for a Sandbox; see [Destination](#destination).
 
 A backtest needs exactly two capabilities: **read** the source and **write** the destination. One token may provide both, or you may split them across two; the tool detects which you gave rather than predicting it.
+
+### Guided setup (auth-first)
+
+In an interactive terminal pr-backtest walks an **auth-first** flow before any plan:
+
+1. **Inherited login offer.** It looks for a GitHub credential the terminal already has (via `git credential` and the `gh` CLI). If it finds one, it offers it by name — *"Use your existing GitHub login? [Y/n]"* (defaults to yes). No token is ever printed; only the `@login` is named.
+
+2. **If you accept the login (YES):** it asks *"Where should the backtest PR land?"* with two options:
+   - **Original repo** — write the backtest branches and PR straight into the PR's own repo.
+   - **A new sandbox repo** — the tool **auto-creates** a private repo `<owner>/<repo>-backtest` (you can edit the name) to hold the backtests, reading the source read-only. If your login can't create repos in that owner, it offers to land in the original repo instead.
+
+3. **If you decline, or no login is detected (NO / scoped):** it asks *"Land the backtest PR in the original source repo? [Y/n]"*:
+   - **Yes** → Primary: branches and PR go in the source repo using one read + write token.
+   - **No** → you **pre-create** a private sandbox repo yourself, enter it when prompted, then paste two tokens: a read-only **source** token first, then a read + write **destination** token. The source is only ever read.
+
+Non-interactive runs and runs with a destination flag skip the prompts entirely and resolve from env vars / saved config / flags (see below).
 
 **Two environment variables (owner-agnostic):**
 
@@ -69,7 +85,7 @@ pr-backtest logout
 | `pr-backtest status` | Print the saved source/destination token logins + types and the default destination. Never prints a token value; makes no network call. |
 | `pr-backtest logout` | Delete the saved config (both token slots and any saved default destination). |
 
-On first run it asks where the backtest PR goes, then prompts for the token(s) that destination needs. The new PR's URL is printed to stdout. `pr-backtest status` shows what is saved:
+On first run in a terminal it offers your existing GitHub login, then asks where the backtest PR lands (see [Guided setup](#guided-setup-auth-first)) and resolves the token(s) that destination needs. The new PR's URL is printed to stdout. `pr-backtest status` shows what is saved:
 
 ```
 $ pr-backtest status
@@ -132,7 +148,7 @@ pr-backtest always **reads** the PR from its own repo (the source). The branches
 
 **Read-only guarantee:** the repository a PR is read from is **never written to** unless you explicitly choose it as the destination (Primary). A sandbox destination only ever reads the source.
 
-When you run without a destination flag in a terminal, pr-backtest asks once where the simulated PR should go — **Primary** or **Sandbox**. With no saved default the Sandbox row reads "a separate repo you control" and prompts for the `owner/repo` (or a GitHub URL); with a saved default it offers that saved Sandbox plus "a different repo". A non-default Sandbox choice offers to remember it as your default. Non-interactively (or with a flag) it resolves without prompting. The tool never classifies the destination owner (no org-vs-personal branching).
+When you run without a destination flag in a terminal, pr-backtest first offers your existing GitHub login and then asks where the simulated PR should go — see [Guided setup](#guided-setup-auth-first) for the full auth-first flow. A non-default Sandbox choice offers to remember it as your default. Non-interactively (or with a flag) it resolves without prompting. The tool never classifies the destination owner (no org-vs-personal branching).
 
 ### Flags
 

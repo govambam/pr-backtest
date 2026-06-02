@@ -434,7 +434,7 @@ export function makeSlugPrompt(): SlugPrompt {
       const { slug } = await prompts({
         type: "text",
         name: "slug",
-        message: "Destination repo (owner/repo or a GitHub URL):",
+        message: "Destination repo to hold the backtests (owner/repo or URL):",
       });
       if (typeof slug !== "string") {
         throw new DestinationArgsError("No repository entered.");
@@ -769,7 +769,8 @@ export async function verifyOrCreateDestination(
       // NEVER invoked (VAL-CREATE-001).
       throw new DestinationApiError(
         `Sandbox ${dest.owner}/${dest.repo} was not found. ` +
-          "Create it yourself and re-run, or choose an existing repo you can write to.",
+          "Create it yourself at https://github.com/new and re-run, or choose an " +
+          "existing repo you can write to.",
       );
     }
     return createSandboxInteractive(dest, opts);
@@ -834,7 +835,8 @@ async function createSandboxInteractive(
   if (!confirm) {
     throw new DestinationApiError(
       `Sandbox ${dest.owner}/${dest.repo} was not found and was not created. ` +
-        "Create it yourself and re-run, or choose an existing repo you can write to.",
+        "Create it yourself at https://github.com/new and re-run, or choose an " +
+        "existing repo you can write to.",
     );
   }
   try {
