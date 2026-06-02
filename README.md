@@ -193,6 +193,8 @@ A token like this can't reach your other repos or touch org settings. For `--cre
 
 A token scoped to only the sandbox can't read a private source PR; a token scoped to only the source can't write the sandbox. If the source repo is **public**, read access is implicit and a token with write on the sandbox is enough. For a **Primary** destination, one repo's worth of access (read + write on the source) is all you need.
 
+When one token can't cover both repos, set `GITHUB_SOURCE_TOKEN` to a read-only token for the source: `GITHUB_TOKEN` is then used for the write/destination and `GITHUB_SOURCE_TOKEN` for reading the source. This lets a cross-owner `--sandbox <owner/repo>` run non-interactively with two narrowly scoped tokens.
+
 ## Exit codes
 
 The tool exits with a stable code so it can be wired into CI:

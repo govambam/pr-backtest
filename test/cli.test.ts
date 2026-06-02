@@ -69,6 +69,36 @@ test("--help no longer mentions the removed --fork flag", () => {
   assert.doesNotMatch(stdout, /--fork/);
 });
 
+// --- environment variable documentation (VAL-CLI-001) ---
+
+test("--help documents GITHUB_TOKEN and GITHUB_SOURCE_TOKEN env vars", () => {
+  const { status, stdout } = runCli(["--help"]);
+  assert.equal(status, 0, "--help exits 0");
+  assert.match(stdout, /GITHUB_TOKEN/, "GITHUB_TOKEN is documented");
+  assert.match(
+    stdout,
+    /GITHUB_SOURCE_TOKEN/,
+    "GITHUB_SOURCE_TOKEN (read-only source token) is documented",
+  );
+});
+
+test("--help adds NO new destination flag — the set is exactly --primary, --sandbox, --create-sandbox", () => {
+  const { status, stdout } = runCli(["--help"]);
+  assert.equal(status, 0, "--help exits 0");
+  // The owner in --sandbox <owner/repo> expresses org-vs-personal-vs-different;
+  // there must be no separate destination flag (e.g. --org, --personal, --dest).
+  const destinationFlags = (stdout.match(/--[a-z][a-z-]*/g) ?? []).filter((f) =>
+    /^--(primary|sandbox|create-sandbox|org|organization|personal|dest|destination|target|owner|fork)$/.test(
+      f,
+    ),
+  );
+  assert.deepEqual(
+    [...new Set(destinationFlags)].sort(),
+    ["--create-sandbox", "--primary", "--sandbox"],
+    "exactly the three documented destination flags, no new one",
+  );
+});
+
 // --- --verbose flag surface ---
 
 test("--help lists --verbose and does not reassign -v", () => {
