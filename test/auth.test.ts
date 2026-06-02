@@ -689,6 +689,121 @@ test("resolveReadToken: each candidate is scrubbed before its first request", as
   assert.equal(redactedAtRequest, "auth=***");
 });
 
+// ===========================================================================
+// VAL-AUTH-006 — inherited slots into precedence: AFTER env + saved slot, BEFORE
+// the interactive paste, for BOTH the write and read resolvers. Ordering is
+// proven by seam call-order/counts, not just outcome.
+// ===========================================================================
+
+test("VAL-AUTH-006 (write): a valid saved destinationToken wins WITHOUT detecting the inherited credential", async () => {
+  let detectorCalls = 0;
+  const result = await resolveWriteToken(
+    writeOptions({
+      getConfig: () => ({
+        destinationToken: { token: "saved-dest", username: "u", source: "fine-grained" },
+      }),
+      accept: async (_o, token) => token === "saved-dest",
+      getInheritedCredential: async () => {
+        detectorCalls += 1;
+        return { token: "inherited", login: "octo", source: "classic" };
+      },
+      getPaste: async () => { throw new Error("paste must NOT fire"); },
+    }),
+  );
+  assert.equal(result.token, "saved-dest");
+  assert.equal(detectorCalls, 0, "saved slot wins -> inherited detector never runs");
+});
+
+test("VAL-AUTH-006 (write): inherited is offered AFTER env/saved are rejected and BEFORE the paste; never persisted", async () => {
+  let detectorCalls = 0;
+  let pasteCalls = 0;
+  let saveCalls = 0;
+  const result = await resolveWriteToken(
+    writeOptions({
+      // env present but rejected; no saved slot.
+      getEnvToken: () => "env-bad",
+      getConfig: () => null,
+      // Only the inherited token writes the destination.
+      accept: async (_o, token) => token === "inherited-good",
+      getInheritedCredential: async () => {
+        detectorCalls += 1;
+        return { token: "inherited-good", login: "octo", source: "classic" };
+      },
+      getPaste: async () => { pasteCalls += 1; return "would-paste"; },
+      saveConfig: () => { saveCalls += 1; },
+    }),
+  );
+  assert.equal(result.token, "inherited-good");
+  assert.equal(result.fromPaste, false, "inherited is not a fresh paste");
+  assert.equal(result.login, "", "inherited (non-paste) makes no extra getAuthenticated");
+  assert.equal(detectorCalls, 1, "inherited detector consulted after env/saved");
+  assert.equal(pasteCalls, 0, "inherited wins -> paste getter never runs");
+  assert.equal(saveCalls, 0, "inherited token is NOT persisted to config");
+});
+
+test("VAL-AUTH-006 (write): a rejected inherited credential still falls through to the paste", async () => {
+  let pasteCalls = 0;
+  const result = await quiet(() =>
+    resolveWriteToken(
+      writeOptions({
+        isPrimary: true,
+        destination: SOURCE,
+        makeOctokit: loginFactory(() => "writer"),
+        accept: async (_o, token) => token === "pasted-write",
+        getInheritedCredential: async () => ({
+          token: "inherited-cant-write",
+          login: "octo",
+          source: "classic",
+        }),
+        getPaste: async () => { pasteCalls += 1; return "pasted-write"; },
+        saveConfig: () => {},
+      }),
+    ),
+  );
+  assert.equal(result.token, "pasted-write");
+  assert.equal(pasteCalls, 1, "a rejected inherited credential drops to the paste");
+});
+
+test("VAL-AUTH-006 (read): a valid saved sourceToken wins WITHOUT detecting the inherited credential", async () => {
+  let detectorCalls = 0;
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only", // does not read source
+      makeOctokit: readFactory(new Set(["saved-src"])),
+      getConfig: () => ({
+        sourceToken: { token: "saved-src", username: "u", source: "fine-grained" },
+      }),
+      getInheritedCredential: async () => {
+        detectorCalls += 1;
+        return { token: "inherited", login: "octo", source: "classic" };
+      },
+      getPaste: async () => { throw new Error("paste must NOT fire"); },
+    }),
+  );
+  assert.equal(result.token, "saved-src");
+  assert.equal(detectorCalls, 0, "saved slot wins -> inherited detector never runs");
+});
+
+test("VAL-AUTH-006 (read): inherited offered after env/saved/write-reuse, before the paste", async () => {
+  let pasteCalls = 0;
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only", // cannot read source -> not single-PAT
+      // Only the inherited token reads the source.
+      makeOctokit: readFactory(new Set(["inherited-reads"])),
+      getInheritedCredential: async () => ({
+        token: "inherited-reads",
+        login: "octo",
+        source: "classic",
+      }),
+      getPaste: async () => { pasteCalls += 1; return "would-paste"; },
+    }),
+  );
+  assert.equal(result.token, "inherited-reads");
+  assert.equal(result.fromPaste, false);
+  assert.equal(pasteCalls, 0, "inherited wins -> paste getter never runs");
+});
+
 // Type-only: confirm AcceptToken is exported and shaped as documented.
 const _acceptTypeCheck: AcceptToken = async (_octokit, _token) => true;
 void _acceptTypeCheck;
