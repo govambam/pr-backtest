@@ -172,10 +172,10 @@ Non-interactive runs and runs with a destination flag skip the prompts entirely 
 
 Per-capability resolution order (first match that validates wins; no owner logic, no source-visibility probe):
 
-- **Write/destination token:** `GITHUB_TOKEN` env → saved `destinationToken` → interactive paste.
-- **Read/source token:** `GITHUB_SOURCE_TOKEN` env → saved `sourceToken` → the resolved write token *iff* it can read the source → interactive paste.
+- **Write/destination token:** `GITHUB_TOKEN` env → saved `destinationTokens[<dest-owner>/<dest-repo>]` → interactive paste.
+- **Read/source token:** `GITHUB_SOURCE_TOKEN` env → saved `sourceTokens[<src-owner>]` → the resolved write token *iff* it can read the source → interactive paste.
 
-A pasted token is saved automatically to `~/.config/pr-backtest/config.json` (mode `0600`) so a later run resolves it without prompting. In a terminal, a missing token is prompted for in-flow with the exact scope it needs; non-interactively, a missing token exits `1` naming the relevant env var. Otherwise, create a fine-grained token with the permissions in [Recommendations](#recommendations). Run `pr-backtest status` to see what is saved, and `pr-backtest logout` to clear it (tokens and any saved default destination).
+A pasted token is saved automatically to `~/.config/pr-backtest/config.json` (mode `0600`), keyed per destination repo / source owner, so a later run resolves it without prompting. In a terminal, a missing token is prompted for in-flow with the exact scope it needs; non-interactively, a missing token exits `1` naming the relevant env var. Otherwise, create a fine-grained token with the permissions in [Recommendations](#recommendations). Run `pr-backtest status` to see what is saved, and `pr-backtest logout` to clear it (tokens and any saved per-repo sandboxes).
 
 ## Usage
 
@@ -205,7 +205,7 @@ pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sa
 # Create that sandbox first if it doesn't exist yet (private)
 pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox --create-sandbox
 
-# Remove the saved token and default destination
+# Remove the saved tokens and per-repo sandboxes
 pr-backtest logout
 ```
 
@@ -234,19 +234,22 @@ cutoff.
 | Command | Description |
 |---|---|
 | `pr-backtest <pr-url> [options]` | Recreate the PR as it was opened (default; `--full` for every commit) and open a backtest PR. |
-| `pr-backtest status` | Print the saved source/destination token logins + types and the default destination. Never prints a token value; makes no network call. |
-| `pr-backtest logout` | Delete the saved config (both token slots and any saved default destination). |
+| `pr-backtest status` | Print the saved per-repo sandboxes and the source/destination token logins + types. Never prints a token value; makes no network call. |
+| `pr-backtest logout` | Delete the saved config (all token slots and any saved per-repo sandboxes). |
 
 On first run in a terminal it offers your existing GitHub login, then asks where the backtest PR lands (see [Guided setup](#guided-setup-auth-first)) and resolves the token(s) that destination needs. The new PR's URL is printed to stdout. `pr-backtest status` shows what is saved:
 
 ```
 $ pr-backtest status
-Source token:        saved · authenticates as @octocat · fine-grained
-Destination token:   saved · authenticates as @octocat · classic
-Default destination: acme/backtests
+Saved sandboxes:
+  acme/api → octocat/api-backtest
+Source tokens:
+  acme → @octocat · fine-grained
+Destination tokens:
+  octocat/api-backtest → @octocat · classic
 ```
 
-Each line reads `not set` when its slot is empty. Run `pr-backtest logout` to remove the saved tokens (this also deletes the saved default destination — see [Destination](#destination)).
+Each section reads `none saved` when nothing is stored for it. Sandboxes are keyed per source repo, source tokens per source owner, and destination tokens per destination repo. Run `pr-backtest logout` to remove the saved tokens (this also deletes the saved per-repo sandboxes — see [Destination](#destination)).
 
 Running against a **Primary** destination (the PR's own repo) prints a plan like this:
 
@@ -300,7 +303,7 @@ pr-backtest always **reads** the PR from its own repo (the source). The branches
 
 **Read-only guarantee:** the repository a PR is read from is **never written to** unless you explicitly choose it as the destination (Primary). A sandbox destination only ever reads the source.
 
-When you run without a destination flag in a terminal, pr-backtest first offers your existing GitHub login and then asks where the simulated PR should go — see [Guided setup](#guided-setup-auth-first) for the full auth-first flow. A non-default Sandbox choice offers to remember it as your default. Non-interactively (or with a flag) it resolves without prompting. The tool never classifies the destination owner (no org-vs-personal branching).
+When you run without a destination flag in a terminal, pr-backtest first offers your existing GitHub login and then asks where the simulated PR should go — see [Guided setup](#guided-setup-auth-first) for the full auth-first flow. After a successful run, the sandbox you chose is remembered for that source repo and offered (and reused) on the next backtest of the same source. Non-interactively (or with a flag) it resolves without prompting. The tool never classifies the destination owner (no org-vs-personal branching).
 
 ### Flags
 
@@ -312,7 +315,7 @@ When you run without a destination flag in a terminal, pr-backtest first offers 
 
 `--primary` and `--sandbox` are mutually exclusive. `--create-sandbox` on its own is a no-op.
 
-`pr-backtest logout` deletes the whole config file — including any saved default sandbox destination, not just the token.
+`pr-backtest logout` deletes the whole config file — including the per-repo saved sandboxes, not just the tokens.
 
 ## Branch names and re-runs
 

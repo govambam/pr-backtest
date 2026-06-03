@@ -9,6 +9,8 @@ import {
   deleteConfig,
   mergeConfig,
   readConfig,
+  repoKey,
+  sourceKey,
   writeConfig,
   type Config,
   type TokenSlot,
@@ -25,9 +27,9 @@ const DEST_SLOT: TokenSlot = {
   source: "classic",
 };
 const VALID: Config = {
-  sourceToken: SOURCE_SLOT,
-  destinationToken: DEST_SLOT,
-  defaultDestination: { owner: "acme", repo: "backtests" },
+  sandboxes: { "acme/api": { owner: "acme", repo: "backtests" } },
+  destinationTokens: { "acme/backtests": DEST_SLOT },
+  sourceTokens: { acme: SOURCE_SLOT },
 };
 
 /** Point config at a fresh temp dir via XDG_CONFIG_HOME and return it. */
@@ -35,6 +37,13 @@ function useTempConfigHome(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prbt-cfg-"));
   process.env.XDG_CONFIG_HOME = dir;
   return dir;
+}
+
+/** Write a raw JSON object to the config file (for old-shape / malformed fixtures). */
+function writeRaw(value: unknown): void {
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(value), { mode: 0o600 });
 }
 
 /** Capture everything written to stderr while `fn` runs. */
@@ -76,14 +85,37 @@ test("readConfig returns null when the file is absent", () => {
   assert.equal(readConfig(), null);
 });
 
-// VAL-CONFIG-001: both slots round-trip through a 0600 file.
-test("writeConfig round-trips both slots through readConfig", () => {
+// Key helpers (N1): all keys are lowercased.
+test("key helpers lowercase their inputs (N1)", () => {
+  assert.equal(repoKey("Foo", "Bar"), "foo/bar");
+  assert.equal(sourceKey("Foo"), "foo");
+});
+
+// VAL-MEM-CONFIG-001: all three maps round-trip through a 0600 file.
+test("writeConfig round-trips all three maps through readConfig", () => {
   useTempConfigHome();
   writeConfig(VALID);
   assert.deepEqual(readConfig(), VALID);
 });
 
-// VAL-CONFIG-001: the round-tripped file is mode 0600.
+// VAL-MEM-CONFIG-001: each map round-trips independently.
+test("writeConfig round-trips a sandboxes-only file", () => {
+  useTempConfigHome();
+  const cfg: Config = {
+    sandboxes: { "acme/api": { owner: "globex", repo: "sandbox" } },
+  };
+  writeConfig(cfg);
+  assert.deepEqual(readConfig(), cfg);
+});
+
+test("writeConfig round-trips a sourceTokens-only file", () => {
+  useTempConfigHome();
+  const cfg: Config = { sourceTokens: { acme: SOURCE_SLOT } };
+  writeConfig(cfg);
+  assert.deepEqual(readConfig(), cfg);
+});
+
+// VAL-MEM-CONFIG-001: the round-tripped file is mode 0600.
 test("writeConfig writes mode 0600 and tightens an existing loose file", { skip: process.platform === "win32" }, () => {
   useTempConfigHome();
   const p = configPath();
@@ -95,30 +127,52 @@ test("writeConfig writes mode 0600 and tightens an existing loose file", { skip:
   assert.equal(fs.statSync(p).mode & 0o777, 0o600);
 });
 
-// A single-PAT run fills both slots with the same value.
-test("writeConfig round-trips when both slots share a token value", () => {
+// VAL-MEM-CONFIG-001 (N1): write `Foo/Bar`, read `foo/bar` → hit, single entry.
+test("keys normalize to lowercase: write Foo/Bar, read foo/bar hits the same entry", () => {
   useTempConfigHome();
-  const shared: TokenSlot = {
-    token: "sharedtoken",
-    username: "octocat",
-    source: "classic",
-  };
-  const cfg: Config = { sourceToken: shared, destinationToken: shared };
-  writeConfig(cfg);
-  assert.deepEqual(readConfig(), cfg);
+  // Write through the keyed-map API using a mixed-case repo via the key helper.
+  mergeConfig({
+    destinationTokens: { [repoKey("Foo", "Bar")]: DEST_SLOT },
+    sourceTokens: { [sourceKey("Foo")]: SOURCE_SLOT },
+    sandboxes: { [repoKey("Foo", "Bar")]: { owner: "globex", repo: "sb" } },
+  });
+  const cfg = readConfig();
+  // A lookup with a DIFFERENT casing finds the SAME single entry.
+  assert.deepEqual(cfg?.destinationTokens?.[repoKey("foo", "bar")], DEST_SLOT);
+  assert.deepEqual(cfg?.sourceTokens?.[sourceKey("FOO")], SOURCE_SLOT);
+  assert.deepEqual(cfg?.sandboxes?.[repoKey("FOO", "BAR")], {
+    owner: "globex",
+    repo: "sb",
+  });
+  // No duplicate keys: exactly one entry per map.
+  assert.equal(Object.keys(cfg!.destinationTokens!).length, 1);
+  assert.equal(Object.keys(cfg!.sourceTokens!).length, 1);
+  assert.equal(Object.keys(cfg!.sandboxes!).length, 1);
+  assert.deepEqual(Object.keys(cfg!.destinationTokens!), ["foo/bar"]);
 });
 
-// VAL-CONFIG-005: the loosened-permissions warning fires but the file still loads.
-test("readConfig warns (but still reads) when permissions are loosened", { skip: process.platform === "win32" }, () => {
+// readConfig also lowercases keys present on disk in mixed case.
+test("readConfig lowercases mixed-case keys read from disk (N1)", () => {
   useTempConfigHome();
-  writeConfig(VALID);
-  fs.chmodSync(configPath(), 0o644);
-  let result: Config | null = null;
+  writeRaw({ destinationTokens: { "Foo/Bar": DEST_SLOT } });
+  const cfg = readConfig();
+  assert.deepEqual(Object.keys(cfg!.destinationTokens!), ["foo/bar"]);
+  assert.deepEqual(cfg?.destinationTokens?.["foo/bar"], DEST_SLOT);
+});
+
+// TD-05-006: two hand-edited keys that collide after lowercasing are one entry;
+// the later case-variant wins and the override is warned (never dropped silently).
+test("readConfig warns when a post-lowercase key collides (later wins)", () => {
+  useTempConfigHome();
+  const laterSlot: TokenSlot = { token: "later", username: "later", source: "classic" };
+  writeRaw({ destinationTokens: { "Foo/Bar": DEST_SLOT, "foo/bar": laterSlot } });
+  let cfg: Config | null = null;
   const err = captureStderr(() => {
-    result = readConfig();
+    cfg = readConfig();
   });
-  assert.match(err, /group\/other/);
-  assert.deepEqual(result, VALID);
+  assert.match(err, /collides with an earlier case-variant/);
+  assert.deepEqual(Object.keys(cfg!.destinationTokens!), ["foo/bar"]);
+  assert.deepEqual(cfg?.destinationTokens?.["foo/bar"], laterSlot);
 });
 
 test("readConfig ignores malformed JSON (warns, returns null)", () => {
@@ -136,9 +190,7 @@ test("readConfig ignores malformed JSON (warns, returns null)", () => {
 
 test("readConfig ignores a non-object file (warns, returns null)", () => {
   useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify("just a string"), { mode: 0o600 });
+  writeRaw("just a string");
   let result: Config | null = VALID;
   const err = captureStderr(() => {
     result = readConfig();
@@ -150,110 +202,74 @@ test("readConfig ignores a non-object file (warns, returns null)", () => {
 // A file with zero recognized fields reads back as null (no config).
 test("readConfig returns null for a file with no recognized fields", () => {
   useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify({ unrelated: "value" }), { mode: 0o600 });
+  writeRaw({ unrelated: "value" });
   assert.equal(readConfig(), null);
 });
 
-// VAL-CONFIG-004: a malformed slot is warned + dropped while a valid sibling
-// slot in the same file is still used.
-test("readConfig drops a malformed slot but keeps a valid sibling slot", () => {
+// VAL-MEM-CONFIG-001: a malformed ENTRY in one map is dropped + warned, while
+// valid siblings in the same map AND the other maps survive.
+test("readConfig drops a malformed map entry but keeps valid siblings + other maps", () => {
   useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(
-    p,
-    JSON.stringify({
-      // sourceToken missing `source` → malformed
-      sourceToken: { token: "s", username: "u" },
-      destinationToken: DEST_SLOT,
-    }),
-    { mode: 0o600 },
-  );
+  writeRaw({
+    destinationTokens: {
+      "acme/good": DEST_SLOT,
+      "acme/bad": { token: "t", username: "u" }, // missing source → malformed
+    },
+    sourceTokens: { acme: SOURCE_SLOT },
+  });
   let result: Config | null = null;
   const err = captureStderr(() => {
     result = readConfig();
   });
-  assert.match(err, /sourceToken is malformed/);
-  assert.equal(result?.sourceToken, undefined);
-  assert.deepEqual(result?.destinationToken, DEST_SLOT);
+  assert.match(err, /destinationTokens\["acme\/bad"\] is malformed/);
+  assert.deepEqual(result?.destinationTokens, { "acme/good": DEST_SLOT });
+  assert.equal(result?.destinationTokens?.["acme/bad"], undefined);
+  // Sibling map untouched.
+  assert.deepEqual(result?.sourceTokens, { acme: SOURCE_SLOT });
 });
 
-// VAL-CONFIG-004: a slot with a bogus source value is malformed.
-test("readConfig drops a slot with a bogus source value", () => {
+// A map entry with a bogus source value is malformed and dropped.
+test("readConfig drops a token entry with a bogus source value", () => {
   useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(
-    p,
-    JSON.stringify({
-      destinationToken: { token: "t", username: "u", source: "nope" },
-      defaultDestination: { owner: "acme", repo: "backtests" },
-    }),
-    { mode: 0o600 },
-  );
+  writeRaw({
+    destinationTokens: {
+      "acme/bad": { token: "t", username: "u", source: "nope" },
+      "acme/good": DEST_SLOT,
+    },
+  });
   let result: Config | null = null;
   const err = captureStderr(() => {
     result = readConfig();
   });
-  assert.match(err, /destinationToken is malformed/);
-  assert.equal(result?.destinationToken, undefined);
-  assert.deepEqual(result?.defaultDestination, { owner: "acme", repo: "backtests" });
+  assert.match(err, /destinationTokens\["acme\/good"\]|destinationTokens\["acme\/bad"\]/);
+  assert.equal(result?.destinationTokens?.["acme/bad"], undefined);
+  assert.deepEqual(result?.destinationTokens?.["acme/good"], DEST_SLOT);
 });
 
-// A malformed defaultDestination is warned + dropped, valid slots survive.
-test("readConfig drops a malformed defaultDestination but keeps a valid slot", () => {
+// A map that is present but not an object is dropped with a warning; other maps survive.
+test("readConfig drops a non-object map field but keeps the others", () => {
   useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(
-    p,
-    JSON.stringify({
-      sourceToken: SOURCE_SLOT,
-      defaultDestination: { owner: "acme" }, // missing repo → malformed
-    }),
-    { mode: 0o600 },
-  );
+  writeRaw({ sandboxes: "not an object", sourceTokens: { acme: SOURCE_SLOT } });
   let result: Config | null = null;
   const err = captureStderr(() => {
     result = readConfig();
   });
-  assert.match(err, /defaultDestination is malformed/);
-  assert.equal(result?.defaultDestination, undefined);
-  assert.deepEqual(result?.sourceToken, SOURCE_SLOT);
+  assert.match(err, /sandboxes is malformed/);
+  assert.equal(result?.sandboxes, undefined);
+  assert.deepEqual(result?.sourceTokens, { acme: SOURCE_SLOT });
 });
 
-// A slot-only file (no destination) reads back exposing just that slot.
-test("readConfig tolerates a source-token-only file", () => {
+// VAL-CONFIG-005: the loosened-permissions warning fires but the file still loads.
+test("readConfig warns (but still reads) when permissions are loosened", { skip: process.platform === "win32" }, () => {
   useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify({ sourceToken: SOURCE_SLOT }), {
-    mode: 0o600,
+  writeConfig(VALID);
+  fs.chmodSync(configPath(), 0o644);
+  let result: Config | null = null;
+  const err = captureStderr(() => {
+    result = readConfig();
   });
-  const result = readConfig();
-  assert.notEqual(result, null);
-  assert.deepEqual(result?.sourceToken, SOURCE_SLOT);
-  assert.equal(result?.destinationToken, undefined);
-  assert.equal(result?.defaultDestination, undefined);
-});
-
-// A destination-only file (no token slots) reads back exposing the destination.
-test("readConfig tolerates a destination-only file (no token slots)", () => {
-  useTempConfigHome();
-  const p = configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(
-    p,
-    JSON.stringify({ defaultDestination: { owner: "acme", repo: "backtests" } }),
-    { mode: 0o600 },
-  );
-  const result = readConfig();
-  assert.notEqual(result, null);
-  assert.equal(result?.sourceToken, undefined);
-  assert.equal(result?.destinationToken, undefined);
-  assert.deepEqual(result?.defaultDestination, { owner: "acme", repo: "backtests" });
+  assert.match(err, /group\/other/);
+  assert.deepEqual(result, VALID);
 });
 
 // VAL-CONFIG-003: logout (deleteConfig) removes the whole file and tolerates
@@ -268,39 +284,173 @@ test("deleteConfig removes the whole file and tolerates a second call (ENOENT)",
   assert.doesNotThrow(() => deleteConfig());
 });
 
-// mergeConfig: saving the destinationToken preserves a saved sourceToken and
-// defaultDestination (merge, not overwrite).
-test("mergeConfig saving destinationToken preserves sourceToken and defaultDestination", () => {
+// ===========================================================================
+// N5 — merge, never replace.
+// ===========================================================================
+
+// Saving destinationTokens[B] leaves destinationTokens[A] byte-identical.
+test("mergeConfig adds a destination token key without clobbering a sibling key", () => {
   useTempConfigHome();
-  writeConfig({
-    sourceToken: SOURCE_SLOT,
-    defaultDestination: { owner: "acme", repo: "backtests" },
-  });
-  mergeConfig({ destinationToken: DEST_SLOT });
+  writeConfig({ destinationTokens: { "acme/a": DEST_SLOT } });
+  const newSlot: TokenSlot = { token: "b-tok", username: "bee", source: "classic" };
+  mergeConfig({ destinationTokens: { "acme/b": newSlot } });
   const result = readConfig();
-  assert.deepEqual(result, {
-    sourceToken: SOURCE_SLOT,
-    destinationToken: DEST_SLOT,
-    defaultDestination: { owner: "acme", repo: "backtests" },
+  assert.deepEqual(result?.destinationTokens, {
+    "acme/a": DEST_SLOT,
+    "acme/b": newSlot,
   });
 });
 
-// mergeConfig: saving a defaultDestination preserves saved token slots.
-test("mergeConfig saving a destination preserves saved token slots", () => {
+// Saving a sourceTokens key leaves another sourceTokens key unchanged.
+test("mergeConfig adds a source token key without clobbering a sibling key", () => {
   useTempConfigHome();
-  writeConfig({ sourceToken: SOURCE_SLOT, destinationToken: DEST_SLOT });
-  mergeConfig({ defaultDestination: { owner: "globex", repo: "sandbox" } });
+  writeConfig({ sourceTokens: { owner1: SOURCE_SLOT } });
+  const newSlot: TokenSlot = { token: "o2", username: "two", source: "classic" };
+  mergeConfig({ sourceTokens: { owner2: newSlot } });
+  const result = readConfig();
+  assert.deepEqual(result?.sourceTokens, {
+    owner1: SOURCE_SLOT,
+    owner2: newSlot,
+  });
+});
+
+// A write to one map preserves the OTHER maps and their values.
+test("mergeConfig writing one map preserves the other maps (N5)", () => {
+  useTempConfigHome();
+  writeConfig({
+    sourceTokens: { acme: SOURCE_SLOT },
+    sandboxes: { "acme/api": { owner: "g", repo: "sb" } },
+  });
+  mergeConfig({ destinationTokens: { "acme/backtests": DEST_SLOT } });
   const result = readConfig();
   assert.deepEqual(result, {
-    sourceToken: SOURCE_SLOT,
+    sourceTokens: { acme: SOURCE_SLOT },
+    sandboxes: { "acme/api": { owner: "g", repo: "sb" } },
+    destinationTokens: { "acme/backtests": DEST_SLOT },
+  });
+});
+
+// mergeConfig re-asserts mode 0600.
+test("mergeConfig keeps mode 0600 after a key save", { skip: process.platform === "win32" }, () => {
+  useTempConfigHome();
+  mergeConfig({ sourceTokens: { acme: SOURCE_SLOT } });
+  assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
+});
+
+// ===========================================================================
+// VAL-MEM-CONFIG-002 — old/partial-shape config loads without error (N6).
+// ===========================================================================
+
+// (a) salvage: destinationToken + defaultDestination → destinationTokens[defaultDestination].
+test("N6 (a): old destinationToken + defaultDestination salvages into destinationTokens[key]", () => {
+  useTempConfigHome();
+  writeRaw({
+    destinationToken: DEST_SLOT,
+    defaultDestination: { owner: "Acme", repo: "Backtests" },
+  });
+  let result: Config | null = null;
+  assert.doesNotThrow(() => {
+    result = readConfig();
+  });
+  // Salvaged under the LOWERCASED defaultDestination key (N1).
+  assert.deepEqual(result?.destinationTokens, { "acme/backtests": DEST_SLOT });
+});
+
+// (b) drop: destinationToken with NO defaultDestination → token absent (not mis-keyed).
+// TD-05-004: a well-formed-but-undroppable old token surfaces the one-time
+// re-paste note (and names no token value). This is the FIRST drop in this file,
+// so the once-per-process guard has not yet fired.
+test("N6 (b): old destinationToken with no defaultDestination is dropped (not mis-keyed)", () => {
+  useTempConfigHome();
+  writeRaw({ destinationToken: DEST_SLOT });
+  let result: Config | null = "x" as unknown as Config;
+  let err = "";
+  assert.doesNotThrow(() => {
+    err = captureStderr(() => {
+      result = readConfig();
+    });
+  });
+  // No defaultDestination → no salvage key → nothing recognized → null config.
+  assert.equal(result, null);
+  // The one-time re-paste note fires, and never echoes the token value.
+  assert.match(err, /per-repo memory.*paste it once/);
+  assert.ok(!err.includes(DEST_SLOT.token));
+});
+
+// (c) drop: a bare sourceToken (no recorded owner) → absent.
+test("N6 (c): a bare old sourceToken is dropped (no owner to key it under)", () => {
+  useTempConfigHome();
+  writeRaw({ sourceToken: SOURCE_SLOT });
+  let result: Config | null = "x" as unknown as Config;
+  let err = "";
+  assert.doesNotThrow(() => {
+    err = captureStderr(() => {
+      result = readConfig();
+    });
+  });
+  assert.equal(result, null);
+  // TD-05-004: the note is once-per-process — N6 (b) already consumed it, so this
+  // second drop does NOT re-warn.
+  assert.ok(!/per-repo memory/.test(err));
+});
+
+// (d) drop: a bare defaultDestination → no phantom token, no config at all.
+test("N6 (d): a bare defaultDestination yields no phantom token", () => {
+  useTempConfigHome();
+  writeRaw({ defaultDestination: { owner: "acme", repo: "backtests" } });
+  let result: Config | null = "x" as unknown as Config;
+  assert.doesNotThrow(() => {
+    result = readConfig();
+  });
+  // The deprecated single-slot default is NOT part of the new schema and salvages
+  // nothing on its own — a file holding only it has zero recognized fields, so it
+  // reads as no config at all (null). It produces no token map entry.
+  assert.equal(result, null);
+});
+
+// (e) partial: new destinationTokens[A] + old destinationToken + defaultDestination=A
+//     → the existing NEW entry is NOT overwritten.
+test("N6 (e): an existing new destinationTokens[A] is not overwritten by old salvage", () => {
+  useTempConfigHome();
+  const newSlot: TokenSlot = { token: "new-tok", username: "new", source: "fine-grained" };
+  writeRaw({
+    destinationTokens: { "acme/backtests": newSlot },
+    destinationToken: DEST_SLOT, // old slot would salvage to acme/backtests
+    defaultDestination: { owner: "acme", repo: "backtests" },
+  });
+  let result: Config | null = null;
+  assert.doesNotThrow(() => {
+    result = readConfig();
+  });
+  // New wins; old never overwrites.
+  assert.deepEqual(result?.destinationTokens, { "acme/backtests": newSlot });
+});
+
+// (f) reading performs NO disk write (the file is byte-identical after a read).
+test("N6 (f): reading an old-shape config performs no disk write", () => {
+  useTempConfigHome();
+  const raw = JSON.stringify({
+    destinationToken: DEST_SLOT,
+    defaultDestination: { owner: "acme", repo: "backtests" },
+  });
+  const p = configPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, raw, { mode: 0o600 });
+  const before = fs.readFileSync(p, "utf8");
+  readConfig();
+  const after = fs.readFileSync(p, "utf8");
+  assert.equal(after, before, "readConfig must not rewrite the file");
+});
+
+// Migration is additive: a file with BOTH new maps and old fields loads, new maps intact.
+test("N6: a partial mix keeps new maps and salvages a free old key", () => {
+  useTempConfigHome();
+  writeRaw({
+    sourceTokens: { acme: SOURCE_SLOT },
     destinationToken: DEST_SLOT,
     defaultDestination: { owner: "globex", repo: "sandbox" },
   });
-});
-
-// VAL-CONFIG-004 / mergeConfig re-asserts mode 0600.
-test("mergeConfig keeps mode 0600 after a slot save", { skip: process.platform === "win32" }, () => {
-  useTempConfigHome();
-  mergeConfig({ sourceToken: SOURCE_SLOT });
-  assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
+  const result = readConfig();
+  assert.deepEqual(result?.sourceTokens, { acme: SOURCE_SLOT });
+  assert.deepEqual(result?.destinationTokens, { "globex/sandbox": DEST_SLOT });
 });

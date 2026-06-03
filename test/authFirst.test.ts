@@ -37,14 +37,23 @@ const CRED: InheritedCredential = {
 function makeResolvers(opts: {
   detected?: InheritedCredential | null;
   useInherited?: boolean;
-  landing?: "primary" | "sandbox";
+  landing?: "primary" | "saved" | "sandbox";
   landInSource?: boolean;
+  /** The three-option scoped landing answer (only consulted when a saved sandbox exists). */
+  scopedLanding?: "primary" | "saved" | "sandbox";
   slug?: RepoRef;
-  saved?: { owner: string; repo: string };
+  /** The saved sandbox for this source, if any (N7). */
+  saved?: RepoRef;
   /** When set, the editable-name prompt returns this instead of the default. */
   editName?: string;
-}): { resolvers: AuthFirstResolvers; order: string[] } {
+}): {
+  resolvers: AuthFirstResolvers;
+  order: string[];
+  /** The `saved` argument the inherited landing prompt was handed (null until called). */
+  landingSavedArg: () => RepoRef | undefined | null;
+} {
   const order: string[] = [];
+  let landingSavedArg: RepoRef | undefined | null = null;
   const resolvers: AuthFirstResolvers = {
     detectInherited: async () => {
       order.push("detect");
@@ -54,8 +63,9 @@ function makeResolvers(opts: {
       order.push(`offer:${login}`);
       return opts.useInherited ?? false;
     },
-    promptLanding: async () => {
+    promptLanding: async (saved) => {
       order.push("landing");
+      landingSavedArg = saved;
       return opts.landing ?? "primary";
     },
     promptSandboxName: async (defaultName) => {
@@ -65,6 +75,10 @@ function makeResolvers(opts: {
     promptLandInSource: async () => {
       order.push("land-in-source");
       return opts.landInSource ?? true;
+    },
+    promptScopedLanding: async () => {
+      order.push("scoped-landing");
+      return opts.scopedLanding ?? "primary";
     },
     promptForSlug: async () => {
       order.push("slug");
@@ -79,9 +93,9 @@ function makeResolvers(opts: {
       order.push("paste:write");
       return "ghp_scoped_write_token_value_for_tests_1";
     },
-    getDefaultDestination: () => opts.saved,
+    getSavedSandbox: () => opts.saved,
   };
-  return { resolvers, order };
+  return { resolvers, order, landingSavedArg: () => landingSavedArg };
 }
 
 test.beforeEach(() => {
@@ -147,7 +161,6 @@ test("VAL-FLOW-002: inherited + Original → Primary (isSandbox false, dest === 
   const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
   assert.equal(choice.isSandbox, false);
   assert.deepEqual({ owner: choice.owner, repo: choice.repo }, SOURCE);
-  assert.equal(choice.offerRemember, false);
   assert.equal(choice.inheritedCredential, CRED, "the inherited credential is carried forward");
 });
 
@@ -166,7 +179,6 @@ test("VAL-FLOW-002: inherited + new sandbox → <src-owner>/<src-repo>-backtest,
     "sandbox name is <src-repo>-backtest",
   );
   assert.equal(choice.inheritedCredential, CRED);
-  assert.equal(choice.offerRemember, true, "a fresh non-default sandbox flags remember");
 });
 
 // --- VAL-CREATE-002 / VAL-CREATE-003: warn upfront + editable name -----------
@@ -244,7 +256,6 @@ test("VAL-FLOW-003: scoped + no → guidance, then the slug prompt → Sandbox, 
   assert.equal(choice.isSandbox, true);
   assert.deepEqual({ owner: choice.owner, repo: choice.repo }, { owner: "you", repo: "sandbox" });
   assert.equal(choice.inheritedCredential, null);
-  assert.equal(choice.offerRemember, true);
   // §3b order: land-in-source (no) → slug → READ paste → WRITE paste. The
   // guidance is emitted between land-in-source and slug, on stderr via info.
   assert.deepEqual(order, ["detect", "land-in-source", "slug", "paste:read", "paste:write"]);
@@ -254,16 +265,88 @@ test("VAL-FLOW-003: scoped + no → guidance, then the slug prompt → Sandbox, 
   assert.equal(choice.scopedSandboxPastes!.write, "ghp_scoped_write_token_value_for_tests_1");
 });
 
-test("VAL-FLOW-003: scoped + no with slug equal to the saved default does NOT flag offerRemember", async () => {
+// --- VAL-MEM-INT-001: the saved sandbox surfaces as a landing option ---------
+
+const SAVED_SANDBOX: RepoRef = { owner: "me", repo: "saved-sb" };
+
+test("VAL-MEM-INT-001: inherited fork — saved present, the landing prompt is handed the saved sandbox", async () => {
+  const { resolvers, landingSavedArg } = makeResolvers({
+    detected: CRED,
+    useInherited: true,
+    saved: SAVED_SANDBOX,
+    landing: "primary",
+  });
+  await resolveAuthFirstChoice(SOURCE, resolvers);
+  // The landing prompt received the saved sandbox so it can offer it as a row.
+  assert.deepEqual(landingSavedArg(), SAVED_SANDBOX);
+});
+
+test("VAL-MEM-INT-001: inherited fork — selecting the saved sandbox returns it with isSandbox true", async () => {
   const { resolvers } = makeResolvers({
-    detected: null,
-    landInSource: false,
-    slug: { owner: "Me", repo: "Sandbox" }, // mixed case, equals saved
-    saved: { owner: "me", repo: "sandbox" },
+    detected: CRED,
+    useInherited: true,
+    saved: SAVED_SANDBOX,
+    landing: "saved",
   });
   const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.deepEqual({ owner: choice.owner, repo: choice.repo }, SAVED_SANDBOX);
   assert.equal(choice.isSandbox, true);
-  assert.equal(choice.offerRemember, false, "equal-to-default → no remember offer");
+  assert.equal(choice.inheritedCredential, CRED, "still uses the inherited credential");
+});
+
+test("VAL-MEM-INT-001: inherited fork — saved ABSENT, the landing prompt is handed undefined (byte-identical)", async () => {
+  const { resolvers, landingSavedArg, order } = makeResolvers({
+    detected: CRED,
+    useInherited: true,
+    landing: "primary",
+    // no saved
+  });
+  await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.equal(landingSavedArg(), undefined, "no saved sandbox passed to the prompt");
+  assert.deepEqual(order, ["detect", "offer:octocat", "landing"]);
+});
+
+test("VAL-MEM-INT-001: scoped fork — saved present, the three-option prompt is used; selecting saved returns it", async () => {
+  const { resolvers, order } = makeResolvers({
+    detected: null,
+    saved: SAVED_SANDBOX,
+    scopedLanding: "saved",
+  });
+  const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.deepEqual({ owner: choice.owner, repo: choice.repo }, SAVED_SANDBOX);
+  assert.equal(choice.isSandbox, true);
+  assert.equal(choice.inheritedCredential, null);
+  assert.equal(choice.scopedSandboxPastes, null, "reusing the saved sandbox collects no eager pastes");
+  // The three-option scoped landing prompt is used, NOT the two-option confirm.
+  assert.ok(order.includes("scoped-landing"));
+  assert.ok(!order.includes("land-in-source"));
+});
+
+test("VAL-MEM-INT-001: scoped fork — saved present, choosing 'a different repo' falls through to the guided slug+paste flow", async () => {
+  const { resolvers, order } = makeResolvers({
+    detected: null,
+    saved: SAVED_SANDBOX,
+    scopedLanding: "sandbox",
+    slug: { owner: "you", repo: "other" },
+  });
+  const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.deepEqual({ owner: choice.owner, repo: choice.repo }, { owner: "you", repo: "other" });
+  assert.equal(choice.isSandbox, true);
+  assert.ok(choice.scopedSandboxPastes, "the guided sandbox flow collects pastes");
+  assert.deepEqual(order, ["detect", "scoped-landing", "slug", "paste:read", "paste:write"]);
+});
+
+test("VAL-MEM-INT-001: scoped fork — saved ABSENT, the two-option land-in-source confirm is used (byte-identical)", async () => {
+  const { resolvers, order } = makeResolvers({
+    detected: null,
+    landInSource: true,
+    // no saved
+  });
+  const choice = await resolveAuthFirstChoice(SOURCE, resolvers);
+  assert.equal(choice.isSandbox, false);
+  assert.deepEqual({ owner: choice.owner, repo: choice.repo }, SOURCE);
+  assert.ok(order.includes("land-in-source"));
+  assert.ok(!order.includes("scoped-landing"), "no three-option prompt when nothing is saved");
 });
 
 // --- VAL-CREATE-003: the EDITED new-sandbox name is VALIDATED, re-prompting ---

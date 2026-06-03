@@ -14,12 +14,23 @@ import {
   type AcceptToken,
   type RepoRef,
 } from "../src/auth.js";
-import type { Config } from "../src/config.js";
+import type { Config, TokenSlot } from "../src/config.js";
+import { repoKey, sourceKey } from "../src/config.js";
 import { DestinationApiError } from "../src/destination.js";
 import { setVerbose, setTtyOverride, redact } from "../src/log.js";
 
 const SOURCE: RepoRef = { owner: "acme", repo: "api" };
 const DEST: RepoRef = { owner: "alice", repo: "sandbox" };
+
+/** A Config holding one saved destination token under DEST's key (N1-lowercased). */
+function destCfg(slot: TokenSlot, dest: RepoRef = DEST): Config {
+  return { destinationTokens: { [repoKey(dest.owner, dest.repo)]: slot } };
+}
+
+/** A Config holding one saved source token under SOURCE owner's key (N1-lowercased). */
+function srcCfg(slot: TokenSlot, src: RepoRef = SOURCE): Config {
+  return { sourceTokens: { [sourceKey(src.owner)]: slot } };
+}
 
 // The trace surface in log.ts is a module-level singleton. Reset it around every
 // test so a throw before a test's own `finally` can't leak state into later tests.
@@ -186,9 +197,7 @@ function writeOptions(
 }
 
 test("resolveWriteToken: env GITHUB_TOKEN wins over saved destinationToken when both accepted", async () => {
-  const cfg: Config = {
-    destinationToken: { token: "saved-dest", username: "u", source: "fine-grained" },
-  };
+  const cfg = destCfg({ token: "saved-dest", username: "u", source: "fine-grained" });
   const seen: string[] = [];
   const result = await resolveWriteToken(
     writeOptions({
@@ -206,9 +215,7 @@ test("resolveWriteToken: env GITHUB_TOKEN wins over saved destinationToken when 
 });
 
 test("resolveWriteToken: falls to saved destinationToken when env is not accepted", async () => {
-  const cfg: Config = {
-    destinationToken: { token: "saved-dest", username: "u", source: "classic" },
-  };
+  const cfg = destCfg({ token: "saved-dest", username: "u", source: "classic" });
   const result = await resolveWriteToken(
     writeOptions({
       getEnvToken: () => "write-env",
@@ -265,9 +272,7 @@ test("resolveWriteToken: an env/saved write token makes NO users.getAuthenticate
 
   const savedResult = await resolveWriteToken(
     writeOptions({
-      getConfig: () => ({
-        destinationToken: { token: "saved-write", username: "u", source: "classic" },
-      }),
+      getConfig: () => destCfg({ token: "saved-write", username: "u", source: "classic" }),
       makeOctokit: recording,
       accept: async (_o, token) => token === "saved-write",
     }),
@@ -315,9 +320,7 @@ test("resolveReadToken: an env/saved read token makes NO users.getAuthenticated 
   const savedResult = await resolveReadToken(
     readOptions({
       writeToken: "write-only",
-      getConfig: () => ({
-        sourceToken: { token: "saved-read", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => srcCfg({ token: "saved-read", username: "u", source: "fine-grained" }),
       makeOctokit: recording,
     }),
   );
@@ -334,9 +337,7 @@ test("resolveWriteToken: an accept that returns false on rejection falls through
   const result = await resolveWriteToken(
     writeOptions({
       getEnvToken: () => "bad-token",
-      getConfig: () => ({
-        destinationToken: { token: "good-token", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => destCfg({ token: "good-token", username: "u", source: "fine-grained" }),
       accept: async (_o, token) => token === "good-token",
     }),
   );
@@ -360,10 +361,15 @@ test("resolveWriteToken: a fresh accepted paste persists to destinationToken wit
   assert.equal(result.token, "pasted-write");
   assert.equal(result.fromPaste, true);
   assert.equal(result.login, "writer");
-  const slot = saved.find((s) => s.destinationToken)?.destinationToken;
-  assert.ok(slot, "destinationToken persisted");
+  const key = repoKey(SOURCE.owner, SOURCE.repo);
+  const map = saved.find((s) => s.destinationTokens)?.destinationTokens;
+  assert.ok(map, "destinationTokens persisted");
+  const slot = map![key];
+  assert.ok(slot, "destination token persisted under the dest key");
   assert.equal(slot!.token, "pasted-write");
   assert.equal(slot!.username, "writer");
+  // N3/N1: persisted under exactly the (lowercased) destination key, no other.
+  assert.deepEqual(Object.keys(map!), [key]);
 });
 
 test("resolveWriteToken: bounded 3 paste attempts then throws NoTokenNonInteractiveError naming GITHUB_TOKEN", async () => {
@@ -417,9 +423,7 @@ test("resolveWriteToken: every source rejected by a DestinationApiError surfaces
       resolveWriteToken(
         writeOptions({
           getEnvToken: () => "env-token",
-          getConfig: () => ({
-            destinationToken: { token: "saved", username: "u", source: "classic" },
-          }),
+          getConfig: () => destCfg({ token: "saved", username: "u", source: "classic" }),
           getPaste: async () => null,
           accept: async () => { throw destErr; },
           saveConfig: () => {},
@@ -487,9 +491,7 @@ test("resolveWriteToken: an accepted candidate after a DestinationApiError rejec
   const result = await resolveWriteToken(
     writeOptions({
       getEnvToken: () => "bad-token",
-      getConfig: () => ({
-        destinationToken: { token: "good-token", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => destCfg({ token: "good-token", username: "u", source: "fine-grained" }),
       accept: async (_o, token) => {
         if (token === "good-token") return true;
         throw new DestinationApiError("cannot write with bad-token");
@@ -553,9 +555,7 @@ function readOptions(
 }
 
 test("resolveReadToken: env GITHUB_SOURCE_TOKEN wins over saved sourceToken and write-reuse", async () => {
-  const cfg: Config = {
-    sourceToken: { token: "saved-src", username: "u", source: "fine-grained" },
-  };
+  const cfg = srcCfg({ token: "saved-src", username: "u", source: "fine-grained" });
   const result = await resolveReadToken(
     readOptions({
       writeToken: "write-token",
@@ -569,9 +569,7 @@ test("resolveReadToken: env GITHUB_SOURCE_TOKEN wins over saved sourceToken and 
 });
 
 test("resolveReadToken: saved sourceToken used over write-reuse when env absent", async () => {
-  const cfg: Config = {
-    sourceToken: { token: "saved-src", username: "u", source: "fine-grained" },
-  };
+  const cfg = srcCfg({ token: "saved-src", username: "u", source: "fine-grained" });
   const result = await resolveReadToken(
     readOptions({
       writeToken: "write-token",
@@ -621,9 +619,14 @@ test("resolveReadToken: a fresh accepted paste persists to sourceToken with @log
   assert.equal(result.token, "pasted-read");
   assert.equal(result.fromPaste, true);
   assert.equal(result.login, "reader");
-  const slot = saved.find((s) => s.sourceToken)?.sourceToken;
-  assert.ok(slot, "sourceToken persisted");
+  const key = sourceKey(SOURCE.owner);
+  const map = saved.find((s) => s.sourceTokens)?.sourceTokens;
+  assert.ok(map, "sourceTokens persisted");
+  const slot = map![key];
+  assert.ok(slot, "source token persisted under the owner key");
   assert.equal(slot!.username, "reader");
+  // N3/N1: persisted under exactly the (lowercased) source owner key, no other.
+  assert.deepEqual(Object.keys(map!), [key]);
 });
 
 test("resolveReadToken: bounded 3 paste attempts then throws NoSourceTokenNonInteractiveError naming GITHUB_SOURCE_TOKEN", async () => {
@@ -699,9 +702,7 @@ test("VAL-AUTH-006 (write): a valid saved destinationToken wins WITHOUT detectin
   let detectorCalls = 0;
   const result = await resolveWriteToken(
     writeOptions({
-      getConfig: () => ({
-        destinationToken: { token: "saved-dest", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => destCfg({ token: "saved-dest", username: "u", source: "fine-grained" }),
       accept: async (_o, token) => token === "saved-dest",
       getInheritedCredential: async () => {
         detectorCalls += 1;
@@ -727,9 +728,7 @@ test("VAL-AUTH-006 (write): inherited is offered AFTER env/saved are rejected an
     writeOptions({
       // BOTH env AND a saved slot present — and BOTH rejected by accept.
       getEnvToken: () => "env-bad",
-      getConfig: () => ({
-        destinationToken: { token: "saved-bad", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => destCfg({ token: "saved-bad", username: "u", source: "fine-grained" }),
       // Only the inherited token writes the destination; env + saved are rejected.
       accept: async (_o, token) => {
         acceptOrder.push(token);
@@ -791,9 +790,7 @@ test("VAL-AUTH-006 (read): a valid saved sourceToken wins WITHOUT detecting the 
     readOptions({
       writeToken: "write-only", // does not read source
       makeOctokit: readFactory(new Set(["saved-src"])),
-      getConfig: () => ({
-        sourceToken: { token: "saved-src", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => srcCfg({ token: "saved-src", username: "u", source: "fine-grained" }),
       getInheritedCredential: async () => {
         detectorCalls += 1;
         return { token: "inherited", login: "octo", source: "classic" };
@@ -817,9 +814,7 @@ test("VAL-AUTH-006 (read): inherited offered after env/saved/write-reuse, before
     readOptions({
       writeToken: "write-only", // cannot read source -> not single-PAT
       getEnvToken: () => "env-bad", // present but does NOT read the source
-      getConfig: () => ({
-        sourceToken: { token: "saved-bad", username: "u", source: "fine-grained" },
-      }),
+      getConfig: () => srcCfg({ token: "saved-bad", username: "u", source: "fine-grained" }),
       // Only the inherited token reads the source.
       makeOctokit: readFactory(new Set(["inherited-reads"]), undefined, built),
       getInheritedCredential: async () => {
@@ -843,6 +838,248 @@ test("VAL-AUTH-006 (read): inherited offered after env/saved/write-reuse, before
     "env → saved → write-reuse → inherited precedence; inherited offered last before the paste",
   );
   assert.equal(pasteCalls, 0, "inherited wins -> paste getter never runs");
+});
+
+// ===========================================================================
+// VAL-MEM-002 — keyed write-token resolution (N1, N3, N5)
+// ===========================================================================
+
+const SAVED_DEST_SLOT: TokenSlot = {
+  token: "saved-dest-tok",
+  username: "dest-user",
+  source: "fine-grained",
+};
+
+test("VAL-MEM-002: a saved destinationTokens[dest] is auto-used (paste seam 0 calls)", async () => {
+  let pasteCalls = 0;
+  const result = await resolveWriteToken(
+    writeOptions({
+      // The saved key matches DEST exactly.
+      getConfig: () => destCfg(SAVED_DEST_SLOT),
+      accept: async (_o, token) => token === SAVED_DEST_SLOT.token,
+      getPaste: async () => { pasteCalls += 1; return "x"; },
+    }),
+  );
+  assert.equal(result.token, SAVED_DEST_SLOT.token);
+  assert.equal(result.fromPaste, false);
+  assert.equal(pasteCalls, 0, "saved key hit -> no paste");
+});
+
+test("VAL-MEM-002: a saved token under a DIFFERENT dest key misses (no hit for this dest)", async () => {
+  // Saved under another repo; resolving DEST must NOT see it -> falls to paste.
+  let pasteCalls = 0;
+  const result = await quiet(() =>
+    resolveWriteToken(
+      writeOptions({
+        getConfig: () => destCfg(SAVED_DEST_SLOT, { owner: "other", repo: "repo" }),
+        makeOctokit: loginFactory(() => "pwriter"),
+        accept: async (_o, token) => token === "pasted",
+        getPaste: async () => { pasteCalls += 1; return "pasted"; },
+        saveConfig: () => {},
+      }),
+    ),
+  );
+  assert.equal(result.token, "pasted");
+  assert.equal(pasteCalls, 1, "no key for this dest -> prompts");
+});
+
+test("VAL-MEM-002 (N1): saved under Foo/Bar, resolving foo/bar hits (0 paste calls)", async () => {
+  const mixedDest: RepoRef = { owner: "Foo", repo: "Bar" };
+  const lowerDest: RepoRef = { owner: "foo", repo: "bar" };
+  let pasteCalls = 0;
+  const result = await resolveWriteToken(
+    writeOptions({
+      destination: lowerDest,
+      // Saved under the mixed-case key; the resolver lowercases on lookup.
+      getConfig: () => destCfg(SAVED_DEST_SLOT, mixedDest),
+      accept: async (_o, token) => token === SAVED_DEST_SLOT.token,
+      getPaste: async () => { pasteCalls += 1; return "x"; },
+    }),
+  );
+  assert.equal(result.token, SAVED_DEST_SLOT.token);
+  assert.equal(pasteCalls, 0, "case-insensitive key hit");
+});
+
+test("VAL-MEM-002 (N3): a fresh paste persists ONLY destinationTokens[dest] (no clobber payload)", async () => {
+  // The save seam receives a partial update keyed by THIS dest only; merging is
+  // mergeConfig's job (covered in config.test.ts). Here we prove the resolver
+  // hands mergeConfig exactly one keyed entry under the right key.
+  const saved: Array<Partial<Config>> = [];
+  await quiet(() =>
+    resolveWriteToken(
+      writeOptions({
+        destination: DEST,
+        makeOctokit: loginFactory(() => "writer"),
+        getPaste: async () => "fresh",
+        accept: async (_o, token) => token === "fresh",
+        saveConfig: (u) => saved.push(u),
+      }),
+    ),
+  );
+  const map = saved.find((s) => s.destinationTokens)?.destinationTokens;
+  assert.ok(map, "destinationTokens written");
+  assert.deepEqual(Object.keys(map!), [repoKey(DEST.owner, DEST.repo)]);
+  assert.equal(map![repoKey(DEST.owner, DEST.repo)]!.token, "fresh");
+});
+
+test("VAL-MEM-002 (N3): a saved-key HIT never writes (save seam not called)", async () => {
+  // writeOptions' default saveConfig throws if called -> a hit must not save.
+  const result = await resolveWriteToken(
+    writeOptions({
+      getConfig: () => destCfg(SAVED_DEST_SLOT),
+      accept: async (_o, token) => token === SAVED_DEST_SLOT.token,
+    }),
+  );
+  assert.equal(result.token, SAVED_DEST_SLOT.token);
+});
+
+test("VAL-MEM-002 (N3): an env write token never writes (save seam not called)", async () => {
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "env-write",
+      accept: async (_o, token) => token === "env-write",
+    }),
+  );
+  assert.equal(result.token, "env-write");
+});
+
+test("VAL-MEM-002 (N3): an inherited write token never writes (save seam not called)", async () => {
+  const result = await resolveWriteToken(
+    writeOptions({
+      accept: async (_o, token) => token === "inherited-good",
+      getInheritedCredential: async () => ({ token: "inherited-good", source: "classic" }),
+    }),
+  );
+  assert.equal(result.token, "inherited-good");
+});
+
+test("VAL-MEM-002 (N2): env GITHUB_TOKEN still wins over a saved destinationTokens key", async () => {
+  const result = await resolveWriteToken(
+    writeOptions({
+      getEnvToken: () => "env-write",
+      getConfig: () => destCfg(SAVED_DEST_SLOT),
+      accept: async () => true, // both would pass; env must be offered first
+    }),
+  );
+  assert.equal(result.token, "env-write");
+});
+
+// ===========================================================================
+// VAL-MEM-SRC-001 — keyed read-token resolution (N1, N3)
+// ===========================================================================
+
+const SAVED_SRC_SLOT: TokenSlot = {
+  token: "saved-src-tok",
+  username: "src-user",
+  source: "fine-grained",
+};
+
+test("VAL-MEM-SRC-001: a saved sourceTokens[owner] reads the source (paste 0 calls)", async () => {
+  let pasteCalls = 0;
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only", // does not read source
+      getConfig: () => srcCfg(SAVED_SRC_SLOT),
+      makeOctokit: readFactory(new Set([SAVED_SRC_SLOT.token])),
+      getPaste: async () => { pasteCalls += 1; return "x"; },
+    }),
+  );
+  assert.equal(result.token, SAVED_SRC_SLOT.token);
+  assert.equal(result.fromPaste, false);
+  assert.equal(pasteCalls, 0, "saved owner key hit -> no paste");
+});
+
+test("VAL-MEM-SRC-001: a token saved under a DIFFERENT owner misses -> prompts and saves under owner2", async () => {
+  // saved under owner "other"; resolving SOURCE (acme) must not see it.
+  const saved: Array<Partial<Config>> = [];
+  let pasteCalls = 0;
+  const result = await quiet(() =>
+    resolveReadToken(
+      readOptions({
+        writeToken: "write-only",
+        getConfig: () => srcCfg(SAVED_SRC_SLOT, { owner: "other", repo: "x" }),
+        makeOctokit: readFactory(new Set(["pasted-read"]), (t) =>
+          t === "pasted-read" ? "reader" : "w",
+        ),
+        getPaste: async () => { pasteCalls += 1; return "pasted-read"; },
+        saveConfig: (u) => saved.push(u),
+      }),
+    ),
+  );
+  assert.equal(result.token, "pasted-read");
+  assert.equal(pasteCalls, 1);
+  const map = saved.find((s) => s.sourceTokens)?.sourceTokens;
+  assert.ok(map, "sourceTokens written");
+  // Persisted under SOURCE's owner key only.
+  assert.deepEqual(Object.keys(map!), [sourceKey(SOURCE.owner)]);
+});
+
+test("VAL-MEM-SRC-001 (N1): saved under Foo, resolving foo hits (0 paste calls)", async () => {
+  const mixedSrc: RepoRef = { owner: "Foo", repo: "api" };
+  const lowerSrc: RepoRef = { owner: "foo", repo: "api" };
+  let pasteCalls = 0;
+  // readFactory keys readability on SOURCE; build a source-specific factory.
+  const factory = (token: string): ResolverOctokit =>
+    ({
+      repos: {
+        get: async (args: { owner: string; repo: string }) => {
+          const isSource =
+            args.owner === lowerSrc.owner && args.repo === lowerSrc.repo;
+          if (isSource && token === SAVED_SRC_SLOT.token) {
+            return { data: { permissions: { push: false } } };
+          }
+          throw httpError(404);
+        },
+      },
+      users: { getAuthenticated: async () => ({ data: { login: "u" } }) },
+    }) as unknown as ResolverOctokit;
+  const result = await resolveReadToken(
+    readOptions({
+      source: lowerSrc,
+      writeToken: "",
+      getConfig: () => srcCfg(SAVED_SRC_SLOT, mixedSrc),
+      makeOctokit: factory,
+      getPaste: async () => { pasteCalls += 1; return "x"; },
+    }),
+  );
+  assert.equal(result.token, SAVED_SRC_SLOT.token);
+  assert.equal(pasteCalls, 0, "case-insensitive owner key hit");
+});
+
+test("VAL-MEM-SRC-001 (N3): the single-PAT write-reuse does NOT write sourceTokens", async () => {
+  // writeOptions/readOptions default saveConfig throws if called; the reused
+  // write token is fromPaste:false, so no save fires.
+  const result = await resolveReadToken(
+    readOptions({
+      writeToken: "one-pat",
+      makeOctokit: readFactory(new Set(["one-pat"])),
+    }),
+  );
+  assert.equal(result.token, "one-pat");
+  assert.equal(result.fromPaste, false);
+});
+
+test("VAL-MEM-SRC-001 (N3): a saved-key HIT never writes; env still wins over saved key", async () => {
+  // saved-key hit: no save.
+  const hit = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only",
+      getConfig: () => srcCfg(SAVED_SRC_SLOT),
+      makeOctokit: readFactory(new Set([SAVED_SRC_SLOT.token])),
+    }),
+  );
+  assert.equal(hit.token, SAVED_SRC_SLOT.token);
+
+  // env wins over the saved key (N2).
+  const env = await resolveReadToken(
+    readOptions({
+      writeToken: "write-only",
+      getEnvToken: () => "env-read",
+      getConfig: () => srcCfg(SAVED_SRC_SLOT),
+      makeOctokit: readFactory(new Set(["env-read", SAVED_SRC_SLOT.token])),
+    }),
+  );
+  assert.equal(env.token, "env-read");
 });
 
 // Type-only: confirm AcceptToken is exported and shaped as documented.

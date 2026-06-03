@@ -1,17 +1,16 @@
 /**
- * Tests for the `status` command (`src/status.ts`) — VAL-CONFIG-002.
+ * Tests for the `status` command (`src/status.ts`) — VAL-MEM-005.
  *
  * `runStatus` is driven through an injected `readConfig` seam (so a fake config
  * can be supplied) and a `print` seam (so the rendered lines can be captured).
  * It takes NO network-capable dependency — it cannot make a network call by
  * construction (no Octokit/`makeOctokit` is imported or built in the status code
  * path). These tests assert:
- *  - both slots saved → each line shows `@login` + token type, plus the default
- *    destination, and NO token value substring appears in the output;
- *  - empty/absent slots → each line reads `not set`;
+ *  - a populated config → each saved per-source sandbox, plus a per-owner /
+ *    per-repo token summary (login + type), and NO token value substring appears;
+ *  - empty/absent maps → a clear "none saved" state per section;
  *  - the injected `readConfig` is the only seam invoked (no other collaborator),
- *    proving zero network calls;
- *  - exit code 0 (the CLI wiring calls `process.exit(0)` after `runStatus`).
+ *    proving zero network calls.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -26,59 +25,68 @@ function capture(cfg: Config | null): string[] {
   return lines;
 }
 
-test("status: both slots saved → @login + type per slot + default destination", () => {
+test("VAL-MEM-005: populated → sandboxes + per-owner/per-repo token summary, no token value", () => {
+  const sourceTok = "ghp_SOURCE_SECRET_VALUE_123456";
+  const destTok = "ghp_DEST_SECRET_VALUE_7890abcd";
   const cfg: Config = {
-    sourceToken: {
-      token: "ghp_SOURCE_SECRET_VALUE_123456",
-      username: "octocat",
-      source: "fine-grained",
+    sandboxes: {
+      "acme/api": { owner: "me", repo: "api-backtest" },
+      "globex/web": { owner: "me", repo: "web-sb" },
     },
-    destinationToken: {
-      token: "ghp_DEST_SECRET_VALUE_7890abcd",
-      username: "hubber",
-      source: "classic",
+    sourceTokens: {
+      "octo-org": {
+        token: sourceTok,
+        username: "octocat",
+        source: "fine-grained",
+      },
     },
-    defaultDestination: { owner: "acme", repo: "backtests" },
+    destinationTokens: {
+      "acme/backtests": {
+        token: destTok,
+        username: "hubber",
+        source: "classic",
+      },
+    },
   };
 
   const out = capture(cfg).join("\n");
 
-  assert.match(out, /Source token:\s+saved · authenticates as @octocat · fine-grained/);
-  assert.match(out, /Destination token:\s+saved · authenticates as @hubber · classic/);
-  assert.match(out, /Default destination:\s+acme\/backtests/);
+  // Each saved per-source sandbox is listed as <src> → <sandbox>.
+  assert.match(out, /acme\/api → me\/api-backtest/);
+  assert.match(out, /globex\/web → me\/web-sb/);
+  // The token summary names the OWNER / REPO key plus the login + type.
+  assert.match(out, /octo-org → @octocat · fine-grained/);
+  assert.match(out, /acme\/backtests → @hubber · classic/);
 
   // The token value is NEVER printed.
-  assert.ok(!out.includes(cfg.sourceToken!.token), "source token value must not appear");
-  assert.ok(
-    !out.includes(cfg.destinationToken!.token),
-    "destination token value must not appear",
-  );
+  assert.ok(!out.includes(sourceTok), "source token value must not appear");
+  assert.ok(!out.includes(destTok), "destination token value must not appear");
 });
 
-test("status: empty/absent slots → each line reads 'not set'", () => {
+test("VAL-MEM-005: empty/absent maps → a clear 'none saved' state per section", () => {
   const lines = capture(null);
-  assert.deepEqual(lines, [
-    "Source token:        not set",
-    "Destination token:   not set",
-    "Default destination: not set",
-  ]);
+  const out = lines.join("\n");
+  // Each section renders its header and a "none saved" line.
+  assert.match(out, /Saved sandboxes:/);
+  assert.match(out, /Source tokens:/);
+  assert.match(out, /Destination tokens:/);
+  // "none saved" appears once per empty section (all three here).
+  const noneCount = lines.filter((l) => l.includes("none saved")).length;
+  assert.equal(noneCount, 3, "all three sections report 'none saved'");
 });
 
-test("status: a single saved slot → others read 'not set'", () => {
+test("VAL-MEM-005: a partially-populated config → only the empty maps say 'none saved'", () => {
   const cfg: Config = {
-    sourceToken: {
-      token: "ghp_ONLY_SOURCE_SECRET_VALUE",
-      username: "octocat",
-      source: "fine-grained",
-    },
+    sandboxes: { "acme/api": { owner: "me", repo: "api-backtest" } },
   };
   const out = capture(cfg).join("\n");
-  assert.match(out, /Source token:\s+saved · authenticates as @octocat · fine-grained/);
-  assert.match(out, /Destination token:\s+not set/);
-  assert.match(out, /Default destination:\s+not set/);
+  assert.match(out, /acme\/api → me\/api-backtest/);
+  // The two token sections are empty.
+  assert.match(out, /Source tokens:\n {2}none saved/);
+  assert.match(out, /Destination tokens:\n {2}none saved/);
 });
 
-test("status: makes no network call — only the injected readConfig seam is invoked", () => {
+test("VAL-MEM-005: makes no network call — only the injected readConfig seam is invoked", () => {
   let reads = 0;
   // A network-capable dep is intentionally NOT part of StatusDeps; the cleanest
   // proof of "no network" is that runStatus accepts only a readConfig (+ print)
