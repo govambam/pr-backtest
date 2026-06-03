@@ -28,7 +28,7 @@ import { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 
 import {
-  destKey,
+  repoKey,
   inferTokenSource,
   mergeConfig,
   readConfig,
@@ -559,7 +559,7 @@ export async function resolveWriteToken(
 
   const cfg = getConfig();
   const savedSlot =
-    cfg?.destinationTokens?.[destKey(destination.owner, destination.repo)];
+    cfg?.destinationTokens?.[repoKey(destination.owner, destination.repo)];
 
   const resolved = await resolveWithAccept(
     [envCandidate(getEnv()), slotCandidate(savedSlot)],
@@ -586,7 +586,7 @@ export async function resolveWriteToken(
     success(`Authenticated as @${login}`);
     saveConfig({
       destinationTokens: {
-        [destKey(destination.owner, destination.repo)]: {
+        [repoKey(destination.owner, destination.repo)]: {
           token: resolved.token,
           username: login,
           source: resolved.source,

@@ -280,13 +280,27 @@ test("VAL-MEM-004: non-TTY, no flag, a saved sandbox → resolves to it (isSandb
     isTTY: false,
     saved: { owner: "me", repo: "saved-sb" },
   });
-  const result = await resolveDestinationChoice(SOURCE, h.resolvers);
+  // TD-05-003: this path has no plan to show the destination, so it should emit
+  // one info line naming the saved sandbox it resolved to. Capture stderr.
+  const realErr = process.stderr.write.bind(process.stderr);
+  let stderr = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    return true;
+  }) as typeof process.stderr.write;
+  let result;
+  try {
+    result = await resolveDestinationChoice(SOURCE, h.resolvers);
+  } finally {
+    process.stderr.write = realErr;
+  }
   assert.deepEqual(result, {
     owner: "me",
     repo: "saved-sb",
     isSandbox: true,
   });
   assert.equal(h.promptCount(), 0, "no prompt on the non-TTY path");
+  assert.match(stderr, /Using saved sandbox me\/saved-sb for backtests of acme\/api/);
 });
 
 test("VAL-MEM-004: non-TTY, no flag, NO saved sandbox → bad-args (unchanged)", async () => {

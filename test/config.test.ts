@@ -7,10 +7,9 @@ import path from "node:path";
 import {
   configPath,
   deleteConfig,
-  destKey,
   mergeConfig,
   readConfig,
-  sandboxKey,
+  repoKey,
   sourceKey,
   writeConfig,
   type Config,
@@ -88,8 +87,7 @@ test("readConfig returns null when the file is absent", () => {
 
 // Key helpers (N1): all keys are lowercased.
 test("key helpers lowercase their inputs (N1)", () => {
-  assert.equal(sandboxKey("Foo", "Bar"), "foo/bar");
-  assert.equal(destKey("Foo", "Bar"), "foo/bar");
+  assert.equal(repoKey("Foo", "Bar"), "foo/bar");
   assert.equal(sourceKey("Foo"), "foo");
 });
 
@@ -134,15 +132,15 @@ test("keys normalize to lowercase: write Foo/Bar, read foo/bar hits the same ent
   useTempConfigHome();
   // Write through the keyed-map API using a mixed-case repo via the key helper.
   mergeConfig({
-    destinationTokens: { [destKey("Foo", "Bar")]: DEST_SLOT },
+    destinationTokens: { [repoKey("Foo", "Bar")]: DEST_SLOT },
     sourceTokens: { [sourceKey("Foo")]: SOURCE_SLOT },
-    sandboxes: { [sandboxKey("Foo", "Bar")]: { owner: "globex", repo: "sb" } },
+    sandboxes: { [repoKey("Foo", "Bar")]: { owner: "globex", repo: "sb" } },
   });
   const cfg = readConfig();
   // A lookup with a DIFFERENT casing finds the SAME single entry.
-  assert.deepEqual(cfg?.destinationTokens?.[destKey("foo", "bar")], DEST_SLOT);
+  assert.deepEqual(cfg?.destinationTokens?.[repoKey("foo", "bar")], DEST_SLOT);
   assert.deepEqual(cfg?.sourceTokens?.[sourceKey("FOO")], SOURCE_SLOT);
-  assert.deepEqual(cfg?.sandboxes?.[sandboxKey("FOO", "BAR")], {
+  assert.deepEqual(cfg?.sandboxes?.[repoKey("FOO", "BAR")], {
     owner: "globex",
     repo: "sb",
   });
@@ -160,6 +158,21 @@ test("readConfig lowercases mixed-case keys read from disk (N1)", () => {
   const cfg = readConfig();
   assert.deepEqual(Object.keys(cfg!.destinationTokens!), ["foo/bar"]);
   assert.deepEqual(cfg?.destinationTokens?.["foo/bar"], DEST_SLOT);
+});
+
+// TD-05-006: two hand-edited keys that collide after lowercasing are one entry;
+// the later case-variant wins and the override is warned (never dropped silently).
+test("readConfig warns when a post-lowercase key collides (later wins)", () => {
+  useTempConfigHome();
+  const laterSlot: TokenSlot = { token: "later", username: "later", source: "classic" };
+  writeRaw({ destinationTokens: { "Foo/Bar": DEST_SLOT, "foo/bar": laterSlot } });
+  let cfg: Config | null = null;
+  const err = captureStderr(() => {
+    cfg = readConfig();
+  });
+  assert.match(err, /collides with an earlier case-variant/);
+  assert.deepEqual(Object.keys(cfg!.destinationTokens!), ["foo/bar"]);
+  assert.deepEqual(cfg?.destinationTokens?.["foo/bar"], laterSlot);
 });
 
 test("readConfig ignores malformed JSON (warns, returns null)", () => {
@@ -344,15 +357,24 @@ test("N6 (a): old destinationToken + defaultDestination salvages into destinatio
 });
 
 // (b) drop: destinationToken with NO defaultDestination → token absent (not mis-keyed).
+// TD-05-004: a well-formed-but-undroppable old token surfaces the one-time
+// re-paste note (and names no token value). This is the FIRST drop in this file,
+// so the once-per-process guard has not yet fired.
 test("N6 (b): old destinationToken with no defaultDestination is dropped (not mis-keyed)", () => {
   useTempConfigHome();
   writeRaw({ destinationToken: DEST_SLOT });
   let result: Config | null = "x" as unknown as Config;
+  let err = "";
   assert.doesNotThrow(() => {
-    result = readConfig();
+    err = captureStderr(() => {
+      result = readConfig();
+    });
   });
   // No defaultDestination → no salvage key → nothing recognized → null config.
   assert.equal(result, null);
+  // The one-time re-paste note fires, and never echoes the token value.
+  assert.match(err, /per-repo memory.*paste it once/);
+  assert.ok(!err.includes(DEST_SLOT.token));
 });
 
 // (c) drop: a bare sourceToken (no recorded owner) → absent.
@@ -360,10 +382,16 @@ test("N6 (c): a bare old sourceToken is dropped (no owner to key it under)", () 
   useTempConfigHome();
   writeRaw({ sourceToken: SOURCE_SLOT });
   let result: Config | null = "x" as unknown as Config;
+  let err = "";
   assert.doesNotThrow(() => {
-    result = readConfig();
+    err = captureStderr(() => {
+      result = readConfig();
+    });
   });
   assert.equal(result, null);
+  // TD-05-004: the note is once-per-process — N6 (b) already consumed it, so this
+  // second drop does NOT re-warn.
+  assert.ok(!/per-repo memory/.test(err));
 });
 
 // (d) drop: a bare defaultDestination → no phantom token, no config at all.

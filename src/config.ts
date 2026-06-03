@@ -10,6 +10,12 @@ import path from "node:path";
 
 import { warn } from "./log.js";
 
+/**
+ * One-time guard so the "old token couldn't be migrated" note (N6) prints at most
+ * once per process, even though {@link readConfig} runs on several code paths.
+ */
+let warnedDroppedOldToken = false;
+
 /** The source a token was obtained from. */
 export type TokenSource = "fine-grained" | "classic";
 
@@ -55,14 +61,12 @@ export interface TokenSlot {
  *   `"<srcOwner>"`.
  *
  * All keys are lowercased at BOTH write and lookup (GitHub owner/repo are
- * case-insensitive). Use {@link sandboxKey}/{@link destKey}/{@link sourceKey} so
- * callers store and read consistently.
+ * case-insensitive). Use {@link repoKey}/{@link sourceKey} so callers store and
+ * read consistently.
  *
- * The OLD single-slot `defaultDestination` field is NOT part of this schema.
- * `readConfig` still reads the raw on-disk `defaultDestination` (the parsed
- * object, not a `Config` field) purely for the N6 migration salvage — see
- * {@link readConfig} — but it is never surfaced on the in-memory `Config` and is
- * never written back.
+ * The OLD single-slot `sourceToken`/`destinationToken`/`defaultDestination`
+ * fields are NOT part of this schema; {@link readConfig} migrates them in memory
+ * (see its docstring for the salvage/drop rules) and they are never written back.
  */
 export interface Config {
   sandboxes?: { [srcOwnerRepo: string]: RepoRef };
@@ -75,13 +79,11 @@ export interface Config {
 // Saving under `Foo/Bar` and resolving `foo/bar` is the SAME entry.
 // ---------------------------------------------------------------------------
 
-/** Key for the `sandboxes` map: lowercased `"<owner>/<repo>"`. */
-export function sandboxKey(owner: string, repo: string): string {
-  return `${owner}/${repo}`.toLowerCase();
-}
-
-/** Key for the `destinationTokens` map: lowercased `"<owner>/<repo>"`. */
-export function destKey(owner: string, repo: string): string {
+/**
+ * Key for the repo-keyed maps (`sandboxes`, `destinationTokens`): lowercased
+ * `"<owner>/<repo>"`. Shared by both so the normalization rule lives in one place.
+ */
+export function repoKey(owner: string, repo: string): string {
   return `${owner}/${repo}`.toLowerCase();
 }
 
@@ -137,11 +139,6 @@ function isRepoRef(value: unknown): value is RepoRef {
   );
 }
 
-/** A non-empty string usable as a map key. */
-function isKey(value: string): boolean {
-  return value.length > 0;
-}
-
 /**
  * Read a keyed map field, validating every entry independently: a malformed key
  * or value is warned about and DROPPED, while valid siblings survive. Keys are
@@ -160,13 +157,23 @@ function readKeyedMap<V>(
   const out: { [key: string]: V } = {};
   let any = false;
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (!isKey(key) || !isValue(value)) {
+    if (key.length === 0 || !isValue(value)) {
       warn(
         `Config file ${filePath} ${fieldName}["${key}"] is malformed; ignoring it.`,
       );
       continue;
     }
-    out[key.toLowerCase()] = value;
+    const lowered = key.toLowerCase();
+    if (out[lowered] !== undefined) {
+      // Two keys collide after lowercasing (e.g. a hand-edited config with both
+      // `Foo/Bar` and `foo/bar`). Keys are case-insensitive, so this is one
+      // entry; warn that the later case-variant wins rather than dropping silently.
+      warn(
+        `Config file ${filePath} ${fieldName}["${key}"] collides with an earlier ` +
+          `case-variant of the same key; the later one wins.`,
+      );
+    }
+    out[lowered] = value;
     any = true;
   }
   return any ? out : undefined;
@@ -186,8 +193,10 @@ function readKeyedMap<V>(
  * never overwrite). Salvage: an old `destinationToken` migrates to
  * `destinationTokens[<defaultDestination>]` IFF that key is free. DROPPED (not
  * mis-keyed): an old `destinationToken` with no `defaultDestination`; a bare old
- * `sourceToken` (no recorded owner); a bare `defaultDestination`. Reading performs
- * NO disk write — old fields leave disk only on the next {@link mergeConfig}.
+ * `sourceToken` (no recorded owner); a bare `defaultDestination`. When a
+ * well-formed old token is DROPPED (can't be keyed) we warn ONCE that it must be
+ * re-pasted. Reading performs NO disk write — old fields leave disk only on the
+ * next {@link mergeConfig}.
  *
  * Warns (does not throw) if the file's permissions have been loosened so that
  * group or other can read it.
@@ -266,15 +275,8 @@ export function readConfig(): Config | null {
   }
 
   // --- N6 migration: fold OLD single fields into the new maps (in memory). ---
-  // New keys ALWAYS win; old fields only FILL keys not already present.
-
-  // Salvage: an old defaultDestination doubles as the destination repo, so an
-  // old destinationToken migrates to destinationTokens[<defaultDestination>] IFF
-  // that key is free. A bare defaultDestination (no token) salvages nothing and
-  // is DROPPED (it is the deprecated single-slot default, not part of the new
-  // schema). A bare destinationToken (no defaultDestination) is DROPPED — we will
-  // not guess a key. This reads the RAW on-disk object, not a Config field, so it
-  // survives the removal of `defaultDestination` from the Config type.
+  // Salvage/drop rules live in the readConfig docstring. Reads the RAW on-disk
+  // object (not a Config field) so it survives `defaultDestination` leaving the type.
   let oldDefault: RepoRef | undefined;
   if (obj.defaultDestination !== undefined) {
     if (isRepoRef(obj.defaultDestination)) {
@@ -289,29 +291,50 @@ export function readConfig(): Config | null {
     }
   }
 
+  // Tracks whether a well-formed old token was dropped because it can't be keyed,
+  // so we can explain the forced re-paste once (below).
+  let droppedSalvageableToken = false;
+
   if (obj.destinationToken !== undefined) {
     if (isTokenSlot(obj.destinationToken)) {
-      if (oldDefault) {
-        const key = destKey(oldDefault.owner, oldDefault.repo);
-        const existing = cfg.destinationTokens ?? {};
-        if (existing[key] === undefined) {
-          existing[key] = {
-            token: obj.destinationToken.token,
-            username: obj.destinationToken.username,
-            source: obj.destinationToken.source,
-          };
-          cfg.destinationTokens = existing;
-        }
+      const key = oldDefault
+        ? repoKey(oldDefault.owner, oldDefault.repo)
+        : undefined;
+      const existing = cfg.destinationTokens ?? {};
+      // Salvage only when the destination key is both known AND free: a present
+      // new-map key always wins, and a bare destinationToken has no key to use.
+      if (key !== undefined && existing[key] === undefined) {
+        existing[key] = {
+          token: obj.destinationToken.token,
+          username: obj.destinationToken.username,
+          source: obj.destinationToken.source,
+        };
+        cfg.destinationTokens = existing;
+      } else if (key === undefined) {
+        droppedSalvageableToken = true;
       }
-      // else: bare old destinationToken with no defaultDestination → DROP.
     } else {
       warn(`Config file ${filePath} destinationToken is malformed; ignoring it.`);
     }
   }
 
-  // A bare old sourceToken has no recorded owner → DROP (do not mis-key it).
-  if (obj.sourceToken !== undefined && !isTokenSlot(obj.sourceToken)) {
-    warn(`Config file ${filePath} sourceToken is malformed; ignoring it.`);
+  if (obj.sourceToken !== undefined) {
+    if (isTokenSlot(obj.sourceToken)) {
+      // A well-formed old sourceToken has no recorded owner to key it by → DROP.
+      droppedSalvageableToken = true;
+    } else {
+      warn(`Config file ${filePath} sourceToken is malformed; ignoring it.`);
+    }
+  }
+
+  // A well-formed old token couldn't be carried into the new keyed maps; explain
+  // the forced re-paste ONCE per process (malformed entries already warned above).
+  if (droppedSalvageableToken && !warnedDroppedOldToken) {
+    warnedDroppedOldToken = true;
+    warn(
+      "Upgraded saved config to per-repo memory; an old saved token couldn't be " +
+        "carried over — you'll be asked to paste it once.",
+    );
   }
 
   // A file with zero recognized fields is treated as no config at all. A bare

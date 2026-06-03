@@ -162,9 +162,9 @@ export interface ChoiceResolvers {
   getFlags: () => DestinationFlags;
   /**
    * The saved sandbox for THIS source repo, if any (from
-   * `readConfig().sandboxes[sourceKey(source)]`). On the non-TTY/no-flag path it
-   * is the default destination; in the interactive menu it is offered as a
-   * saved-sandbox row.
+   * `readConfig().sandboxes[repoKey(source.owner, source.repo)]`). On the
+   * non-TTY/no-flag path it is the default destination; in the interactive menu
+   * it is offered as a saved-sandbox row.
    */
   getSavedSandbox: () => RepoRef | undefined;
   /** Whether stdin is a TTY (drives the interactive vs non-interactive split). */
@@ -271,6 +271,12 @@ export async function resolveDestinationChoice(
   // (N7 — the destination default, keyed by the source repo).
   const saved = resolvers.getSavedSandbox();
   if (saved) {
+    // No flag named the destination and there is no interactive plan to show it,
+    // so name the saved sandbox we resolved to (one line). Token-free.
+    info(
+      `Using saved sandbox ${saved.owner}/${saved.repo} for backtests of ` +
+        `${source.owner}/${source.repo}.`,
+    );
     return {
       owner: saved.owner,
       repo: saved.repo,

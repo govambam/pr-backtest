@@ -15,7 +15,7 @@ import {
   type RepoRef,
 } from "../src/auth.js";
 import type { Config, TokenSlot } from "../src/config.js";
-import { destKey, sourceKey } from "../src/config.js";
+import { repoKey, sourceKey } from "../src/config.js";
 import { DestinationApiError } from "../src/destination.js";
 import { setVerbose, setTtyOverride, redact } from "../src/log.js";
 
@@ -24,7 +24,7 @@ const DEST: RepoRef = { owner: "alice", repo: "sandbox" };
 
 /** A Config holding one saved destination token under DEST's key (N1-lowercased). */
 function destCfg(slot: TokenSlot, dest: RepoRef = DEST): Config {
-  return { destinationTokens: { [destKey(dest.owner, dest.repo)]: slot } };
+  return { destinationTokens: { [repoKey(dest.owner, dest.repo)]: slot } };
 }
 
 /** A Config holding one saved source token under SOURCE owner's key (N1-lowercased). */
@@ -361,7 +361,7 @@ test("resolveWriteToken: a fresh accepted paste persists to destinationToken wit
   assert.equal(result.token, "pasted-write");
   assert.equal(result.fromPaste, true);
   assert.equal(result.login, "writer");
-  const key = destKey(SOURCE.owner, SOURCE.repo);
+  const key = repoKey(SOURCE.owner, SOURCE.repo);
   const map = saved.find((s) => s.destinationTokens)?.destinationTokens;
   assert.ok(map, "destinationTokens persisted");
   const slot = map![key];
@@ -918,8 +918,8 @@ test("VAL-MEM-002 (N3): a fresh paste persists ONLY destinationTokens[dest] (no 
   );
   const map = saved.find((s) => s.destinationTokens)?.destinationTokens;
   assert.ok(map, "destinationTokens written");
-  assert.deepEqual(Object.keys(map!), [destKey(DEST.owner, DEST.repo)]);
-  assert.equal(map![destKey(DEST.owner, DEST.repo)]!.token, "fresh");
+  assert.deepEqual(Object.keys(map!), [repoKey(DEST.owner, DEST.repo)]);
+  assert.equal(map![repoKey(DEST.owner, DEST.repo)]!.token, "fresh");
 });
 
 test("VAL-MEM-002 (N3): a saved-key HIT never writes (save seam not called)", async () => {

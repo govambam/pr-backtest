@@ -9,8 +9,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `--full` flag: recreate the **whole** PR — every commit from the merge-base up
   to the PR head, including any commits pushed after the PR was opened.
+- **Per-repo memory.** The saved config is now three keyed maps instead of single
+  slots: `sandboxes` (the sandbox to reuse, keyed by source `owner/repo`),
+  `destinationTokens` (the write token, keyed by destination `owner/repo`), and
+  `sourceTokens` (the read token, keyed by source owner). Each is independent, so
+  backtesting several repos no longer overwrites the last one's saved choices.
+  After a successful run the chosen sandbox is remembered for that source repo and
+  reused on every later path — interactive, flag, env-token, or non-TTY — regardless
+  of how you authenticate. `pr-backtest status` now renders three sections (Saved
+  sandboxes, Source tokens, Destination tokens).
 
 ### Changed
+- Removed the global "Remember default sandbox?" prompt and the single
+  `defaultDestination` slot. The sandbox is persisted automatically on success and
+  keyed per source repo (see Per-repo memory above), so there is no separate
+  remember step. Old-format configs are migrated in memory on read; a saved token
+  that can't be re-keyed is dropped with a one-time note that it must be re-pasted.
 - The default scope is now **the PR as opened**: a backtest recreates only the
   commits whose committer date is at or before the PR's `created_at`, so commits
   pushed after the PR opened are left out and the review sees the original change
@@ -67,8 +81,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `--create-sandbox`: with `--sandbox`, create the destination repo (always
     **private**) if it does not already exist. No effect without `--sandbox`.
   - Interactively (a TTY with neither flag), pr-backtest prompts for the
-    destination and can remember it as the default. `--primary` and `--sandbox`
-    are mutually exclusive.
+    destination and offers to save it. `--primary` and `--sandbox` are mutually
+    exclusive.
 
 ### Security
 - Every GitHub API request is traced through a single hook that asserts the host

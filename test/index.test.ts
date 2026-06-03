@@ -49,7 +49,7 @@ import {
 } from "../src/destination.js";
 import { resolveAuthFirstChoice, sandboxCreateWarning } from "../src/authFirst.js";
 import type { InheritedCredential } from "../src/inheritedAuth.js";
-import { sandboxKey, type Config, type RepoRef } from "../src/config.js";
+import { repoKey, type Config, type RepoRef } from "../src/config.js";
 import { redact, setTtyOverride, setVerbose } from "../src/log.js";
 
 /** An `Error` tagged with the exit code a stubbed `process.exit` was given. */
@@ -789,7 +789,7 @@ test("VAL-BRANCH-003: a CLOSED prior backtest PR does NOT block — the run proc
 // --- VAL-MEM-001 / N4: persist the chosen sandbox on SUCCESS only -----------
 
 /** The lowercased sandboxes key for the default source repo (acme/api). */
-const SOURCE_SANDBOX_KEY = sandboxKey(SOURCE_OWNER, SOURCE_REPO);
+const SOURCE_SANDBOX_KEY = repoKey(SOURCE_OWNER, SOURCE_REPO);
 
 /**
  * Build deps for a non-default Sandbox run, recording every `saveConfig` call so
@@ -821,13 +821,20 @@ function makePersistDeps(
 
 test("VAL-MEM-001: a successful Sandbox run persists sandboxes[source] via the write seam", async () => {
   const { deps, saved } = makePersistDeps();
-  const { exit } = await run({ deps });
+  const { exit, stderr } = await run({ deps });
   assert.equal(exit, 0);
   assert.deepEqual(
     saved,
     [{ sandboxes: { [SOURCE_SANDBOX_KEY]: { owner: SANDBOX_OWNER, repo: SANDBOX_REPO } } }],
     "the chosen sandbox is persisted exactly once, on the success path",
   );
+  // TD-05-003: a NEWLY-saved sandbox surfaces one info line naming the reuse,
+  // and never echoes a token.
+  assert.match(
+    stderr,
+    new RegExp(`Will reuse ${SANDBOX_OWNER}/${SANDBOX_REPO} for backtests of ${SOURCE_OWNER}/${SOURCE_REPO}`),
+  );
+  assert.ok(!stderr.includes(WRITE_TOKEN) && !stderr.includes(READ_TOKEN));
 });
 
 test("VAL-MEM-001: a Sandbox run that fails verify/create persists nothing", async () => {
@@ -884,9 +891,11 @@ test("VAL-MEM-001: a reuse run (the same sandbox already saved) does NOT rewrite
       sandboxes: { [SOURCE_SANDBOX_KEY]: { owner: SANDBOX_OWNER, repo: SANDBOX_REPO } },
     }),
   });
-  const { exit } = await run({ deps });
+  const { exit, stderr } = await run({ deps });
   assert.equal(exit, 0);
   assert.deepEqual(saved, [], "an already-saved sandbox is not rewritten");
+  // TD-05-003: a reuse run stays quiet — no "Will reuse" line.
+  assert.ok(!/Will reuse/.test(stderr), "a reuse run does not re-announce the sandbox");
 });
 
 test("VAL-MEM-001: two-run round-trip — run 1 persists, run 2 reuses with zero re-entry", async () => {

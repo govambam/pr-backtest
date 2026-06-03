@@ -180,8 +180,8 @@ export interface AuthFirstResolvers {
   getSandboxWritePaste: ScopedPastePrompt;
   /**
    * The saved sandbox for THIS source repo, if any (from
-   * `readConfig().sandboxes[sourceKey(source)]`). When present it is offered as a
-   * landing option on BOTH forks (N7).
+   * `readConfig().sandboxes[repoKey(source.owner, source.repo)]`). When present it
+   * is offered as a landing option on BOTH forks (N7).
    */
   getSavedSandbox: () => RepoRef | undefined;
 }

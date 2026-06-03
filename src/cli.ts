@@ -79,9 +79,9 @@ program
       "                       source and GITHUB_TOKEN only writes the destination.",
       "",
       "Commands:",
-      "  pr-backtest status   Print the saved source/destination token logins + types and",
-      "                       the default destination (never a token value). No network.",
-      "  pr-backtest logout   Delete the saved config (tokens + default destination).",
+      "  pr-backtest status   Print the saved per-repo sandboxes and the source/destination",
+      "                       token logins + types (never a token value). No network.",
+      "  pr-backtest logout   Delete the saved config (tokens + saved per-repo sandboxes).",
       "",
       "Branch naming: branches are backtest-pr<N>-<shortSha>-{head,base}. An existing",
       "OPEN backtest PR for those branches exits 4 and prints its URL; to recreate,",
@@ -136,7 +136,7 @@ program
 program
   .command("status")
   .description(
-    "Print what is saved (token logins + types and the default destination). Reads only stored metadata — no network call, no token value.",
+    "Print what is saved (per-repo sandboxes and token logins + types). Reads only stored metadata — no network call, no token value.",
   )
   .action(() => {
     runStatus();
@@ -146,12 +146,12 @@ program
 program
   .command("logout")
   .description(
-    "Delete the saved config (GitHub token and any saved default destination).",
+    "Delete the saved config (GitHub tokens and any saved per-repo sandboxes).",
   )
   .action(() => {
     deleteConfig();
     success(
-      "Logged out: saved token and any saved default destination removed.",
+      "Logged out: saved tokens and any saved per-repo sandboxes removed.",
     );
     process.exit(0);
   });

@@ -55,7 +55,7 @@ import {
 import {
   mergeConfig,
   readConfig,
-  sandboxKey,
+  repoKey,
   type Config,
   type RepoRef,
   type TokenSource,
@@ -352,7 +352,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   // (interactive forks + the menu) and used as the non-TTY/no-flag default. Plain
   // config — independent of how the user later authenticates.
   const getSavedSandbox = (): RepoRef | undefined =>
-    deps.readConfig()?.sandboxes?.[sandboxKey(source.owner, source.repo)];
+    deps.readConfig()?.sandboxes?.[repoKey(source.owner, source.repo)];
   // The accepted inherited credential (interactive YES fork only); null on every
   // other path. When present it is threaded into the write/read resolvers as the
   // `getInheritedCredential` source so the inherited token is USED (no paste).
@@ -925,8 +925,15 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     const already = getSavedSandbox();
     if (!(already && sameRepo(already, settled))) {
       deps.saveConfig({
-        sandboxes: { [sandboxKey(source.owner, source.repo)]: settled },
+        sandboxes: { [repoKey(source.owner, source.repo)]: settled },
       });
+      // Surface the newly-saved sandbox once (reuse runs stay quiet). The token
+      // save prints its own "Token saved"; this is the sandbox's counterpart.
+      info(
+        `Will reuse ${settled.owner}/${settled.repo} for backtests of ` +
+          `${source.owner}/${source.repo} next time (run \`pr-backtest status\` ` +
+          "to view, `pr-backtest logout` to clear).",
+      );
     }
   }
 
