@@ -6,15 +6,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `--full` flag: recreate the **whole** PR — every commit from the merge-base up
+  to the PR head, including any commits pushed after the PR was opened.
+
 ### Changed
-- Backtests now recreate the **entire** PR by default — every commit from the
-  PR's merge-base up to its head — so a review bot sees the same change set the
-  original PR presented. Previously only the PR's first commit was recreated, so
-  multi-commit PRs were reviewed as a single commit.
+- The default scope is now **the PR as opened**: a backtest recreates only the
+  commits whose committer date is at or before the PR's `created_at`, so commits
+  pushed after the PR opened are left out and the review sees the original change
+  set. If nothing was added after open (the common case), this is the whole PR.
+  Use `--full` to force every commit. If the branch was rebased/force-pushed
+  after opening (no commit dates at/before `created_at`), the default falls back
+  to `--full` and prints a one-line note suggesting `--commit <sha>`.
+- `--full` and `--commit` are mutually exclusive; supplying both exits `1`.
+- Backtests recreate the full change set against the PR's merge-base (every
+  commit in scope, not just the first). Previously only the PR's first commit was
+  recreated, so multi-commit PRs were reviewed as a single commit.
 - `--commit <sha>` now recreates the PR **up to** that commit (all commits up to
   it, with the base held at the PR's merge-base), so you can replay the PR as it
   stood before later fix-ups. This replaces the old single-commit selection and
-  the `--commit initial` default; omit `--commit` for the full PR.
+  the `--commit initial` default; omit `--commit` for the as-opened default, or
+  pass `--full` for every commit.
 
 ## [0.2.1] - 2026-06-01
 

@@ -78,10 +78,14 @@ import {
   type AuthFirstResolvers,
 } from "./authFirst.js";
 import type { InheritedCredential } from "./inheritedAuth.js";
-import { error, info, setVerbose, success, traceOp } from "./log.js";
+import { error, info, setVerbose, success, traceOp, warn } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
-import { confirmPlan, type PlanInput } from "./plan.js";
-import { countCommitsUpToHead, resolveHead } from "./resolveCommit.js";
+import { confirmPlan, headScopeLabel, type HeadScope, type PlanInput } from "./plan.js";
+import {
+  countCommitsUpToHead,
+  resolveAsOpened,
+  resolveHead,
+} from "./resolveCommit.js";
 import { shortSha } from "./util.js";
 
 /** The tool's own repository, linked from the generated PR body. */
@@ -207,8 +211,18 @@ const defaultDeps: RunBacktestDeps = {
 /** Options for a single backtest run, as parsed by the CLI. */
 export interface RunBacktestOptions {
   prUrl: string;
-  /** `--commit <sha>`: cutoff head; omit to recreate the full PR (all commits). */
+  /**
+   * `--commit <sha>`: cutoff head — recreate every commit up to this SHA. Omit
+   * (and without `--full`) to recreate the PR AS OPENED (the default scope).
+   * Mutually exclusive with `--full`.
+   */
   commit?: string;
+  /**
+   * `--full`: recreate the WHOLE PR (head = PR head, every commit). Without it
+   * (and without `--commit`) the default is the PR as opened. Mutually exclusive
+   * with `--commit`.
+   */
+  full?: boolean;
   yes: boolean;
   /** `--primary`: land the backtest in the PR's own repo (no prompt). */
   primary?: boolean;
@@ -290,6 +304,17 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //    bad-args exit 1 with no token/network work attempted first.
   if (opts.primary === true && typeof opts.sandbox === "string") {
     error("Pass either --primary or --sandbox, not both.");
+    process.exit(EXIT.BAD_ARGS);
+  }
+
+  // 2b. --full and --commit are mutually exclusive. Fail fast (exit 1) BEFORE any
+  //     token/network/git work: --full recreates every commit; --commit cuts the
+  //     head at a chosen SHA. Supplying both is contradictory.
+  if (opts.full === true && typeof opts.commit === "string") {
+    error(
+      "Pass either --full (recreate every commit) or --commit <sha> (cut the " +
+        "head at a commit), not both.",
+    );
     process.exit(EXIT.BAD_ARGS);
   }
 
@@ -580,6 +605,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   let prHeadSha: string;
   let prBaseSha: string;
   let prBaseRef: string;
+  let prCreatedAt: string;
   let prCommits: Awaited<ReturnType<typeof listPullRequestCommits>>;
   const readTrace = traceOp(`Read PR ${redactedRepoRef(owner, repo)}#${number}`);
   try {
@@ -589,6 +615,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     prHeadSha = pr.headSha;
     prBaseSha = pr.baseSha;
     prBaseRef = pr.baseRef;
+    prCreatedAt = pr.createdAt;
     prCommits = await deps.listPullRequestCommits(readOctokit, owner, repo, number);
   } catch (err) {
     readTrace.fail();
@@ -597,20 +624,59 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   }
   readTrace.done(`"${prTitle}"`);
 
-  // 8. Resolve the backtest head (the PR head by default, or the --commit
-  //    cutoff) and base. An invalid --commit value is a bad-args failure
-  //    (exit 1). The base is the PR's merge-base — the commit GitHub diffs
-  //    against — so the recreation spans EVERY commit from the branch point up
-  //    to the head, matching the original PR's full change set rather than a
-  //    single commit. A `--commit <sha>` cutoff keeps the same merge-base and
-  //    only moves the head earlier, reproducing the PR as it stood at that
-  //    point (all commits up to there).
+  // 8. Resolve the backtest head per the chosen scope, and the base. The base is
+  //    ALWAYS the PR's merge-base — the commit GitHub diffs against — for every
+  //    mode; only the head moves.
+  //
+  //    Three modes (mutual exclusion of --full/--commit was already enforced in
+  //    step 2b):
+  //      - DEFAULT (no flag): the PR "as opened" — the contiguous prefix of
+  //        commits committed at/before created_at (resolveAsOpened). If even the
+  //        first commit post-dates created_at the as-opened set is unrecoverable:
+  //        fall back to the full PR and emit a one-line rebase note.
+  //      - --full: the WHOLE PR (head = PR head, every commit).
+  //      - --commit <sha>: a cutoff at that SHA (head = sha). An invalid value is
+  //        a bad-args failure (exit 1). Byte-identical to the prior behavior.
   let targetSha: string;
-  try {
-    targetSha = resolveHead(opts.commit, prCommits, prHeadSha);
-  } catch (err) {
-    error(messageOf(err));
-    process.exit(EXIT.BAD_ARGS);
+  let commitCount: number;
+  let headScope: HeadScope;
+  // The PR's full commit count, needed for the narrowed "k of M" wording.
+  const totalCommits = prCommits.length;
+  if (typeof opts.commit === "string") {
+    // --commit cutoff (unchanged path).
+    try {
+      targetSha = resolveHead(opts.commit, prCommits);
+    } catch (err) {
+      error(messageOf(err));
+      process.exit(EXIT.BAD_ARGS);
+    }
+    commitCount = countCommitsUpToHead(prCommits, targetSha);
+    headScope = "cutoff";
+  } else if (opts.full === true) {
+    // --full: the whole PR.
+    targetSha = prHeadSha;
+    commitCount = countCommitsUpToHead(prCommits, prHeadSha);
+    headScope = "full";
+  } else {
+    // Default: the PR as opened.
+    const asOpened = resolveAsOpened(prCommits, prCreatedAt, prHeadSha);
+    targetSha = asOpened.headSha;
+    commitCount = asOpened.count;
+    if (asOpened.indeterminate) {
+      // k == 0: the as-opened set is unrecoverable (branch likely rebased after
+      // opening). Fall back to the full PR. This is a non-fatal heads-up, not a
+      // failure, so it uses warn() (the run still succeeds); the distinct
+      // `as-opened-fallback` scope then surfaces the fallback on the plan's Head
+      // line and in the PR body, right where the user confirms. The note text
+      // names both "rebased" and "--commit".
+      headScope = "as-opened-fallback";
+      warn(
+        "Couldn't determine the as-opened state (the branch was likely rebased " +
+          "after opening); recreating the full PR. Pass --commit <sha> to pin a cutoff.",
+      );
+    } else {
+      headScope = asOpened.narrowed ? "as-opened" : "as-opened-all";
+    }
   }
   let baseSha: string;
   try {
@@ -619,8 +685,6 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     error(messageOf(err));
     process.exit(EXIT.API_ERROR);
   }
-  const commitCount = countCommitsUpToHead(prCommits, targetSha);
-  const isFullPr = targetSha === prHeadSha;
 
   // 9. Branch names include the SHORT SHA of the target commit,
   //    so the (PR, commit) pair is the backtest identity: the same PR at
@@ -660,8 +724,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
 
   // 11. Show the plan and confirm (unless -y). A decline is a clean exit 0. The
   //     plan's two-token annotation is driven off the run's resolved token count.
-  const commits = `${commitCount} commit${commitCount === 1 ? "" : "s"}`;
-  const headLabel = isFullPr ? `PR head — ${commits}` : `cutoff — ${commits} up to here`;
+  const headLabel = headScopeLabel(headScope, commitCount, totalCommits);
   const planInput: PlanInput = {
     ownerRepo: `${owner}/${repo}`,
     prNumber: number,
@@ -744,11 +807,15 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   //      (exit 4) or reports a no-diff (exit 2); any other API error → exit 2.
   //      Open-PR has no git-layer trace, so narrate its ✓ completion here.
   const openTrace = traceOp("Opened backtest PR");
-  const scope = isFullPr
-    ? `(${commitCount} commit${commitCount === 1 ? "" : "s"})`
-    : `up to \`${targetSha}\` (${commitCount} commit${commitCount === 1 ? "" : "s"})`;
+  // The PR body states the chosen scope + count via the same `headLabel` shown in
+  // the plan (e.g. "as opened — 2 of 3 commits" / "full PR — 3 commits" /
+  // "cutoff — 2 commits up to here"). For a cutoff, also name the cutoff SHA.
+  const scope =
+    headScope === "cutoff"
+      ? `${headLabel} (up to \`${targetSha}\`)`
+      : headLabel;
   const body = [
-    `Backtest of ${owner}/${repo}#${number} ${scope}.`,
+    `Backtest of ${owner}/${repo}#${number} — ${scope}.`,
     "",
     `Recreated by [pr-backtest](${PROJECT_URL}) so a PR-review bot can ` +
       `review the original change set.`,

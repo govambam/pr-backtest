@@ -20,6 +20,12 @@ export interface PullRequest {
   baseSha: string;
   /** The base branch name, e.g. "main". Used only for plan/label wording. */
   baseRef: string;
+  /**
+   * The PR's creation timestamp (ISO-8601 `created_at`). The as-opened default
+   * scope uses this as the cutoff: commits committed at or before this instant
+   * are "the PR as opened".
+   */
+  createdAt: string;
 }
 
 /**
@@ -129,6 +135,7 @@ export async function getPullRequest(
       headSha: data.head.sha,
       baseSha: data.base.sha,
       baseRef: data.base.ref,
+      createdAt: data.created_at,
     };
   } catch (err: unknown) {
     if (isStatus(err, 404)) {
@@ -161,6 +168,8 @@ export async function listPullRequestCommits(
   return commits.map((commit) => ({
     sha: commit.sha,
     parents: commit.parents.map((parent) => ({ sha: parent.sha })),
+    // The committer date is what the as-opened default compares to created_at.
+    committedDate: commit.commit.committer?.date,
   }));
 }
 

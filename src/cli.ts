@@ -31,7 +31,7 @@ const program = new Command();
 program
   .name("pr-backtest")
   .description(
-    "Recreate a GitHub PR (all its commits) so a PR-review bot can review it.",
+    "Recreate a GitHub PR as it was opened (its original commits) so a PR-review bot can review it. Use --full for every commit.",
   )
   .version(packageVersion(), "-v, --version", "Print the version and exit");
 
@@ -39,7 +39,11 @@ program
   .argument("<pr-url>", "Full GitHub PR URL, e.g. https://github.com/acme/api/pull/123")
   .option(
     "--commit <sha>",
-    "recreate the PR only up to this commit SHA (default: the full PR, all commits)",
+    "recreate the PR only up to this commit SHA (cannot be combined with --full)",
+  )
+  .option(
+    "--full",
+    "recreate the WHOLE PR (every commit), not just the PR as it was opened (cannot be combined with --commit)",
   )
   .option("-y, --yes", "Skip the confirmation prompt (for scripting)", false)
   .option("--primary", "Land the backtest in the PR's own repo (no prompt)")
@@ -90,6 +94,13 @@ program
       "  Land in a separate repo you control (creating it if missing):",
       "    pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox --create-sandbox",
       "",
+      "  Recreate the PR as it was opened (the default — only its original commits,",
+      "  excluding anything pushed after open):",
+      "    pr-backtest https://github.com/acme/api/pull/123",
+      "",
+      "  Recreate the WHOLE PR — every commit, including those added after open:",
+      "    pr-backtest https://github.com/acme/api/pull/123 --full",
+      "",
       "  Recreate the PR only as it stood at an earlier commit (all commits up to it):",
       "    pr-backtest https://github.com/acme/api/pull/123 --commit a1b2c3d",
       "  To keep the source read with a read-only token, set GITHUB_SOURCE_TOKEN",
@@ -101,6 +112,7 @@ program
       prUrl: string,
       options: {
         commit?: string;
+        full?: boolean;
         yes: boolean;
         primary?: boolean;
         sandbox?: string;
@@ -111,6 +123,7 @@ program
       await runBacktest({
         prUrl,
         commit: options.commit,
+        full: options.full,
         yes: options.yes,
         primary: options.primary,
         sandbox: options.sandbox,

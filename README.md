@@ -113,7 +113,7 @@ pr-backtest prints the backtest PR's URL. Open it:
 - If Macroscope was connected before the PR opened, its correctness check runs automatically.
 - Otherwise, enable correctness on the destination repo (step 3) and comment `@macroscope-app review` on the PR to start it.
 
-That's a full backtest: you replayed a PR at its original state and had a bot review it. Everything below — saved tokens, the `--commit` cutoff, the activity trace, exit codes — is detail you can reach for later.
+That's a backtest: you replayed a PR as it was opened and had a bot review it. Everything below — the `--full` / `--commit` scope flags, saved tokens, the activity trace, exit codes — is detail you can reach for later.
 
 ## Install
 
@@ -180,11 +180,17 @@ A pasted token is saved automatically to `~/.config/pr-backtest/config.json` (mo
 ## Usage
 
 ```bash
-# Recreate the whole PR — all commits, base..head — prints a plan, asks to confirm
+# Recreate the PR AS IT WAS OPENED (the default) — only the commits that existed
+# when the PR was opened, excluding anything pushed afterward. Prints a plan,
+# asks to confirm.
 pr-backtest https://github.com/acme/api/pull/123
+
+# Recreate the WHOLE PR — every commit, including any added after it was opened.
+pr-backtest https://github.com/acme/api/pull/123 --full
 
 # Recreate the PR only up to a commit (all commits up to it; base stays the merge-base).
 # Useful to replay the PR as it stood before later fix-up commits.
+# (Cannot be combined with --full.)
 pr-backtest https://github.com/acme/api/pull/123 --commit a1b2c3d
 
 # Skip the confirmation prompt (for scripting)
@@ -203,11 +209,31 @@ pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sa
 pr-backtest logout
 ```
 
+### Commit scope
+
+By default the backtest recreates the PR **as it was opened**: the commits whose
+committer date is at or before the PR's `created_at`. If commits were pushed
+after the PR opened, the default leaves them out (so the review sees the original
+change set). If nothing was added after open — the common case — the as-opened
+set is the whole PR.
+
+| Flag | Meaning |
+|---|---|
+| _(none)_ | Recreate the PR **as opened** (commits committed at/before `created_at`). |
+| `--full` | Recreate the **whole PR** — every commit, including any added after open. |
+| `--commit <sha>` | Recreate every commit up to `<sha>` (head = `<sha>`; base stays the merge-base). |
+
+`--full` and `--commit` are mutually exclusive (supplying both exits 1). If the
+branch was rebased/force-pushed after the PR opened — so every commit's date is
+after `created_at` and the as-opened state can't be recovered — the default falls
+back to `--full` and prints a one-line note suggesting `--commit <sha>` to pin a
+cutoff.
+
 ### Commands
 
 | Command | Description |
 |---|---|
-| `pr-backtest <pr-url> [options]` | Recreate the PR (all commits by default) and open a backtest PR. |
+| `pr-backtest <pr-url> [options]` | Recreate the PR as it was opened (default; `--full` for every commit) and open a backtest PR. |
 | `pr-backtest status` | Print the saved source/destination token logins + types and the default destination. Never prints a token value; makes no network call. |
 | `pr-backtest logout` | Delete the saved config (both token slots and any saved default destination). |
 
@@ -385,7 +411,7 @@ The tool exits with a stable code so it can be wired into CI:
 | Code | Meaning |
 |---|---|
 | `0` | Success, or the user declined the confirmation prompt (no changes made). |
-| `1` | Bad args — invalid PR URL, invalid `--commit`, both `--primary` and `--sandbox`, or no token in a non-interactive run. |
+| `1` | Bad args — invalid PR URL, invalid `--commit`, both `--full` and `--commit`, both `--primary` and `--sandbox`, or no token in a non-interactive run. |
 | `2` | GitHub API error — PR not found, auth rejected, or the destination is missing / not writable. |
 | `3` | A git operation failed (clone / fetch / push). |
 | `4` | A backtest PR already exists for the planned branches. The existing PR's URL is printed to stdout — a useful CI signal. |
@@ -396,7 +422,8 @@ Because exit `4` prints the existing PR's URL to stdout, a re-run is idempotent:
 
 - **Deleted or unreachable commits.** If the head or merge-base commit can no longer be fetched — the commit was deleted (an old force-push, a repo transfer/delete), the PR came from a fork whose owner deleted their branch, or your token can't read the commit — the run fails (exit `3`) with the two manual `git push` lines you can use to recreate the branches yourself.
 - **No diff across the PR.** If the head and the merge-base produce no difference, GitHub rejects the empty PR (422) and the tool exits `2` rather than opening a no-op PR.
-- **PRs with more than 250 commits.** The GitHub API lists only the first 250 commits of a PR. The default (full PR) is unaffected — the head comes from the PR itself, not the commit list — but a `--commit <sha>` cutoff pointing at a commit in the unlisted tail is reported as not matching any commit in the PR; push that commit as a branch manually instead.
+- **As-opened is best-effort (clock skew / rebases).** The default scope buckets commits by comparing each commit's **committer date** to the PR's `created_at`. A commit committed within minutes of opening could be mis-bucketed if the author's clock was skewed. If the branch was rebased/force-pushed after opening, every committer date is rewritten to after `created_at`, so the as-opened state can't be recovered — the tool falls back to `--full` and prints a note. Use `--full` or `--commit <sha>` when you need exact, date-independent control.
+- **PRs with more than 250 commits.** The GitHub API lists only the first 250 commits of a PR. `--full` is unaffected — the head comes from the PR itself, not the commit list — but the as-opened default and a `--commit <sha>` cutoff rely on the listed commits; a cutoff pointing at a commit in the unlisted tail is reported as not matching any commit in the PR; push that commit as a branch manually instead.
 
 ## License
 
