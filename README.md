@@ -32,14 +32,14 @@ Check it: `pr-backtest --version`. To update later, run `npm run update` from th
 | Path | Use it when | Trade-off |
 |---|---|---|
 | **A — Your GitHub login** | You just want to try it on your own machine | Easiest, nothing to create; acts with your full GitHub permissions; needs an interactive terminal |
-| **B — Scoped tokens → sandbox repo** | Backtesting a PR you don't own (a company repo) without touching it | The source repo is only ever read; you create a throwaway repo and (optionally) use two tokens |
+| **B — Scoped tokens → sandbox repo** | Backtesting a PR you don't own (a company repo) without touching it | The source repo is only ever read; you create a temporary repo and (optionally) use two tokens |
 | **B — Scoped tokens → source repo** | The PR is in a repo you own and don't mind writing to | One token, the backtest sits next to the original PR — but it writes branches + a PR into the real repo |
 
 The **destination** is the sandbox in the sandbox paths, and the PR's own repo in the source path.
 
 ### 3. Connect Macroscope to your destination repo
 
-Macroscope reviews the backtest PR in whatever repo it lands in, so connect it to your **destination** repo. Connect it *before* you run so the correctness check fires automatically when the PR opens.
+Add the Macroscope GitHub app before you run the backtest so the correctness check fires automatically when the PR opens.
 
 > **Already have correctness checks on by default for all repos?** Then there's nothing to do here — the backtest PR in your new sandbox gets reviewed automatically. Skip to the next step.
 
@@ -109,15 +109,6 @@ If a single token can both read the source and write the sandbox, drop `GITHUB_S
 # 3. Run:
 GITHUB_TOKEN=<token> pr-backtest https://github.com/OWNER/REPO/pull/NUMBER --primary
 ```
-
-### 5. Read the review
-
-pr-backtest prints the backtest PR's URL. Open it:
-
-- If Macroscope was connected before the PR opened, its correctness check runs automatically.
-- Otherwise, enable correctness on the destination repo (step 3) and comment `@macroscope-app review` on the PR to start it.
-
-That's a backtest: you replayed a PR as it was opened and had a bot review it. Everything below — the `--full` / `--commit` scope flags, saved tokens, the activity trace, exit codes — is reference for later.
 
 ## Install
 
