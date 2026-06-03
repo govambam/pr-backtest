@@ -68,6 +68,8 @@ Then:
 2. **Where should the backtest PR land?**
    - **A new sandbox repo** — pr-backtest creates a private `OWNER/REPO-backtest` (you can rename it) and only ever *reads* the source. To have Macroscope review it automatically, pre-create that repo and connect Macroscope first (step 3), then type its name here — pr-backtest reuses an existing repo it can write to. Otherwise let it create the repo and trigger the review with a comment afterward.
    - **Original repo** — the branches and backtest PR go into the PR's own repo.
+
+   The sandbox you pick is **remembered for this source repo**, so the next backtest of it reuses the sandbox automatically (no re-picking) — and if you've backtested this repo before, your saved sandbox is offered first. Run `pr-backtest status` to see what's saved.
 3. Confirm the printed plan (it shows `Head:` / `Base:` and the commit count).
 4. pr-backtest prints the new PR's URL.
 
@@ -155,11 +157,14 @@ In an interactive terminal pr-backtest walks an **auth-first** flow before any p
 
 1. **Inherited login offer.** It looks for a GitHub credential the terminal already has (via `git credential` and the `gh` CLI). If it finds one, it offers it by name — *"Use your existing GitHub login? [Y/n]"* (defaults to yes). No token is ever printed; only the `@login` is named.
 
-2. **If you accept the login (YES):** it asks *"Where should the backtest PR land?"* with two options:
+2. **If you accept the login (YES):** it asks *"Where should the backtest PR land?"*:
+   - **Your saved sandbox** *(shown only if you've backtested this source repo before)* — reuse the sandbox you used last time for this source, no re-entry.
    - **Original repo** — write the backtest branches and PR straight into the PR's own repo.
    - **A new sandbox repo** — the tool **auto-creates** a private repo `<owner>/<repo>-backtest` (you can edit the name) to hold the backtests, reading the source read-only. If your login can't create repos in that owner, it offers to land in the original repo instead.
 
-3. **If you decline, or no login is detected (NO / scoped):** it asks *"Land the backtest PR in the original source repo? [Y/n]"*:
+   Whatever sandbox you land in is **remembered for that source repo** (on a successful run) and offered/reused on the next backtest of the same source — regardless of which auth method you use. See [Destination](#destination).
+
+3. **If you decline, or no login is detected (NO / scoped):** if you have a saved sandbox for this source repo it is offered first (reuse it); otherwise it asks *"Land the backtest PR in the original source repo? [Y/n]"*:
    - **Yes** → Primary: branches and PR go in the source repo using one read + write token.
    - **No** → you **pre-create** a private sandbox repo yourself, enter it when prompted, then paste two tokens: a read-only **source** token first, then a read + write **destination** token. The source is only ever read.
 
