@@ -97,6 +97,14 @@ async function capture(
 const PR_URL = "https://github.com/acme/api/pull/123";
 const CREATED_URL = "https://github.com/acme/api/pull/451";
 
+/**
+ * The default PR `created_at` for the base fakes. The base/full-PR fixtures give
+ * their commits NO committer date, so the as-opened picker keeps every commit
+ * (default == full PR) — preserving the pre-existing assertions. The VAL-SCOPE
+ * fixtures below set explicit commit dates relative to this instant.
+ */
+const PR_CREATED_AT = "2026-01-01T00:00:00Z";
+
 const SOURCE_OWNER = "acme";
 const SOURCE_REPO = "api";
 const SANDBOX_OWNER = "octocat";
@@ -169,6 +177,7 @@ function makeDeps(
         headSha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
         baseSha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
         baseRef: "main",
+        createdAt: PR_CREATED_AT,
       };
     },
     listPullRequestCommits: async () => [
@@ -497,6 +506,7 @@ function makeFullPrDeps(pushes: { sha: string; branch: string }[]) {
       // true branch point, and that is what must land on the base branch.
       baseSha: "e".repeat(40),
       baseRef: "main",
+      createdAt: PR_CREATED_AT,
     }),
     listPullRequestCommits: async () => [
       { sha: FULLPR_FIRST, parents: [{ sha: FULLPR_MERGE_BASE }] },
@@ -545,6 +555,177 @@ test("VAL-FULLPR-002: --commit <sha> cuts the head at that commit (all commits u
   assert.equal(headPush?.sha, FULLPR_FIRST, "the cutoff moves the head to the chosen commit");
   assert.equal(basePush?.sha, FULLPR_MERGE_BASE, "base still points at the merge-base");
   assert.ok(headPush?.branch.includes(FULLPR_FIRST.slice(0, 7)));
+});
+
+// --- VAL-SCOPE-001..007: default = the PR as opened; --full; --commit -------
+//
+// One SHARED STRADDLE fixture proves default ≠ --full on IDENTICAL input: c0,c1
+// are committed at/before the PR's created_at; c2 is committed after. So the
+// as-opened head is c1 (k=2, "2 of 3"); the PR head is c2.
+
+const SCOPE_T = "2026-01-01T12:00:00Z";
+const SCOPE_BASE = "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1";
+const STRADDLE_C0 = "c000000" + "0".repeat(33);
+const STRADDLE_C1 = "c111111" + "1".repeat(33);
+const STRADDLE_C2 = "c222222" + "2".repeat(33);
+
+/**
+ * Build deps for a default/full/commit scope run over a chosen commit fixture.
+ * Records pushes ({sha,branch}) and the created PR body so a test can assert the
+ * pushed head, base, and the scope+count string in the body.
+ */
+function makeScopeDeps(
+  commits: Array<{ sha: string; committedDate?: string; parent: string }>,
+  prHeadSha: string,
+  createdAt: string,
+): {
+  deps: Partial<RunBacktestDeps>;
+  pushes: { sha: string; branch: string }[];
+  body: { value: string };
+} {
+  const pushes: { sha: string; branch: string }[] = [];
+  const body = { value: "" };
+  const { deps } = makeDeps({
+    getPullRequest: async () => ({
+      title: "Scope fixture PR",
+      user: "octocat",
+      headSha: prHeadSha,
+      baseSha: "e".repeat(40),
+      baseRef: "main",
+      createdAt,
+    }),
+    listPullRequestCommits: async () =>
+      commits.map((c) => ({
+        sha: c.sha,
+        parents: [{ sha: c.parent }],
+        committedDate: c.committedDate,
+      })),
+    getMergeBase: async () => SCOPE_BASE,
+    pushBranchFromSha: async (_git, sha, branch) => {
+      pushes.push({ sha, branch });
+    },
+    createPullRequest: async (_o, _ow, _r, _h, _b, _title, prBody) => {
+      body.value = prBody;
+      return CREATED_URL;
+    },
+  });
+  return { deps, pushes, body };
+}
+
+/** The shared STRADDLE commit list (oldest→newest). */
+const STRADDLE_COMMITS = [
+  { sha: STRADDLE_C0, committedDate: "2025-12-31T00:00:00Z", parent: SCOPE_BASE },
+  { sha: STRADDLE_C1, committedDate: "2025-12-31T23:00:00Z", parent: STRADDLE_C0 },
+  { sha: STRADDLE_C2, committedDate: "2026-01-02T00:00:00Z", parent: STRADDLE_C1 },
+];
+
+test("VAL-SCOPE-001: default on STRADDLE recreates the PR as opened — head = c1 (not PR head c2), base = merge-base", async () => {
+  const { deps, pushes, body } = makeScopeDeps(STRADDLE_COMMITS, STRADDLE_C2, SCOPE_T);
+  const { exit, stderr } = await run({ deps }); // no flag → default (as opened)
+  assert.equal(exit, 0);
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  const basePush = pushes.find((p) => p.branch.endsWith("-base"));
+  assert.equal(headPush?.sha, STRADDLE_C1, "default head is the as-opened head c1");
+  assert.notEqual(headPush?.sha, STRADDLE_C2, "default head is NOT the PR head c2");
+  assert.equal(basePush?.sha, SCOPE_BASE, "base is the merge-base");
+  assert.match(body.value, /as opened — 2 of 3 commits/, "PR body states the as-opened scope+count");
+  assert.doesNotMatch(stderr, /rebased/, "no rebase note when the as-opened state is determinate");
+});
+
+test("VAL-SCOPE-003: --full on STRADDLE recreates ALL commits — head = PR head c2 (not c1)", async () => {
+  const { deps, pushes, body } = makeScopeDeps(STRADDLE_COMMITS, STRADDLE_C2, SCOPE_T);
+  const { exit } = await run({ deps, full: true });
+  assert.equal(exit, 0);
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  const basePush = pushes.find((p) => p.branch.endsWith("-base"));
+  assert.equal(headPush?.sha, STRADDLE_C2, "--full head is the PR head c2");
+  assert.notEqual(headPush?.sha, STRADDLE_C1, "--full provably differs from the default on identical input");
+  assert.equal(basePush?.sha, SCOPE_BASE, "base is the merge-base");
+  assert.match(body.value, /full PR — 3 commits/, "PR body states the full scope+count");
+});
+
+test("VAL-SCOPE-004: --commit to a non-head commit on STRADDLE → head = that sha (distinct from full + as-opened)", async () => {
+  const { deps, pushes, body } = makeScopeDeps(STRADDLE_COMMITS, STRADDLE_C2, SCOPE_T);
+  // Cut at c1 explicitly (here c1 also happens to be the as-opened head, but the
+  // cutoff PATH and label differ — label "cutoff — 2 commits up to here").
+  const { exit } = await run({ deps, commit: STRADDLE_C1.slice(0, 10) });
+  assert.equal(exit, 0);
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  assert.equal(headPush?.sha, STRADDLE_C1, "--commit moves the head to the chosen sha");
+  assert.match(body.value, /cutoff — 2 commits up to here/, "PR body states the cutoff scope+count");
+});
+
+test("VAL-SCOPE-002: default on ALL_BEFORE → head = PR head AND no rebase note", async () => {
+  const allBefore = [
+    { sha: STRADDLE_C0, committedDate: "2025-12-31T00:00:00Z", parent: SCOPE_BASE },
+    { sha: STRADDLE_C1, committedDate: "2025-12-31T10:00:00Z", parent: STRADDLE_C0 },
+    { sha: STRADDLE_C2, committedDate: "2025-12-31T20:00:00Z", parent: STRADDLE_C1 },
+  ];
+  const { deps, pushes, body } = makeScopeDeps(allBefore, STRADDLE_C2, SCOPE_T);
+  const { exit, stderr } = await run({ deps });
+  assert.equal(exit, 0);
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  assert.equal(headPush?.sha, STRADDLE_C2, "as-opened == full when nothing was added after open");
+  assert.doesNotMatch(stderr, /rebased/, "ALL_BEFORE prints NO fallback note");
+  assert.match(body.value, /as opened — all 3 commits/, "PR body states the all-commits as-opened scope");
+});
+
+test("VAL-SCOPE-006: default on ALL_AFTER (k==0) falls back to the full PR AND prints the rebase note", async () => {
+  const allAfter = [
+    { sha: STRADDLE_C0, committedDate: "2026-01-02T00:00:00Z", parent: SCOPE_BASE },
+    { sha: STRADDLE_C1, committedDate: "2026-01-02T01:00:00Z", parent: STRADDLE_C0 },
+    { sha: STRADDLE_C2, committedDate: "2026-01-02T02:00:00Z", parent: STRADDLE_C1 },
+  ];
+  const { deps, pushes } = makeScopeDeps(allAfter, STRADDLE_C2, SCOPE_T);
+  const { exit, stderr } = await run({ deps });
+  assert.equal(exit, 0);
+  const headPush = pushes.find((p) => p.branch.endsWith("-head"));
+  assert.equal(headPush?.sha, STRADDLE_C2, "indeterminate as-opened falls back to the PR head");
+  // The one-line note names both "rebased" and "--commit".
+  assert.match(stderr, /rebased/, "the fallback note mentions rebased");
+  assert.match(stderr, /--commit/, "the fallback note points at --commit");
+});
+
+test("VAL-SCOPE-005: --full AND --commit together exits 1 BEFORE any network/git, getPullRequest not called", async () => {
+  let networkTouched = false;
+  let getPrCalled = false;
+  const { deps } = makeScopeDeps(STRADDLE_COMMITS, STRADDLE_C2, SCOPE_T);
+  const guarded: Partial<RunBacktestDeps> = {
+    ...deps,
+    resolveDestinationChoice: async (source) => {
+      networkTouched = true;
+      return { owner: source.owner, repo: source.repo, isSandbox: false };
+    },
+    resolveWriteToken: async () => {
+      networkTouched = true;
+      return { token: ONE_TOKEN, source: "classic", login: "x", fromPaste: false };
+    },
+    cloneRepo: async () => {
+      networkTouched = true;
+      return fakeGit;
+    },
+    getPullRequest: async () => {
+      getPrCalled = true;
+      networkTouched = true;
+      return {
+        title: "x",
+        user: "y",
+        headSha: STRADDLE_C2,
+        baseSha: "e".repeat(40),
+        baseRef: "main",
+        createdAt: SCOPE_T,
+      };
+    },
+  };
+  const { exit, stderr } = await run({
+    deps: guarded,
+    full: true,
+    commit: STRADDLE_C1.slice(0, 10),
+  });
+  assert.equal(exit, 1, "both --full and --commit is a bad-args exit 1");
+  assert.match(stderr, /either --full .* or --commit/, "the exact conflict message");
+  assert.equal(networkTouched, false, "no token/destination/git work before the fast-fail");
+  assert.equal(getPrCalled, false, "getPullRequest was not called");
 });
 
 // --- VAL-BRANCH-003: open dedup → exit 4; closed does NOT block -------------
@@ -939,6 +1120,7 @@ function makeRoutingDeps(opts: {
         headSha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
         baseSha: "9f3c1a29f3c1a29f3c1a29f3c1a29f3c1a29f3c1",
         baseRef: "main",
+        createdAt: PR_CREATED_AT,
       };
     },
     listPullRequestCommits: async (octokit) => {
@@ -1161,7 +1343,7 @@ test("VAL-TOKEN-006: a missing WRITE token non-interactively exits 1 naming GITH
     },
     getPullRequest: async () => {
       sideEffects.readPr += 1;
-      return { title: "x", user: "y", headSha: "a".repeat(40), baseSha: "b".repeat(40), baseRef: "main" };
+      return { title: "x", user: "y", headSha: "a".repeat(40), baseSha: "b".repeat(40), baseRef: "main", createdAt: PR_CREATED_AT };
     },
     cloneRepo: async () => {
       sideEffects.clone += 1;

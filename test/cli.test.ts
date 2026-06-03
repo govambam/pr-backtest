@@ -69,6 +69,30 @@ test("--help no longer mentions the removed --fork flag", () => {
   assert.doesNotMatch(stdout, /--fork/);
 });
 
+// --- VAL-SCOPE: --full flag surface + new default wording ---
+
+test("VAL-SCOPE-007: --help advertises --full and the new as-opened default wording", () => {
+  const { status, stdout } = runCli(["--help"]);
+  assert.equal(status, 0, "--help exits 0");
+  assert.match(stdout, /--full/, "--full appears in help");
+  // The description/help reflects the new default (the PR "as opened").
+  assert.match(stdout, /as it was opened|as opened/, "help describes the as-opened default");
+});
+
+test("VAL-SCOPE-005: --full and --commit together exits 1 before any network", () => {
+  const { status, stderr, stdout } = runCli([
+    "--full",
+    "--commit",
+    "a1b2c3d",
+    "https://github.com/acme/api/pull/123",
+  ]);
+  assert.equal(status, 1, "both --full and --commit is a bad-args exit 1");
+  assert.match(stderr, /either --full .* or --commit/, "the message names both flags");
+  // No token error and no success PR URL — the fast-fail fired before any work.
+  assert.doesNotMatch(stderr, /token/i);
+  assert.doesNotMatch(stdout, /https:\/\/github\.com\/.*\/pull\/\d+/);
+});
+
 // --- environment variable documentation (VAL-CLI-001) ---
 
 test("--help documents GITHUB_TOKEN and GITHUB_SOURCE_TOKEN env vars", () => {

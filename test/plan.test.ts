@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { renderPlan, confirmPlan, type PlanInput } from "../src/plan.js";
+import {
+  renderPlan,
+  confirmPlan,
+  headScopeLabel,
+  type PlanInput,
+} from "../src/plan.js";
 
 const input: PlanInput = {
   ownerRepo: "acme/api",
@@ -50,6 +55,40 @@ test("renderPlan has a Plan: header and numbered steps", () => {
   }
   assert.match(out, /backtest-pr123-head/);
   assert.match(out, /backtest-pr123-base/);
+});
+
+// --- VAL-SCOPE-007: the four Head: scope labels (exact strings) -------------
+
+test("VAL-SCOPE-007: headScopeLabel renders the four exact scope strings", () => {
+  // Default, narrowed: "k of M".
+  assert.equal(headScopeLabel("as-opened", 2, 3), "as opened — 2 of 3 commits");
+  // Default, nothing after open: "all N".
+  assert.equal(headScopeLabel("as-opened-all", 3), "as opened — all 3 commits");
+  assert.equal(headScopeLabel("as-opened-all", 1), "as opened — all 1 commit");
+  // --full.
+  assert.equal(headScopeLabel("full", 3), "full PR — 3 commits");
+  assert.equal(headScopeLabel("full", 1), "full PR — 1 commit");
+  // --commit cutoff (unchanged wording).
+  assert.equal(headScopeLabel("cutoff", 2), "cutoff — 2 commits up to here");
+  assert.equal(headScopeLabel("cutoff", 1), "cutoff — 1 commit up to here");
+});
+
+test("VAL-SCOPE-007: the Head: line preserves its shape for every scope label", () => {
+  // The `Head: <shortSha> (<label>)` shape must hold for each scope; only the
+  // label text changes. The OLD default "PR head — <N> commits" must NOT appear.
+  const cases: Array<[string, RegExp]> = [
+    [headScopeLabel("as-opened", 2, 3), /Head:\s+a1b2c3d \(as opened — 2 of 3 commits\)/],
+    [headScopeLabel("as-opened-all", 3), /Head:\s+a1b2c3d \(as opened — all 3 commits\)/],
+    [headScopeLabel("full", 3), /Head:\s+a1b2c3d \(full PR — 3 commits\)/],
+    [headScopeLabel("cutoff", 2), /Head:\s+a1b2c3d \(cutoff — 2 commits up to here\)/],
+  ];
+  for (const [label, re] of cases) {
+    const out = renderPlan({ ...input, headLabel: label });
+    assert.match(out, re);
+    assert.doesNotMatch(out, /PR head — \d+ commits/, "the old default label must not render");
+    // Base line shape stays intact alongside.
+    assert.match(out, /Base:\s+f0e9d8c \(merge-base with main\)/);
+  }
 });
 
 test("confirmPlan resolves true without prompting when yes is set", async () => {

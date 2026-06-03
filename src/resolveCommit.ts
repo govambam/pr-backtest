@@ -9,6 +9,12 @@
 export interface PrCommit {
   sha: string;
   parents: { sha: string }[];
+  /**
+   * The commit's committer date (ISO-8601 string), i.e. `commit.committer.date`.
+   * Optional so existing callers/fixtures that only need `--commit` resolution
+   * stay valid; the as-opened picker treats a missing/empty date as "no date".
+   */
+  committedDate?: string;
 }
 
 /** Lowercase hex, 7..40 chars — a syntactically valid (possibly abbreviated) SHA. */
@@ -75,4 +81,76 @@ export function countCommitsUpToHead(
 ): number {
   const idx = prCommits.findIndex((c) => c.sha === headSha);
   return idx >= 0 ? idx + 1 : prCommits.length;
+}
+
+/**
+ * The result of resolving the "PR as opened" head.
+ *
+ * - `indeterminate: true` — even the first commit is dated AFTER `created_at`
+ *   (k == 0). The as-opened set cannot be recovered (the branch was likely
+ *   rebased/force-pushed after opening). `headSha` falls back to the PR head and
+ *   `count` to the full PR length; the caller should print the rebase note.
+ * - `narrowed: true` — `0 < k < M`: post-open commits were dropped; `headSha` is
+ *   the as-opened head `c[k-1]` and `count` is `k`.
+ * - `narrowed: false`, `indeterminate: false` — every commit is `<= created_at`
+ *   (the common case): `headSha` is the PR head and `count` is the full length.
+ */
+export interface AsOpenedHead {
+  headSha: string;
+  count: number;
+  narrowed: boolean;
+  indeterminate: boolean;
+}
+
+/**
+ * Resolve the backtest head for the DEFAULT (no-flag) scope: the PR "as opened".
+ *
+ * Given the PR's commits in API order (oldest→newest) and the PR's `created_at`
+ * (T), let `k` = the index of the FIRST commit whose committer date is `> T`
+ * (scan oldest→newest; the comparison is INCLUSIVE, so a commit dated exactly
+ * `== T` is in the as-opened set). Then:
+ *
+ *  - No such `k` (every commit `<= T`): head = the PR head; `narrowed = false`.
+ *  - `k == 0` (even the first commit is `> T`): the as-opened set is
+ *    unrecoverable → fall back to the PR head; `indeterminate = true`.
+ *  - `0 < k < M`: head = `c[k-1]`; `narrowed = true`; `count = k`.
+ *
+ * This is a contiguous prefix from the merge-base: the scan stops at the FIRST
+ * commit dated after T, so a stray later commit dated before T does not re-enter
+ * the set. A commit with no/empty committer date is treated as `<= T` (we cannot
+ * prove it was added after open, so it stays in the as-opened set). An empty
+ * commit list returns the PR head, not narrowed.
+ */
+export function resolveAsOpened(
+  prCommits: PrCommit[],
+  createdAt: string,
+  prHeadSha: string,
+): AsOpenedHead {
+  const M = prCommits.length;
+  if (M === 0) {
+    return { headSha: prHeadSha, count: 0, narrowed: false, indeterminate: false };
+  }
+
+  const t = Date.parse(createdAt);
+  // A commit is "after open" only when it has a parseable date strictly greater
+  // than T. A missing/unparseable date counts as "<= T" (kept in the set).
+  const isAfter = (c: PrCommit): boolean => {
+    if (c.committedDate === undefined || c.committedDate === "") return false;
+    const d = Date.parse(c.committedDate);
+    if (Number.isNaN(d) || Number.isNaN(t)) return false;
+    return d > t;
+  };
+
+  const k = prCommits.findIndex(isAfter);
+
+  if (k === -1) {
+    // Every commit is <= T: the as-opened set is the full PR.
+    return { headSha: prHeadSha, count: M, narrowed: false, indeterminate: false };
+  }
+  if (k === 0) {
+    // Even the first commit is after open: unrecoverable, fall back to full PR.
+    return { headSha: prHeadSha, count: M, narrowed: false, indeterminate: true };
+  }
+  // 0 < k < M: the as-opened head is the last commit before the first post-open one.
+  return { headSha: prCommits[k - 1]!.sha, count: k, narrowed: true, indeterminate: false };
 }

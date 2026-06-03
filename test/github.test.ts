@@ -7,7 +7,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { getMergeBase, getPullRequest, verifyRepo } from "../src/github.js";
+import {
+  getMergeBase,
+  getPullRequest,
+  listPullRequestCommits,
+  verifyRepo,
+} from "../src/github.js";
 import type { Octokit } from "@octokit/rest";
 
 /** An HTTP-status-bearing error shaped like an Octokit failure. */
@@ -117,6 +122,7 @@ test("getPullRequest: maps pulls.get data to the PullRequest shape", async () =>
           user: { login: "octocat" },
           head: { sha: "head-sha" },
           base: { sha: "base-sha", ref: "main" },
+          created_at: "2026-01-01T00:00:00Z",
         },
       }),
     },
@@ -128,6 +134,7 @@ test("getPullRequest: maps pulls.get data to the PullRequest shape", async () =>
     headSha: "head-sha",
     baseSha: "base-sha",
     baseRef: "main",
+    createdAt: "2026-01-01T00:00:00Z",
   });
 });
 
@@ -140,6 +147,7 @@ test("getPullRequest: null user falls back to empty string", async () => {
           user: null,
           head: { sha: "h" },
           base: { sha: "b", ref: "main" },
+          created_at: "2026-02-02T08:30:00Z",
         },
       }),
     },
@@ -151,5 +159,55 @@ test("getPullRequest: null user falls back to empty string", async () => {
     headSha: "h",
     baseSha: "b",
     baseRef: "main",
+    createdAt: "2026-02-02T08:30:00Z",
   });
+});
+
+// --- VAL-SCOPE-008: github wrappers surface created_at + committer dates -----
+
+test("VAL-SCOPE-008: getPullRequest surfaces the PR's created_at as createdAt", async () => {
+  const octokit = {
+    pulls: {
+      get: async () => ({
+        data: {
+          title: "Dated PR",
+          user: { login: "octocat" },
+          head: { sha: "h" },
+          base: { sha: "b", ref: "main" },
+          created_at: "2026-03-03T09:00:00Z",
+        },
+      }),
+    },
+  } as unknown as Octokit;
+  const result = await getPullRequest(octokit, "me", "repo", 11);
+  assert.equal(result.createdAt, "2026-03-03T09:00:00Z");
+});
+
+test("VAL-SCOPE-008: listPullRequestCommits surfaces each commit's committer date", async () => {
+  // The wrapper paginates; the fake `paginate` just invokes the passed endpoint
+  // and returns its data array, mirroring octokit.paginate's contract closely
+  // enough for the mapping under test.
+  const raw = [
+    {
+      sha: "aaaaaaa1",
+      parents: [{ sha: "p0" }],
+      commit: { committer: { date: "2026-01-01T00:00:00Z" } },
+    },
+    {
+      sha: "bbbbbbb2",
+      parents: [{ sha: "aaaaaaa1" }],
+      commit: { committer: { date: "2026-01-02T00:00:00Z" } },
+    },
+  ];
+  const octokit = {
+    paginate: async () => raw,
+    pulls: { listCommits: () => {} },
+  } as unknown as Octokit;
+
+  const result = await listPullRequestCommits(octokit, "me", "repo", 12);
+  assert.equal(result[0]!.committedDate, "2026-01-01T00:00:00Z");
+  assert.equal(result[1]!.committedDate, "2026-01-02T00:00:00Z");
+  // The sha + parents mapping is unchanged.
+  assert.equal(result[0]!.sha, "aaaaaaa1");
+  assert.deepEqual(result[0]!.parents, [{ sha: "p0" }]);
 });
