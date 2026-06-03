@@ -59,18 +59,24 @@ test("renderPlan has a Plan: header and numbered steps", () => {
 
 // --- VAL-SCOPE-007: the four Head: scope labels (exact strings) -------------
 
-test("VAL-SCOPE-007: headScopeLabel renders the four exact scope strings", () => {
+test("VAL-SCOPE-007: headScopeLabel renders the exact scope strings", () => {
   // Default, narrowed: "k of M".
   assert.equal(headScopeLabel("as-opened", 2, 3), "as opened — 2 of 3 commits");
-  // Default, nothing after open: "all N".
-  assert.equal(headScopeLabel("as-opened-all", 3), "as opened — all 3 commits");
-  assert.equal(headScopeLabel("as-opened-all", 1), "as opened — all 1 commit");
+  // Default, nothing after open: "all N" (total is ignored for this form).
+  assert.equal(headScopeLabel("as-opened-all", 3, 3), "as opened — all 3 commits");
+  assert.equal(headScopeLabel("as-opened-all", 1, 1), "as opened — all 1 commit");
+  // Default, indeterminate (branch rebased after open): falls back to the full PR
+  // but says so, so the plan/body show it was a fallback.
+  assert.equal(
+    headScopeLabel("as-opened-fallback", 3, 3),
+    "as opened unavailable — full PR — 3 commits",
+  );
   // --full.
-  assert.equal(headScopeLabel("full", 3), "full PR — 3 commits");
-  assert.equal(headScopeLabel("full", 1), "full PR — 1 commit");
-  // --commit cutoff (unchanged wording).
-  assert.equal(headScopeLabel("cutoff", 2), "cutoff — 2 commits up to here");
-  assert.equal(headScopeLabel("cutoff", 1), "cutoff — 1 commit up to here");
+  assert.equal(headScopeLabel("full", 3, 3), "full PR — 3 commits");
+  assert.equal(headScopeLabel("full", 1, 1), "full PR — 1 commit");
+  // --commit cutoff (unchanged wording; total is ignored for this form).
+  assert.equal(headScopeLabel("cutoff", 2, 3), "cutoff — 2 commits up to here");
+  assert.equal(headScopeLabel("cutoff", 1, 3), "cutoff — 1 commit up to here");
 });
 
 test("VAL-SCOPE-007: the Head: line preserves its shape for every scope label", () => {
@@ -78,9 +84,10 @@ test("VAL-SCOPE-007: the Head: line preserves its shape for every scope label", 
   // label text changes. The OLD default "PR head — <N> commits" must NOT appear.
   const cases: Array<[string, RegExp]> = [
     [headScopeLabel("as-opened", 2, 3), /Head:\s+a1b2c3d \(as opened — 2 of 3 commits\)/],
-    [headScopeLabel("as-opened-all", 3), /Head:\s+a1b2c3d \(as opened — all 3 commits\)/],
-    [headScopeLabel("full", 3), /Head:\s+a1b2c3d \(full PR — 3 commits\)/],
-    [headScopeLabel("cutoff", 2), /Head:\s+a1b2c3d \(cutoff — 2 commits up to here\)/],
+    [headScopeLabel("as-opened-all", 3, 3), /Head:\s+a1b2c3d \(as opened — all 3 commits\)/],
+    [headScopeLabel("as-opened-fallback", 3, 3), /Head:\s+a1b2c3d \(as opened unavailable — full PR — 3 commits\)/],
+    [headScopeLabel("full", 3, 3), /Head:\s+a1b2c3d \(full PR — 3 commits\)/],
+    [headScopeLabel("cutoff", 2, 3), /Head:\s+a1b2c3d \(cutoff — 2 commits up to here\)/],
   ];
   for (const [label, re] of cases) {
     const out = renderPlan({ ...input, headLabel: label });

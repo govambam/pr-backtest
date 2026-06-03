@@ -19,44 +19,35 @@ const commits: PrCommit[] = [
   { sha: C, parents: [{ sha: B }] },
 ];
 
-// The PR head is the last commit in the list.
-const HEAD = C;
-
-test("resolveHead(undefined): returns the PR head SHA (recreate the whole PR)", () => {
-  // Even though HEAD is the last commit and not the first, the full-PR default
-  // returns prHeadSha verbatim.
-  assert.equal(resolveHead(undefined, commits, HEAD), HEAD);
-});
-
 test("resolveHead: exact full SHA match returns that commit's sha", () => {
-  assert.equal(resolveHead(A, commits, HEAD), A);
-  assert.equal(resolveHead(B, commits, HEAD), B);
+  assert.equal(resolveHead(A, commits), A);
+  assert.equal(resolveHead(B, commits), B);
 });
 
 test("resolveHead: abbreviated (>=7 char) prefix matches the full sha", () => {
-  assert.equal(resolveHead(B.slice(0, 8), commits, HEAD), B);
+  assert.equal(resolveHead(B.slice(0, 8), commits), B);
 });
 
 test("resolveHead: case-insensitive matching", () => {
-  assert.equal(resolveHead(A.toUpperCase(), commits, HEAD), A);
+  assert.equal(resolveHead(A.toUpperCase(), commits), A);
 });
 
 test("resolveHead: malformed values throw /Invalid --commit value/", () => {
   // not hex at all
-  assert.throws(() => resolveHead("xyz", commits, HEAD), /Invalid --commit value/);
+  assert.throws(() => resolveHead("xyz", commits), /Invalid --commit value/);
   // too short to be a usable abbreviation
-  assert.throws(() => resolveHead("abc", commits, HEAD), /Invalid --commit value/);
+  assert.throws(() => resolveHead("abc", commits), /Invalid --commit value/);
   // hex but too short (< 7 chars)
-  assert.throws(() => resolveHead("abc12", commits, HEAD), /Invalid --commit value/);
+  assert.throws(() => resolveHead("abc12", commits), /Invalid --commit value/);
   // 7+ chars but contains non-hex characters
-  assert.throws(() => resolveHead("zzzzzzz", commits, HEAD), /Invalid --commit value/);
+  assert.throws(() => resolveHead("zzzzzzz", commits), /Invalid --commit value/);
   // a revision expression, not a SHA
-  assert.throws(() => resolveHead("HEAD~1", commits, HEAD), /Invalid --commit value/);
+  assert.throws(() => resolveHead("HEAD~1", commits), /Invalid --commit value/);
 });
 
 test("resolveHead: a well-formed SHA matching no PR commit throws /does not match any commit/", () => {
   assert.throws(
-    () => resolveHead("deadbeef", commits, HEAD),
+    () => resolveHead("deadbeef", commits),
     /does not match any commit/,
   );
 });
@@ -71,7 +62,7 @@ test("resolveHead: an abbreviated prefix matching 2+ commits throws /ambiguous/"
     { sha: dup2, parents: [{ sha: dup1 }] },
   ];
   assert.throws(
-    () => resolveHead(PREFIX, ambiguous, dup2),
+    () => resolveHead(PREFIX, ambiguous),
     /ambiguous/,
   );
 });

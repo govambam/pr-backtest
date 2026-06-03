@@ -12,7 +12,8 @@ export interface PrCommit {
   /**
    * The commit's committer date (ISO-8601 string), i.e. `commit.committer.date`.
    * Optional so existing callers/fixtures that only need `--commit` resolution
-   * stay valid; the as-opened picker treats a missing/empty date as "no date".
+   * stay valid; the as-opened picker treats a missing/empty/unparseable date as
+   * "no date" (kept in the as-opened set).
    */
   committedDate?: string;
 }
@@ -21,28 +22,18 @@ export interface PrCommit {
 const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
 
 /**
- * Resolve the head (cutoff) commit for the backtest.
+ * Resolve the `--commit <sha>` cutoff head.
  *
- * - Omitted (`commitOption` undefined): the PR's head SHA — recreate the whole
- *   PR. Combined with the merge-base used as the base, the backtest spans every
- *   commit GitHub shows in the PR.
- * - A full or >=7-char abbreviated SHA: matched (by prefix) against the PR's
- *   commits; the match becomes the cutoff head, so the backtest spans every
- *   commit from the PR base up to and including it. Pass an earlier commit's SHA
- *   to reproduce the PR as it stood at that point (e.g. before later fix-ups).
+ * Matches a full or >=7-char abbreviated SHA (by prefix) against the PR's
+ * commits; the match becomes the cutoff head, so the backtest spans every commit
+ * from the PR base up to and including it. Pass an earlier commit's SHA to
+ * reproduce the PR as it stood at that point (e.g. before later fix-ups). The
+ * default (no `--commit`) and `--full` are handled by the caller, not here.
  *
  * Throws a clear Error for malformed input or a SHA that is not one of the PR's
  * commits.
  */
-export function resolveHead(
-  commitOption: string | undefined,
-  prCommits: PrCommit[],
-  prHeadSha: string,
-): string {
-  if (commitOption === undefined) {
-    return prHeadSha;
-  }
-
+export function resolveHead(commitOption: string, prCommits: PrCommit[]): string {
   const normalized = commitOption.trim().toLowerCase();
   if (!SHA_PATTERN.test(normalized)) {
     throw new Error(

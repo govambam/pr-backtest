@@ -644,15 +644,17 @@ test("VAL-SCOPE-003: --full on STRADDLE recreates ALL commits — head = PR head
   assert.match(body.value, /full PR — 3 commits/, "PR body states the full scope+count");
 });
 
-test("VAL-SCOPE-004: --commit to a non-head commit on STRADDLE → head = that sha (distinct from full + as-opened)", async () => {
+test("VAL-SCOPE-004: --commit on STRADDLE → head = that sha, distinct from BOTH the as-opened head and the PR head", async () => {
   const { deps, pushes, body } = makeScopeDeps(STRADDLE_COMMITS, STRADDLE_C2, SCOPE_T);
-  // Cut at c1 explicitly (here c1 also happens to be the as-opened head, but the
-  // cutoff PATH and label differ — label "cutoff — 2 commits up to here").
-  const { exit } = await run({ deps, commit: STRADDLE_C1.slice(0, 10) });
+  // Cut at c0 — distinct from the as-opened head (c1) AND the PR head (c2), so the
+  // cutoff path is proven by the resolved head SHA, not merely the label.
+  const { exit } = await run({ deps, commit: STRADDLE_C0.slice(0, 10) });
   assert.equal(exit, 0);
   const headPush = pushes.find((p) => p.branch.endsWith("-head"));
-  assert.equal(headPush?.sha, STRADDLE_C1, "--commit moves the head to the chosen sha");
-  assert.match(body.value, /cutoff — 2 commits up to here/, "PR body states the cutoff scope+count");
+  assert.equal(headPush?.sha, STRADDLE_C0, "--commit moves the head to the chosen sha (c0)");
+  assert.notEqual(headPush?.sha, STRADDLE_C1, "distinct from the as-opened head");
+  assert.notEqual(headPush?.sha, STRADDLE_C2, "distinct from the PR head");
+  assert.match(body.value, /cutoff — 1 commit up to here/, "PR body states the cutoff scope+count");
 });
 
 test("VAL-SCOPE-002: default on ALL_BEFORE → head = PR head AND no rebase note", async () => {
@@ -676,7 +678,7 @@ test("VAL-SCOPE-006: default on ALL_AFTER (k==0) falls back to the full PR AND p
     { sha: STRADDLE_C1, committedDate: "2026-01-02T01:00:00Z", parent: STRADDLE_C0 },
     { sha: STRADDLE_C2, committedDate: "2026-01-02T02:00:00Z", parent: STRADDLE_C1 },
   ];
-  const { deps, pushes } = makeScopeDeps(allAfter, STRADDLE_C2, SCOPE_T);
+  const { deps, pushes, body } = makeScopeDeps(allAfter, STRADDLE_C2, SCOPE_T);
   const { exit, stderr } = await run({ deps });
   assert.equal(exit, 0);
   const headPush = pushes.find((p) => p.branch.endsWith("-head"));
@@ -684,6 +686,11 @@ test("VAL-SCOPE-006: default on ALL_AFTER (k==0) falls back to the full PR AND p
   // The one-line note names both "rebased" and "--commit".
   assert.match(stderr, /rebased/, "the fallback note mentions rebased");
   assert.match(stderr, /--commit/, "the fallback note points at --commit");
+  // It is a non-fatal warning (yellow "!"), NOT a fatal error ("✗") — the run succeeds.
+  assert.match(stderr, /!\s.*rebased/, "the fallback note uses the warn (!) style, not the error (✗) style");
+  assert.doesNotMatch(stderr, /✗.*rebased/, "the fallback note must not use the fatal error glyph");
+  // The fallback is surfaced in the PR body so it is visible at confirm time / in CI.
+  assert.match(body.value, /as opened unavailable — full PR — 3 commits/, "PR body states the fallback scope");
 });
 
 test("VAL-SCOPE-005: --full AND --commit together exits 1 BEFORE any network/git, getPullRequest not called", async () => {

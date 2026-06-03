@@ -78,7 +78,7 @@ import {
   type AuthFirstResolvers,
 } from "./authFirst.js";
 import type { InheritedCredential } from "./inheritedAuth.js";
-import { error, info, setVerbose, success, traceOp } from "./log.js";
+import { error, info, setVerbose, success, traceOp, warn } from "./log.js";
 import { parseUrl } from "./parseUrl.js";
 import { confirmPlan, headScopeLabel, type HeadScope, type PlanInput } from "./plan.js";
 import {
@@ -645,7 +645,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   if (typeof opts.commit === "string") {
     // --commit cutoff (unchanged path).
     try {
-      targetSha = resolveHead(opts.commit, prCommits, prHeadSha);
+      targetSha = resolveHead(opts.commit, prCommits);
     } catch (err) {
       error(messageOf(err));
       process.exit(EXIT.BAD_ARGS);
@@ -664,10 +664,13 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
     commitCount = asOpened.count;
     if (asOpened.indeterminate) {
       // k == 0: the as-opened set is unrecoverable (branch likely rebased after
-      // opening). Fall back to the full PR AND print the one-line note (its text
-      // names both "rebased" and "--commit").
-      headScope = "full";
-      error(
+      // opening). Fall back to the full PR. This is a non-fatal heads-up, not a
+      // failure, so it uses warn() (the run still succeeds); the distinct
+      // `as-opened-fallback` scope then surfaces the fallback on the plan's Head
+      // line and in the PR body, right where the user confirms. The note text
+      // names both "rebased" and "--commit".
+      headScope = "as-opened-fallback";
+      warn(
         "Couldn't determine the as-opened state (the branch was likely rebased " +
           "after opening); recreating the full PR. Pass --commit <sha> to pin a cutoff.",
       );

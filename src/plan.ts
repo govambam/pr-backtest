@@ -57,31 +57,42 @@ export interface PlanInput {
 }
 
 /** The chosen backtest scope, driving the `Head:` label wording. */
-export type HeadScope = "as-opened" | "as-opened-all" | "full" | "cutoff";
+export type HeadScope =
+  | "as-opened"
+  | "as-opened-all"
+  | "as-opened-fallback"
+  | "full"
+  | "cutoff";
 
 /**
  * Build the exact `Head:` label string for each scope (the parenthetical after
  * the short SHA on the plan's `Head:` line and the scope phrase in the PR body):
  *
- *  - `as-opened`     → `as opened — <k> of <total> commits`  (default, narrowed)
- *  - `as-opened-all` → `as opened — all <count> commits`     (default, nothing after open)
- *  - `full`          → `full PR — <count> commits`           (--full)
- *  - `cutoff`        → `cutoff — <count> commits up to here` (--commit)
+ *  - `as-opened`          → `as opened — <k> of <total> commits`  (default, narrowed)
+ *  - `as-opened-all`      → `as opened — all <count> commits`     (default, nothing after open)
+ *  - `as-opened-fallback` → `as opened unavailable — full PR — <count> commits`
+ *                           (default, but the branch was rebased after opening, so
+ *                           the as-opened set is unrecoverable — see the warning)
+ *  - `full`               → `full PR — <count> commits`           (--full)
+ *  - `cutoff`             → `cutoff — <count> commits up to here` (--commit)
  *
- * `count` is the included-commit count; `total` is the PR's full commit count
- * (only used by the narrowed `as-opened` form, for the "k of M" wording).
+ * `count` is the included-commit count; `total` is the PR's full commit count,
+ * used only by the narrowed `as-opened` form for the "k of M" wording (the caller
+ * always has it on hand, so it is required rather than defaulted).
  */
 export function headScopeLabel(
   scope: HeadScope,
   count: number,
-  total?: number,
+  total: number,
 ): string {
   const plural = (n: number) => `${n} commit${n === 1 ? "" : "s"}`;
   switch (scope) {
     case "as-opened":
-      return `as opened — ${count} of ${total ?? count} commits`;
+      return `as opened — ${count} of ${total} commits`;
     case "as-opened-all":
       return `as opened — all ${plural(count)}`;
+    case "as-opened-fallback":
+      return `as opened unavailable — full PR — ${plural(count)}`;
     case "full":
       return `full PR — ${plural(count)}`;
     case "cutoff":
