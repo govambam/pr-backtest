@@ -41,10 +41,12 @@ The **destination** is the sandbox in the sandbox paths, and the PR's own repo i
 
 Macroscope reviews the backtest PR in whatever repo it lands in, so connect it to your **destination** repo. Connect it *before* you run so the correctness check fires automatically when the PR opens.
 
+> **Already have correctness checks on by default for all repos?** Then there's nothing to do here — the backtest PR in your new sandbox gets reviewed automatically. Skip to the next step.
+
 1. If you haven't already, install the Macroscope GitHub app and give it access to your destination repo.
 2. Enable **correctness checks** on that repo in your Macroscope settings: `https://app.macroscope.com/<your-org>/settings#Repos` (for example `https://app.macroscope.com/govambam/settings#Repos`).
 
-**Order matters for a sandbox:** the repo must exist before Macroscope can see it. So **create the sandbox first → enable correctness on it → then run pr-backtest.** If you let pr-backtest auto-create the sandbox (Path A), the repo won't exist until after the run; enable correctness on the new repo afterward and trigger the review by hand.
+**Order matters for a sandbox** (only if you enable correctness per-repo rather than by default): the repo must exist before Macroscope can see it. So **create the sandbox first → enable correctness on it → then run pr-backtest.** If you let pr-backtest auto-create the sandbox (Path A), the repo won't exist until after the run; enable correctness on the new repo afterward and trigger the review by hand.
 
 **To trigger a review at any time**, comment on the backtest PR:
 
