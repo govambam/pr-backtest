@@ -4,7 +4,7 @@ Recreate a GitHub pull request — all of its commits — so a PR-review bot can
 
 **Why:** backtest a PR-review bot against history. Take a PR whose outcome you already know, replay it at its original commit, and see how your bot does on a "brand new" PR.
 
-**Security:** pr-backtest only ever talks to GitHub — `api.github.com` and `github.com`, nothing else. No telemetry, no analytics, no third-party calls. Your token stays on your machine (read from `GITHUB_TOKEN` / `GITHUB_SOURCE_TOKEN`, or saved locally with `0600` permissions) and is never sent anywhere except GitHub.
+**Security:** pr-backtest only ever talks to GitHub — `api.github.com` and `github.com`, nothing else. No telemetry, no analytics, no third-party calls. Your token stays on your machine (read from `GITHUB_TOKEN` / `GITHUB_SOURCE_TOKEN`, or saved locally with `0600` permissions) and is never sent anywhere except GitHub. See [Security](#security) for the data flow and where each guarantee is enforced.
 
 ## Requirements
 
@@ -12,9 +12,9 @@ Node.js `>=18` and a `git` binary on your `PATH` (the tool shells out to `git` f
 
 ## Quickstart
 
-Recreate your first PR end to end and have a review bot review the result, in a few minutes.
+Recreate your first PR end to end and have a review bot review the result.
 
-The shape is always the same: pr-backtest reads a PR from its **source** repo and writes a fresh "backtest" PR into a **destination** repo. That destination is where the review bot (Macroscope) reviews it. The two decisions you make are *how to authenticate* and *which repo is the destination*.
+pr-backtest reads a PR from its **source** repo and writes a fresh "backtest" PR into a **destination** repo, where the review bot (Macroscope) reviews it. You make two decisions: *how to authenticate* and *which repo is the destination*.
 
 ### 1. Install the CLI
 
@@ -117,7 +117,7 @@ pr-backtest prints the backtest PR's URL. Open it:
 - If Macroscope was connected before the PR opened, its correctness check runs automatically.
 - Otherwise, enable correctness on the destination repo (step 3) and comment `@macroscope-app review` on the PR to start it.
 
-That's a backtest: you replayed a PR as it was opened and had a bot review it. Everything below — the `--full` / `--commit` scope flags, saved tokens, the activity trace, exit codes — is detail you can reach for later.
+That's a backtest: you replayed a PR as it was opened and had a bot review it. Everything below — the `--full` / `--commit` scope flags, saved tokens, the activity trace, exit codes — is reference for later.
 
 ## Install
 
@@ -151,7 +151,7 @@ npm run reinstall  # rebuild dist/ and reinstall globally from the current branc
 
 There is no separate setup step. **In a terminal the tool asks about your GitHub login first**, then asks where the backtest PR lands — see [Guided setup](#guided-setup-auth-first) below. Only then does it resolve the exact token(s) the chosen destination needs. The source is only ever *read* for a Sandbox; see [Destination](#destination).
 
-A backtest needs exactly two capabilities: **read** the source and **write** the destination. One token may provide both, or you may split them across two; the tool detects which you gave rather than predicting it.
+A backtest needs exactly two capabilities: **read** the source and **write** the destination. One token may provide both, or you may split them across two; the tool detects which you gave.
 
 ### Guided setup (auth-first)
 
@@ -177,7 +177,7 @@ Non-interactive runs and runs with a destination flag skip the prompts entirely 
 - **`GITHUB_TOKEN`** — the destination/write token. It also reads the source when it covers the source too (the single-PAT case). For a **Primary** destination it is the one read + write token. Set it with `export GITHUB_TOKEN=github_pat_...` (or prefix a single run: `GITHUB_TOKEN=github_pat_... pr-backtest <pr-url>`). Non-interactive runs require it.
 - **`GITHUB_SOURCE_TOKEN`** — optional read-only source token. When set, it reads the source and `GITHUB_TOKEN` only writes the destination. This is the quarantined two-token setup (the source token can be scoped read-only, so a write to the source is impossible by scope).
 
-Per-capability resolution order (first match that validates wins; no owner logic, no source-visibility probe):
+Per-capability resolution order (first match that validates wins):
 
 - **Write/destination token:** `GITHUB_TOKEN` env → saved `destinationTokens[<dest-owner>/<dest-repo>]` → interactive paste.
 - **Read/source token:** `GITHUB_SOURCE_TOKEN` env → saved `sourceTokens[<src-owner>]` → the resolved write token *iff* it can read the source → interactive paste.
@@ -310,7 +310,7 @@ pr-backtest always **reads** the PR from its own repo (the source). The branches
 
 **Read-only guarantee:** the repository a PR is read from is **never written to** unless you explicitly choose it as the destination (Primary). A sandbox destination only ever reads the source.
 
-When you run without a destination flag in a terminal, pr-backtest first offers your existing GitHub login and then asks where the simulated PR should go — see [Guided setup](#guided-setup-auth-first) for the full auth-first flow. After a successful run, the sandbox you chose is remembered for that source repo and offered (and reused) on the next backtest of the same source. Non-interactively (or with a flag) it resolves without prompting. The tool never classifies the destination owner (no org-vs-personal branching).
+When you run without a destination flag in a terminal, pr-backtest first offers your existing GitHub login and then asks where the simulated PR should go — see [Guided setup](#guided-setup-auth-first) for the full auth-first flow. After a successful run, the sandbox you chose is remembered for that source repo and offered (and reused) on the next backtest of the same source. Non-interactively (or with a flag) it resolves without prompting.
 
 ### Flags
 
@@ -346,7 +346,7 @@ To recreate the backtest, **close that PR and re-run** — a *closed* prior back
 
 ## Live activity trace
 
-pr-backtest shows you what it is doing as it does it. The whole point is trust: you can watch that it only ever **reads** the source PR, only **writes** the destination you chose, and only ever talks to `api.github.com`.
+pr-backtest shows each operation as it runs, so you can watch that it only ever **reads** the source PR, only **writes** the destination you chose, and only talks to `api.github.com`.
 
 **Default view.** Each operation prints a friendly `✓` completion marker as it finishes (a sandbox run, which also shows the `source` remote step):
 
@@ -383,11 +383,11 @@ $ git push origin a1b2c3d:refs/heads/backtest-pr123-a1b2c3d-head  635ms
 → POST  /repos/octocat/pr-backtest-sandbox/pulls  201  301ms
 ```
 
-Each git command shows the real argv (the token never appears — see below); each API line shows method, path, status, and elapsed time. Elapsed times are always rendered in whole milliseconds.
+Each git command shows the real argv (the token never appears — see below); each API line shows method, path, status, and elapsed time.
 
 `--verbose` is off by default and has no short alias (`-v` is `--version`).
 
-**The displayed git commands are the real ones, and they carry no token.** pr-backtest hands your token to git through `GIT_ASKPASS` (an environment-based credential helper) — never in the remote URL and never on the command line. So the command shown is exactly the command run, and it is safe to share: the clone URL contains only the non-secret `x-access-token@` username, with no token in it. As a final safety net every trace line — API or git, default or verbose — is passed through a redaction filter that scrubs your token even if some upstream string ever carried it.
+**The displayed git commands are real, and they carry no token.** The `x-access-token@` in the clone URL is only a non-secret username — the token reaches git through `GIT_ASKPASS`, never the URL or the command line, so the output is safe to share. See [Security](#security) for how that (and the redaction net behind it) is enforced.
 
 ## Recommendations
 
@@ -401,18 +401,53 @@ Each git command shows the real argv (the token never appears — see below); ea
 
 A token like this can't reach your other repos or touch org settings. For `--create-sandbox`, the token also needs permission to create repositories for the destination owner.
 
-**A Sandbox destination needs read on the source and write on the destination.** A backtest needs two capabilities — **read** the source (to read the PR and fetch its commits) and **write** the destination (Contents + Pull requests). For a **Primary** destination those are the same repo, so one token with read + write on the source is all you need. For a **Sandbox** destination they may be the same token or two different tokens; pr-backtest detects which you gave instead of predicting it.
+**A Sandbox destination needs read on the source and write on the destination** — read to fetch the PR and its commits, write (Contents + Pull requests) to push the branches and open the PR. For a **Primary** destination those are the same repo, so one token with read + write on it is all you need.
 
-**One token or two — detected, not predicted.** If a single token can both read the source and write the destination, pr-backtest uses it and never asks for a second. It detects this with the write-permission check it already runs (`repos.get(dest).permissions.push`). When you instead supply two tokens, the split is the trust boundary:
+For a **Sandbox**, one token works if it can both read the source and write the destination; otherwise use two — a read-only `GITHUB_SOURCE_TOKEN` for the source and a write `GITHUB_TOKEN` for the destination (`--create-sandbox` also needs repo-creation rights on the destination owner). When two distinct tokens are used, the confirmation plan tags the source line `(read-only token)` and the `Into:` line `(write token)`. Scoping the source token read-only is defense in depth — see [Security](#security).
 
-- a **read-only** source token — reads the PR and fetches its commits, and needs **no write access anywhere**, and
-- a **write** destination token — Contents + Pull requests on the destination (plus repo-creation rights for `--create-sandbox`).
+## Security
 
-The source is *only ever read* with the source token, and the write token *only ever writes* the destination. When the run uses two distinct tokens, the confirmation plan notes it: the source line is tagged `(read-only token)` and the `Into:` line `(write token)`. A one-token run renders with no token tags.
+pr-backtest contacts only GitHub — `api.github.com` for the API, `github.com` for git over HTTPS — and persists nothing but an optional `0600` token file. It carries two capabilities: read on the source repo, write on the destination. The data flow, guarantees, and their enforcement points follow.
 
-To run a `--sandbox <owner/repo>` non-interactively with a quarantined source token, set **`GITHUB_SOURCE_TOKEN`** to the read-only source token; `GITHUB_TOKEN` is then used to write the destination. If `GITHUB_TOKEN` alone can both read the source and write the destination, that one token suffices and `GITHUB_SOURCE_TOKEN` is unnecessary. In a terminal, pr-backtest instead prompts for any missing token in-flow with the exact scope it needs.
+### Data flow and trust boundary
 
-**The read-only source token is defense in depth.** Scoping the source token read-only makes a write to the source *impossible by scope*, beyond the code's read-only-source invariant — useful when testing a private company PR in a sandbox you control. A sandbox under your **personal account** is the lowest-fuss path (you can always create repos there) but lands the source's code under your account — an egress consideration to weigh; a sandbox **inside the org** keeps the code within the org boundary but needs org repo-creation rights. Pick whichever matches your compliance posture.
+```
+   ┌──────────────────┐                              ┌──────────────────────┐
+   │   SOURCE repo    │                              │   DESTINATION repo   │
+   │  (never written) │                              │ (sandbox or source)  │
+   └────────┬─────────┘                              └───────────▲──────────┘
+            │  read: PR + commits   write: branches + open PR     │
+            │  (read token)              (write token)            │
+            │                                                     │
+            │         ┌───────────────────────────────────┐      │
+            └────────▶│            pr-backtest            │───────┘
+                      │                                   │
+                      │  • token → GIT_ASKPASS env        │
+                      │    (never in a URL or argv)       │
+                      │  • redact() scrubs every line     │
+                      │  • only host: api.github.com      │
+                      └─────────────────┬─────────────────┘
+                                        │
+                                        ▼
+                            stdout: the new PR's URL only
+```
+
+The **trust boundary is the pair of tokens**: a read capability over the source and a write capability over the destination. When one token can do both, pr-backtest uses it and never asks for a second; when you supply two, the source token *only ever reads the source* and the write token *only ever writes the destination*. The split is detected from GitHub's own permission data, not predicted (see [Recommendations](#recommendations)).
+
+### Guarantees — and where each is enforced
+
+| Guarantee | Where it's enforced |
+|---|---|
+| **The token is never written to any log, stdout, or stderr.** Every line out of the process passes through a redaction net that replaces the registered token with `***`. | `registerSecret()` / `redact()` in `src/log.ts` — `write()` redacts before every `process.stderr.write`. |
+| **The token is never embedded in a git remote URL** (which git persists to disk and which leaks via `ps` / `/proc/<pid>/cmdline`). It reaches git only through a `GIT_ASKPASS` helper that reads it from an owner-readable env var. | `authedRemoteUrl()` (URL carries only the `x-access-token` username) and the `GIT_ASKPASS` helper in `src/git.ts`. |
+| **The tool only ever contacts `api.github.com`.** Every resolved API request asserts its host; any other host is a hard error, not a silent skip. No telemetry, analytics, or third-party calls exist in the code. | `GITHUB_API_HOST` host check in `src/github.ts` (throws on mismatch). |
+| **The read token never performs a write; the write token never touches the source.** Orchestration resolves the destination first (local, no network), then the write token, then the read token — reusing one token only when it can do both. | Orchestration order documented and implemented in `src/index.ts` (`runBacktest`). |
+| **Your `main` is never touched.** The backtest is recreated on fresh, named branches from the merge-base to the head; nothing is force-pushed over existing refs. | Branch planning in `src/plan.ts`; push logic in `src/git.ts`. |
+| **A saved token lives only on your machine, `0600`.** Tokens read from the environment are never persisted; tokens you opt to save are written owner-only. | Config read/write in `src/config.ts`. |
+
+### Defense in depth
+
+Scoping the **source token read-only** makes a write to the source *impossible by scope* — a second layer beneath the code's read-only-source invariant, useful when backtesting a PR in a repo you don't own. A sandbox under your **personal account** needs no extra rights but lands the source's code under your account (an egress consideration); a sandbox **inside the org** keeps the code within the org boundary but needs org repo-creation rights. See [Recommendations](#recommendations) for the exact token scopes.
 
 ## Exit codes
 
