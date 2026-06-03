@@ -410,7 +410,7 @@ pr-backtest contacts only GitHub — `api.github.com` for the API, `github.com` 
             │  read: PR + commits   write: branches + open PR     │
             │  (read token)              (write token)            │
             │                                                     │
-            │         ┌───────────────────────────────────┐      │
+            │         ┌───────────────────────────────────┐       │
             └────────▶│            pr-backtest            │───────┘
                       │                                   │
                       │  • token → GIT_ASKPASS env        │
