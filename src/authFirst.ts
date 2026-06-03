@@ -70,16 +70,11 @@ export const SANDBOX_NAME_SUFFIX = "-backtest";
  * orchestrator passes it to the write/read resolvers so the inherited token is
  * used without a paste. On the scoped fork it is null, so the resolvers go
  * env → saved → paste.
- *
- * `offerRemember` mirrors {@link DestinationChoice}: true only for an
- * interactively-entered Sandbox that is not already the saved default. The
- * orchestrator makes the offer on the SUCCESS path only.
  */
 export interface AuthFirstChoice {
   owner: string;
   repo: string;
   isSandbox: boolean;
-  offerRemember: boolean;
   /** The accepted inherited credential (YES fork), or null (scoped fork). */
   inheritedCredential: InheritedCredential | null;
   /**
@@ -103,10 +98,16 @@ export interface AuthFirstChoice {
 export type AuthOfferPrompt = (login: string) => Promise<boolean>;
 
 /**
- * Render the inherited (YES) fork's two-option destination question and return
- * the choice: `"primary"` (Original repo) or `"sandbox"` (a new sandbox repo).
+ * Render the inherited (YES) fork's destination question and return the choice.
+ *
+ * When `saved` is undefined the question has EXACTLY two options — `"primary"`
+ * (Original repo) or `"sandbox"` (a new sandbox repo) — byte-identical to before.
+ * When a saved sandbox exists for this source it is offered as a THIRD option
+ * (`"saved"`), alongside the existing two.
  */
-export type LandingChoicePrompt = () => Promise<"primary" | "sandbox">;
+export type LandingChoicePrompt = (
+  saved: RepoRef | undefined,
+) => Promise<"primary" | "saved" | "sandbox">;
 
 /**
  * Prompt for the new-sandbox repository NAME on the inherited fork, pre-filled
@@ -118,9 +119,21 @@ export type SandboxNamePrompt = (defaultName: string) => Promise<string>;
 
 /**
  * Render the scoped (NO) fork's "Land the backtest PR in the original source
- * repo? [Y/n]" question and return the answer.
+ * repo? [Y/n]" question and return the answer. Used ONLY when there is NO saved
+ * sandbox for this source (byte-identical to before); when one exists the
+ * three-option {@link ScopedLandingPrompt} is used instead.
  */
 export type LandInSourcePrompt = () => Promise<boolean>;
+
+/**
+ * Render the scoped (NO) fork's THREE-option landing question, used ONLY when a
+ * saved sandbox exists for this source. Returns `"primary"` (the source repo),
+ * `"saved"` (reuse the saved sandbox), or `"sandbox"` (a different, pre-created
+ * repo entered via the slug prompt + scoped pastes).
+ */
+export type ScopedLandingPrompt = (
+  saved: RepoRef,
+) => Promise<"primary" | "saved" | "sandbox">;
 
 /**
  * A guided masked paste prompt for the scoped Sandbox fork, returning the trimmed
@@ -149,16 +162,28 @@ export interface AuthFirstResolvers {
    * and editable. Invoked AFTER the warn-upfront line.
    */
   promptSandboxName: SandboxNamePrompt;
-  /** The scoped-fork "Land in the original source repo? [Y/n]" prompt. */
+  /**
+   * The scoped-fork "Land in the original source repo? [Y/n]" prompt. Used ONLY
+   * when there is NO saved sandbox for this source.
+   */
   promptLandInSource: LandInSourcePrompt;
+  /**
+   * The scoped-fork THREE-option landing prompt, used ONLY when a saved sandbox
+   * exists for this source (offers Primary / the saved sandbox / a different repo).
+   */
+  promptScopedLanding: ScopedLandingPrompt;
   /** The scoped-fork `owner/repo`-or-URL prompt (re-prompts on parse error). */
   promptForSlug: SlugPrompt;
   /** Scoped-sandbox READ-only source paste (reused from the resolver copy). */
   getSandboxReadPaste: ScopedPastePrompt;
   /** Scoped-sandbox READ+WRITE destination paste (reused from the resolver copy). */
   getSandboxWritePaste: ScopedPastePrompt;
-  /** The saved default destination, if any (for the offer-remember check). */
-  getDefaultDestination: () => { owner: string; repo: string } | undefined;
+  /**
+   * The saved sandbox for THIS source repo, if any (from
+   * `readConfig().sandboxes[sourceKey(source)]`). When present it is offered as a
+   * landing option on BOTH forks (N7).
+   */
+  getSavedSandbox: () => RepoRef | undefined;
 }
 
 /**
@@ -211,13 +236,28 @@ async function resolveInheritedFork(
   inherited: InheritedCredential,
   resolvers: AuthFirstResolvers,
 ): Promise<AuthFirstChoice> {
-  const choice = await resolvers.promptLanding();
+  // N7: when a saved sandbox exists for this source it is offered as a third
+  // landing option. With none, the prompt is byte-identical (two options).
+  const saved = resolvers.getSavedSandbox();
+  const choice = await resolvers.promptLanding(saved);
   if (choice === "primary") {
     return {
       owner: source.owner,
       repo: source.repo,
       isSandbox: false,
-      offerRemember: false,
+      inheritedCredential: inherited,
+      scopedSandboxPastes: null,
+    };
+  }
+  if (choice === "saved") {
+    if (!saved) {
+      // The prompt only ever returns "saved" when a saved sandbox was passed in.
+      throw new Error("Saved-sandbox landing chosen without a saved sandbox.");
+    }
+    return {
+      owner: saved.owner,
+      repo: saved.repo,
+      isSandbox: !sameRepo(saved, source),
       inheritedCredential: inherited,
       scopedSandboxPastes: null,
     };
@@ -231,13 +271,10 @@ async function resolveInheritedFork(
   info(sandboxCreateWarning(source, defaultName));
   const name = await resolvers.promptSandboxName(defaultName);
   const dest: RepoRef = { owner: source.owner, repo: name };
-  const saved = resolvers.getDefaultDestination();
-  const offerRemember = !(saved && sameRepo(saved, dest));
   return {
     owner: dest.owner,
     repo: dest.repo,
     isSandbox: true,
-    offerRemember,
     inheritedCredential: inherited,
     scopedSandboxPastes: null,
   };
@@ -271,19 +308,62 @@ async function resolveScopedFork(
   source: RepoRef,
   resolvers: AuthFirstResolvers,
 ): Promise<AuthFirstChoice> {
+  // N7: when a saved sandbox exists for this source, offer it as a landing
+  // option via the three-option prompt. With none, the prompt and the entire
+  // fork are byte-identical to before (the two-option land-in-source confirm).
+  const saved = resolvers.getSavedSandbox();
+  if (saved) {
+    const choice = await resolvers.promptScopedLanding(saved);
+    if (choice === "primary") {
+      return {
+        owner: source.owner,
+        repo: source.repo,
+        isSandbox: false,
+        inheritedCredential: null,
+        scopedSandboxPastes: null,
+      };
+    }
+    if (choice === "saved") {
+      // Reuse the saved sandbox. The write/read resolvers go env → saved-key →
+      // paste for it; no eager pastes are collected here.
+      return {
+        owner: saved.owner,
+        repo: saved.repo,
+        isSandbox: !sameRepo(saved, source),
+        inheritedCredential: null,
+        scopedSandboxPastes: null,
+      };
+    }
+    // "a different repo" → fall through to the guided slug + scoped-paste flow.
+    return resolveScopedSandbox(source, resolvers);
+  }
+
   const landInSource = await resolvers.promptLandInSource();
   if (landInSource) {
     return {
       owner: source.owner,
       repo: source.repo,
       isSandbox: false,
-      offerRemember: false,
       inheritedCredential: null,
       scopedSandboxPastes: null,
     };
   }
 
-  // NO → guidance FIRST, then the slug prompt (re-prompting on a parse error),
+  return resolveScopedSandbox(source, resolvers);
+}
+
+/**
+ * The scoped guided-sandbox sub-flow (the "no, a different repo" path): emit the
+ * create-it-yourself GUIDANCE, then the `owner/repo`-or-URL slug prompt, then the
+ * two scoped pastes in USER-FACING order (READ-only source FIRST, then
+ * READ+WRITE destination). Shared by the no-saved-sandbox path and the
+ * three-option "a different repo" choice.
+ */
+async function resolveScopedSandbox(
+  source: RepoRef,
+  resolvers: AuthFirstResolvers,
+): Promise<AuthFirstChoice> {
+  // guidance FIRST, then the slug prompt (re-prompting on a parse error),
   // then the two scoped pastes in USER-FACING order: the READ-only
   // source token FIRST, then the READ+WRITE destination token. Collecting them
   // here (rather than letting the resolvers prompt) is what makes the user see
@@ -301,15 +381,10 @@ async function resolveScopedFork(
   const isSandbox = !sameRepo(dest, source);
   const read = await resolvers.getSandboxReadPaste(source);
   const write = await resolvers.getSandboxWritePaste(dest);
-  const saved = resolvers.getDefaultDestination();
-  // Flag remember-as-default unless it already equals the saved default or it
-  // collapses to the source (not a sandbox). The orchestrator offers on success.
-  const offerRemember = isSandbox && !(saved && sameRepo(saved, dest));
   return {
     owner: dest.owner,
     repo: dest.repo,
     isSandbox,
-    offerRemember,
     inheritedCredential: null,
     scopedSandboxPastes: { read, write },
   };
@@ -357,36 +432,88 @@ export function makeAuthOfferPrompt(
 }
 
 /**
- * Build the real inherited-fork "Where should the backtest PR land?" prompt with
- * EXACTLY two options. Returns `"primary"` (Original repo) or `"sandbox"` (a new
- * sandbox repo). Off-TTY it returns `"primary"` (the source repo) rather than
- * hanging.
+ * Build the real inherited-fork "Where should the backtest PR land?" prompt.
+ *
+ * With NO saved sandbox it offers EXACTLY two options — `"primary"` (Original
+ * repo) or `"sandbox"` (a new sandbox repo) — byte-identical to before. When a
+ * saved sandbox exists for this source it is offered as a THIRD option
+ * (`"saved"`, reuse the saved sandbox) between them. Off-TTY it returns
+ * `"primary"` (the source repo) rather than hanging.
  */
 export function makeLandingChoicePrompt(
   source: RepoRef,
   options: AuthOfferPromptOptions = {},
 ): LandingChoicePrompt {
   const isTTY = options.isTTY ?? (() => process.stdin.isTTY === true);
-  return async (): Promise<"primary" | "sandbox"> => {
+  return async (
+    saved: RepoRef | undefined,
+  ): Promise<"primary" | "saved" | "sandbox"> => {
     if (!isTTY()) {
       return "primary";
     }
-    const { index } = await prompts({
+    const choices: { title: string; value: "primary" | "saved" | "sandbox" }[] = [
+      {
+        title: `Original repo — ${source.owner}/${source.repo}   (writes the backtest PR here)`,
+        value: "primary",
+      },
+    ];
+    if (saved) {
+      choices.push({
+        title: `Saved sandbox — ${saved.owner}/${saved.repo}   (reuse it)`,
+        value: "saved",
+      });
+    }
+    choices.push({
+      title: "A new sandbox repo                          (the source is only ever read)",
+      value: "sandbox",
+    });
+    const { value } = await prompts({
       type: "select",
-      name: "index",
+      name: "value",
+      message: "Where should the backtest PR land?",
+      choices,
+    });
+    return value === "saved" || value === "sandbox" ? value : "primary";
+  };
+}
+
+/**
+ * Build the real scoped-fork THREE-option landing prompt, used ONLY when a saved
+ * sandbox exists for this source. Offers Primary (the source repo), the saved
+ * sandbox (reuse), or a different repo (the guided slug + scoped-paste flow).
+ * Off-TTY it returns `"primary"` rather than hanging.
+ */
+export function makeScopedLandingPrompt(
+  source: RepoRef,
+  options: AuthOfferPromptOptions = {},
+): ScopedLandingPrompt {
+  const isTTY = options.isTTY ?? (() => process.stdin.isTTY === true);
+  return async (
+    saved: RepoRef,
+  ): Promise<"primary" | "saved" | "sandbox"> => {
+    if (!isTTY()) {
+      return "primary";
+    }
+    const { value } = await prompts({
+      type: "select",
+      name: "value",
       message: "Where should the backtest PR land?",
       choices: [
         {
           title: `Original repo — ${source.owner}/${source.repo}   (writes the backtest PR here)`,
-          value: 0,
+          value: "primary",
         },
         {
-          title: "A new sandbox repo                          (the source is only ever read)",
-          value: 1,
+          title: `Saved sandbox — ${saved.owner}/${saved.repo}   (reuse it)`,
+          value: "saved",
+        },
+        {
+          title: "A different repo                            (the source is only ever read)",
+          value: "sandbox",
         },
       ],
     });
-    return index === 1 ? "sandbox" : "primary";
+    return value === "saved" || value === "sandbox" ? value : "primary";
   };
 }
 

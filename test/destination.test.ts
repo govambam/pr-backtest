@@ -1,8 +1,5 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import prompts from "prompts";
 
 import {
@@ -12,7 +9,6 @@ import {
   makeConfirmCreate,
   makeMenuPrompt,
   makeSlugPrompt,
-  makeRememberPrompt,
   sameRepo,
   DestinationArgsError,
   DestinationApiError,
@@ -23,10 +19,8 @@ import {
   type RepoRef,
   type VerifyOrCreateOptions,
 } from "../src/destination.js";
-import { readConfig } from "../src/config.js";
 import type { Octokit } from "@octokit/rest";
 import type { RepoVerification } from "../src/github.js";
-import type { SavedDestination } from "../src/config.js";
 
 const SOURCE: RepoRef = { owner: "acme", repo: "api" };
 
@@ -44,7 +38,7 @@ interface ChoiceHarness {
 
 function makeChoiceHarness(opts: {
   flags?: DestinationFlags;
-  saved?: SavedDestination;
+  saved?: RepoRef;
   isTTY?: boolean;
   /** Which row the menu seam returns, by kind (first match). */
   pick?: MenuRow["kind"];
@@ -55,8 +49,8 @@ function makeChoiceHarness(opts: {
   let promptCount = 0;
   const resolvers: ChoiceResolvers = {
     getFlags: () => opts.flags ?? {},
-    getDefaultDestination: () => {
-      // The choice flow legitimately reads the saved default to build the menu;
+    getSavedSandbox: () => {
+      // The choice flow legitimately reads the saved sandbox to build the menu;
       // this is config, NOT an authenticated-login lookup.
       return opts.saved;
     },
@@ -88,7 +82,6 @@ test("--primary → source, isSandbox false, no prompt (VAL-DEST-002)", async ()
     owner: "acme",
     repo: "api",
     isSandbox: false,
-    offerRemember: false,
   });
   assert.equal(h.promptCount(), 0);
 });
@@ -101,7 +94,6 @@ test("--sandbox <owner/repo> → that repo, isSandbox true (VAL-DEST-004)", asyn
     owner: "me",
     repo: "sandbox",
     isSandbox: true,
-    offerRemember: false,
   });
   assert.equal(h.promptCount(), 0);
 });
@@ -113,7 +105,6 @@ test("--sandbox equal to source resolves like --primary (isSandbox false)", asyn
     owner: "acme",
     repo: "api",
     isSandbox: false,
-    offerRemember: false,
   });
 });
 
@@ -124,7 +115,6 @@ test("--sandbox with different case than source resolves like --primary", async 
     owner: "acme",
     repo: "api",
     isSandbox: false,
-    offerRemember: false,
   });
 });
 
@@ -181,7 +171,6 @@ test("non-interactive, no flag, saved default → returns saved (isSandbox by sa
       owner: "me",
       repo: "sandbox",
       isSandbox: true,
-      offerRemember: false,
     });
     assert.equal(h.promptCount(), 0);
   }
@@ -242,7 +231,7 @@ test("VAL-DEST-001: saved default → Primary, saved-sandbox, a-different-repo (
     ["primary", "saved-sandbox", "sandbox"],
   );
   assert.match(rows[1].title, /Sandbox — me\/sandbox/);
-  assert.match(rows[1].title, /saved default/);
+  assert.match(rows[1].title, /saved for this repo/);
   assert.match(rows[2].title, /Sandbox — a different repo/);
 });
 
@@ -253,23 +242,20 @@ test("VAL-DEST-002: choosing Primary from the menu → source, isSandbox false",
     owner: "acme",
     repo: "api",
     isSandbox: false,
-    offerRemember: false,
   });
 });
 
-test("interactive: choosing the saved-sandbox row returns that repo, no remember re-offer", async () => {
+test("interactive: choosing the saved-sandbox row returns that repo", async () => {
   const h = makeChoiceHarness({
     isTTY: true,
     saved: { owner: "me", repo: "sandbox" },
     pick: "saved-sandbox",
   });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  // VAL-DEST-005: already the saved default → never re-offered (offerRemember false).
   assert.deepEqual(result, {
     owner: "me",
     repo: "sandbox",
     isSandbox: true,
-    offerRemember: false,
   });
 });
 
@@ -284,37 +270,51 @@ test("VAL-DEST-003: choosing Sandbox prompts for a slug and returns it", async (
     owner: "you",
     repo: "other",
     isSandbox: true,
-    offerRemember: true,
   });
 });
 
-test("VAL-DEST-005: non-default Sandbox choice flags offerRemember (offer deferred to success)", async () => {
+// --- VAL-MEM-004: resolveDestinationChoice non-TTY/no-flag uses sandboxes[source] ---
+
+test("VAL-MEM-004: non-TTY, no flag, a saved sandbox → resolves to it (isSandbox true)", async () => {
   const h = makeChoiceHarness({
-    isTTY: true,
-    pick: "sandbox",
-    slug: { owner: "you", repo: "other" },
+    isTTY: false,
+    saved: { owner: "me", repo: "saved-sb" },
   });
   const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.equal(result.isSandbox, true);
-  // The choice flow no longer persists anything — it only flags the offer; the
-  // orchestrator makes it on the success path.
-  assert.equal(result.offerRemember, true);
+  assert.deepEqual(result, {
+    owner: "me",
+    repo: "saved-sb",
+    isSandbox: true,
+  });
+  assert.equal(h.promptCount(), 0, "no prompt on the non-TTY path");
 });
 
-test("VAL-DEST-005: Sandbox slug equal to the saved default does NOT flag offerRemember", async () => {
-  const h = makeChoiceHarness({
-    isTTY: true,
-    saved: { owner: "me", repo: "sandbox" },
-    pick: "sandbox", // "a different repo" row
-    slug: { owner: "Me", repo: "Sandbox" }, // same as saved, mixed case
-  });
-  const result = await resolveDestinationChoice(SOURCE, h.resolvers);
-  assert.equal(result.isSandbox, true);
-  assert.equal(
-    result.offerRemember,
-    false,
-    "equal-to-default → no remember offer",
+test("VAL-MEM-004: non-TTY, no flag, NO saved sandbox → bad-args (unchanged)", async () => {
+  const h = makeChoiceHarness({ isTTY: false });
+  await assert.rejects(
+    () => resolveDestinationChoice(SOURCE, h.resolvers),
+    (err: unknown) => err instanceof DestinationArgsError,
   );
+});
+
+test("VAL-MEM-004: --sandbox flag overrides the saved sandbox on the non-TTY path", async () => {
+  const h = makeChoiceHarness({
+    isTTY: false,
+    saved: { owner: "me", repo: "saved-sb" },
+    flags: { sandbox: "you/flag-sb" },
+  });
+  const result = await resolveDestinationChoice(SOURCE, h.resolvers);
+  assert.deepEqual(result, { owner: "you", repo: "flag-sb", isSandbox: true });
+});
+
+test("VAL-MEM-004: --primary flag overrides the saved sandbox on the non-TTY path", async () => {
+  const h = makeChoiceHarness({
+    isTTY: false,
+    saved: { owner: "me", repo: "saved-sb" },
+    flags: { primary: true },
+  });
+  const result = await resolveDestinationChoice(SOURCE, h.resolvers);
+  assert.deepEqual(result, { owner: "acme", repo: "api", isSandbox: false });
 });
 
 // --- VAL-DEST-006: the choice flow never invokes a login/getAuthenticated seam ---
@@ -343,12 +343,6 @@ test("VAL-DEST-006: the choice flow performs no owner classification / login loo
 // Stage 1 interactive seams — the real prompts-backed implementations
 // =====================================================================
 
-/** Point config at a fresh temp dir via XDG_CONFIG_HOME and return it. */
-function useTempConfigHome(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prbt-dest-"));
-  process.env.XDG_CONFIG_HOME = dir;
-  return dir;
-}
 
 const NO_SAVED_ROWS: MenuRow[] = [
   { kind: "primary", title: "Primary — acme/api", repo: { owner: "acme", repo: "api" } },
@@ -419,25 +413,6 @@ test("makeSlugPrompt: aborting throws bad-args", async () => {
     () => slugPrompt(),
     (err: unknown) => err instanceof DestinationArgsError,
   );
-});
-
-test("VAL-DEST-005: makeRememberPrompt persists on yes via mergeConfig", async () => {
-  useTempConfigHome();
-  prompts.inject([true]);
-  const rememberPrompt = makeRememberPrompt();
-  await rememberPrompt({ owner: "you", repo: "other" });
-  const cfg = readConfig();
-  assert.deepEqual(cfg?.defaultDestination, { owner: "you", repo: "other" });
-});
-
-test("makeRememberPrompt: declining does not persist", async () => {
-  const persisted: SavedDestination[] = [];
-  prompts.inject([false]);
-  const rememberPrompt = makeRememberPrompt({
-    saveDefault: (d) => persisted.push(d),
-  });
-  await rememberPrompt({ owner: "you", repo: "other" });
-  assert.equal(persisted.length, 0);
 });
 
 test("VAL-CORR-005: makeConfirmCreate memoizes the answer per owner/repo (asked ≤ 1 time)", async () => {

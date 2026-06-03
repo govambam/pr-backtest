@@ -26,7 +26,7 @@ import type { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 import type { RepoVerification } from "./github.js";
 import { createPrivateRepo, isStatus } from "./github.js";
-import { mergeConfig, type RepoRef, type SavedDestination } from "./config.js";
+import type { RepoRef } from "./config.js";
 import { parseRepoSlug } from "./parseUrl.js";
 import { info, warn } from "./log.js";
 
@@ -50,18 +50,11 @@ export interface DestinationFlags {
  * `isSandbox` is true ONLY when the destination differs from the source. A
  * `--sandbox` value equal to the source resolves with `isSandbox` false,
  * equivalent to `--primary`.
- *
- * `offerRemember` is true only for an interactively-entered Sandbox that is not
- * already the saved default. The choice flow no longer persists anything; the
- * orchestrator carries this flag to the SUCCESS path and offers remember-as-
- * default only after the run actually succeeds, so a destination that later
- * fails to verify/create is never saved as the default.
  */
 export interface DestinationChoice {
   owner: string;
   repo: string;
   isSandbox: boolean;
-  offerRemember: boolean;
 }
 
 /**
@@ -152,9 +145,6 @@ export type MenuPrompt = (rows: MenuRow[]) => Promise<MenuRow>;
 /** Prompt for a free-form `owner/repo` or URL (re-prompt on parse error lives here). */
 export type SlugPrompt = () => Promise<RepoRef>;
 
-/** Offer to remember a non-default sandbox as the saved default. */
-export type RememberPrompt = (dest: RepoRef) => Promise<void>;
-
 /**
  * A single interactive menu row. `kind` drives the post-select sub-flow; `title`
  * is what the user sees; `repo` is the concrete destination for the rows that
@@ -170,8 +160,13 @@ export interface MenuRow {
 export interface ChoiceResolvers {
   /** Parsed destination flags. */
   getFlags: () => DestinationFlags;
-  /** The saved default destination, if any (from `readConfig().defaultDestination`). */
-  getDefaultDestination: () => SavedDestination | undefined;
+  /**
+   * The saved sandbox for THIS source repo, if any (from
+   * `readConfig().sandboxes[sourceKey(source)]`). On the non-TTY/no-flag path it
+   * is the default destination; in the interactive menu it is offered as a
+   * saved-sandbox row.
+   */
+  getSavedSandbox: () => RepoRef | undefined;
   /** Whether stdin is a TTY (drives the interactive vs non-interactive split). */
   getIsTTY: () => boolean;
   /** Interactive menu seam (TTY only). */
@@ -219,9 +214,9 @@ function parseSandboxSlug(value: string): RepoRef {
  *    (a value equal to the source behaves like `--primary`). BOTH flags → throw
  *    {@link DestinationArgsError} (exit 1). `--create-sandbox` is carried forward
  *    by the caller into stage 2; it does not affect the choice.
- *  - No flag + TTY → the interactive menu (Primary + Sandbox, plus a saved-default
- *    Sandbox row when one exists).
- *  - No flag + no TTY → the saved default if present; else throw
+ *  - No flag + TTY → the interactive menu (Primary + Sandbox, plus a saved-sandbox
+ *    row when one exists for this source).
+ *  - No flag + no TTY → the saved sandbox for this source if present; else throw
  *    {@link DestinationArgsError} naming `--primary`/`--sandbox` (exit 1).
  *
  * @param source the source PR's `owner/repo` (read-only; never written here).
@@ -246,7 +241,6 @@ export async function resolveDestinationChoice(
       owner: source.owner,
       repo: source.repo,
       isSandbox: false,
-      offerRemember: false,
     };
   }
 
@@ -258,33 +252,29 @@ export async function resolveDestinationChoice(
         owner: source.owner,
         repo: source.repo,
         isSandbox: false,
-        offerRemember: false,
       };
     }
-    // A flag-supplied sandbox is explicit each run; never offer to remember it.
     return {
       owner: slug.owner,
       repo: slug.repo,
       isSandbox: true,
-      offerRemember: false,
     };
   }
 
-  // --- No flag: interactive (TTY) vs saved-default (non-TTY) ---
+  // --- No flag: interactive (TTY) vs saved-sandbox (non-TTY) ---
 
   if (resolvers.getIsTTY()) {
     return resolveInteractiveChoice(source, resolvers);
   }
 
-  // Non-interactive, no flag: use the saved default if present.
-  const saved = resolvers.getDefaultDestination();
+  // Non-interactive, no flag: use the saved sandbox for THIS source if present
+  // (N7 — the destination default, keyed by the source repo).
+  const saved = resolvers.getSavedSandbox();
   if (saved) {
-    // Already the saved default → nothing to re-remember.
     return {
       owner: saved.owner,
       repo: saved.repo,
       isSandbox: !sameRepo(saved, source),
-      offerRemember: false,
     };
   }
 
@@ -299,24 +289,23 @@ export async function resolveDestinationChoice(
 
 /**
  * The interactive menu (TTY, no flag). Builds the Primary + Sandbox rows
- * (plus a saved-default Sandbox row when a default exists), presents them via
+ * (plus a saved-sandbox row when one exists for this source), presents them via
  * the injected seam, then runs the per-row sub-flow. NO network, NO token.
  *
  * Menu shapes:
- *  - No saved default: two rows — Primary, Sandbox (a separate repo you control).
- *  - Saved default: three rows — Primary, Sandbox <saved> (saved default),
- *    Sandbox (a different repo).
+ *  - No saved sandbox: two rows — Primary, Sandbox (a separate repo you control).
+ *  - Saved sandbox: three rows — Primary, Sandbox <saved> (saved sandbox for this
+ *    source), Sandbox (a different repo).
  *
  * Choosing the no-default Sandbox row or the "a different repo" row prompts for
- * an `owner/repo`-or-URL (re-prompting on a parse error) and flags it for a
- * remember-as-default offer — which the orchestrator makes only AFTER the run
- * succeeds (so an unverifiable destination is never saved).
+ * an `owner/repo`-or-URL (re-prompting on a parse error). Nothing is persisted
+ * here; the saved sandbox is written by the orchestrator on the SUCCESS path.
  */
 async function resolveInteractiveChoice(
   source: RepoRef,
   resolvers: ChoiceResolvers,
 ): Promise<DestinationChoice> {
-  const saved = resolvers.getDefaultDestination();
+  const saved = resolvers.getSavedSandbox();
 
   const rows: MenuRow[] = [
     {
@@ -328,7 +317,7 @@ async function resolveInteractiveChoice(
   if (saved) {
     rows.push({
       kind: "saved-sandbox",
-      title: `Sandbox — ${saved.owner}/${saved.repo}      (saved default)`,
+      title: `Sandbox — ${saved.owner}/${saved.repo}      (saved for this repo)`,
       repo: { owner: saved.owner, repo: saved.repo },
     });
     rows.push({
@@ -349,7 +338,6 @@ async function resolveInteractiveChoice(
       owner: source.owner,
       repo: source.repo,
       isSandbox: false,
-      offerRemember: false,
     };
   }
 
@@ -357,30 +345,22 @@ async function resolveInteractiveChoice(
     const dest = chosen.repo;
     if (!dest) {
       throw new DestinationArgsError(
-        "Saved-default sandbox row carried no repository.",
+        "Saved-sandbox row carried no repository.",
       );
     }
-    // Already the saved default → never re-offer remember.
     return {
       owner: dest.owner,
       repo: dest.repo,
       isSandbox: !sameRepo(dest, source),
-      offerRemember: false,
     };
   }
 
   // "sandbox" → prompt for a free-form owner/repo or URL (re-prompt on parse error).
   const dest = await resolvers.promptForSlug();
-  const isSandbox = !sameRepo(dest, source);
-  // Flag remember-as-default unless it already equals the saved default or it
-  // collapses to the source (not a sandbox). The orchestrator makes the offer on
-  // the SUCCESS path only — nothing is persisted here.
-  const offerRemember = isSandbox && !(saved && sameRepo(saved, dest));
   return {
     owner: dest.owner,
     repo: dest.repo,
-    isSandbox,
-    offerRemember,
+    isSandbox: !sameRepo(dest, source),
   };
 }
 
@@ -446,39 +426,6 @@ export function makeSlugPrompt(): SlugPrompt {
         warn(err instanceof Error ? err.message : "Invalid owner/repo.");
         // Loop to re-prompt.
       }
-    }
-  };
-}
-
-/** Options for {@link makeRememberPrompt} (primarily for testing/injection). */
-export interface RememberPromptOptions {
-  /** Persist a chosen default destination. Defaults to {@link mergeConfig}. */
-  saveDefault?: (dest: SavedDestination) => void;
-}
-
-/**
- * Build the real remember-as-default prompt. The orchestrator invokes it on the
- * SUCCESS path only (after the PR is opened) for a non-default Sandbox run, so a
- * destination that fails to verify/create is never saved. Asks once and, on yes,
- * persists via the injected `saveDefault` (defaulting to {@link mergeConfig}).
- */
-export function makeRememberPrompt(
-  options: RememberPromptOptions = {},
-): RememberPrompt {
-  const saveDefault =
-    options.saveDefault ??
-    ((dest: SavedDestination) =>
-      mergeConfig({ defaultDestination: dest }));
-  return async (dest: RepoRef): Promise<void> => {
-    const { remember } = await prompts({
-      type: "confirm",
-      name: "remember",
-      message: `Remember ${dest.owner}/${dest.repo} as your default sandbox?`,
-      initial: true,
-    });
-    if (remember === true) {
-      saveDefault({ owner: dest.owner, repo: dest.repo });
-      info(`Saved ${dest.owner}/${dest.repo} as your default sandbox.`);
     }
   };
 }

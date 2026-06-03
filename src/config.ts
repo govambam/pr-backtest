@@ -32,12 +32,6 @@ export interface RepoRef {
   repo: string;
 }
 
-/** A saved write destination (the repo branches/PRs are pushed to). */
-export interface SavedDestination {
-  owner: string;
-  repo: string;
-}
-
 /**
  * A named token slot: a `token` secret plus its `username` (@login) and the
  * `source` it was obtained from. Like the rest of the config, the `token` is a
@@ -50,22 +44,50 @@ export interface TokenSlot {
 }
 
 /**
- * Persisted config shape.
+ * Persisted config shape (per-repo memory).
  *
- * Two named token slots plus an optional saved destination, each independent
- * and optional:
- * - `sourceToken` — the token used to read the source PR/repo.
- * - `destinationToken` — the token used to write branches/PRs to the
- *   destination. In a single-PAT run both slots may hold the same value.
- * - `defaultDestination` — the saved write destination.
+ * Three independent, optional keyed maps:
+ * - `sandboxes` — the sandbox to reuse for a given SOURCE repo, keyed by the
+ *   lowercased `"<srcOwner>/<srcRepo>"`.
+ * - `destinationTokens` — the write token per DESTINATION repo, keyed by the
+ *   lowercased `"<destOwner>/<destRepo>"`.
+ * - `sourceTokens` — the read token per SOURCE owner, keyed by the lowercased
+ *   `"<srcOwner>"`.
  *
- * Any field may be absent (a config may hold only a `defaultDestination` when a
- * token came from the environment and was never persisted).
+ * All keys are lowercased at BOTH write and lookup (GitHub owner/repo are
+ * case-insensitive). Use {@link sandboxKey}/{@link destKey}/{@link sourceKey} so
+ * callers store and read consistently.
+ *
+ * The OLD single-slot `defaultDestination` field is NOT part of this schema.
+ * `readConfig` still reads the raw on-disk `defaultDestination` (the parsed
+ * object, not a `Config` field) purely for the N6 migration salvage — see
+ * {@link readConfig} — but it is never surfaced on the in-memory `Config` and is
+ * never written back.
  */
 export interface Config {
-  sourceToken?: TokenSlot;
-  destinationToken?: TokenSlot;
-  defaultDestination?: SavedDestination;
+  sandboxes?: { [srcOwnerRepo: string]: RepoRef };
+  destinationTokens?: { [destOwnerRepo: string]: TokenSlot };
+  sourceTokens?: { [srcOwner: string]: TokenSlot };
+}
+
+// ---------------------------------------------------------------------------
+// Key normalization (N1). All map keys are lowercased at BOTH write and lookup.
+// Saving under `Foo/Bar` and resolving `foo/bar` is the SAME entry.
+// ---------------------------------------------------------------------------
+
+/** Key for the `sandboxes` map: lowercased `"<owner>/<repo>"`. */
+export function sandboxKey(owner: string, repo: string): string {
+  return `${owner}/${repo}`.toLowerCase();
+}
+
+/** Key for the `destinationTokens` map: lowercased `"<owner>/<repo>"`. */
+export function destKey(owner: string, repo: string): string {
+  return `${owner}/${repo}`.toLowerCase();
+}
+
+/** Key for the `sourceTokens` map: lowercased `"<owner>"`. */
+export function sourceKey(owner: string): string {
+  return owner.toLowerCase();
 }
 
 /**
@@ -105,8 +127,8 @@ function isTokenSlot(value: unknown): value is TokenSlot {
   );
 }
 
-/** A `defaultDestination` shaped as `{ owner: string, repo: string }`. */
-function isSavedDestination(value: unknown): value is SavedDestination {
+/** A `{ owner: string, repo: string }` repo coordinate. */
+function isRepoRef(value: unknown): value is RepoRef {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -115,13 +137,57 @@ function isSavedDestination(value: unknown): value is SavedDestination {
   );
 }
 
+/** A non-empty string usable as a map key. */
+function isKey(value: string): boolean {
+  return value.length > 0;
+}
+
+/**
+ * Read a keyed map field, validating every entry independently: a malformed key
+ * or value is warned about and DROPPED, while valid siblings survive. Keys are
+ * normalized to lowercase (N1). Returns undefined when no valid entry survives.
+ */
+function readKeyedMap<V>(
+  raw: unknown,
+  fieldName: string,
+  filePath: string,
+  isValue: (v: unknown) => v is V,
+): { [key: string]: V } | undefined {
+  if (typeof raw !== "object" || raw === null) {
+    warn(`Config file ${filePath} ${fieldName} is malformed; ignoring it.`);
+    return undefined;
+  }
+  const out: { [key: string]: V } = {};
+  let any = false;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isKey(key) || !isValue(value)) {
+      warn(
+        `Config file ${filePath} ${fieldName}["${key}"] is malformed; ignoring it.`,
+      );
+      continue;
+    }
+    out[key.toLowerCase()] = value;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+
 /**
  * Read the config file. Returns null if it does not exist, is unparseable, or
  * holds no recognized field.
  *
- * Each slot is validated independently: a present-but-malformed slot (or
- * `defaultDestination`) is warned about and dropped, while valid sibling fields
- * in the same file are still returned.
+ * Each map entry is validated independently: a present-but-malformed entry is
+ * warned about and dropped, while valid sibling entries (and the other maps)
+ * survive. Mirrors the old single-slot tolerance, now per entry.
+ *
+ * Migration (N6) is read-only and in-memory: an OLD-shape file
+ * (`sourceToken`/`destinationToken`/`defaultDestination`) is folded into the new
+ * keyed maps, FILLING ONLY keys not already present (new keys win; old fields
+ * never overwrite). Salvage: an old `destinationToken` migrates to
+ * `destinationTokens[<defaultDestination>]` IFF that key is free. DROPPED (not
+ * mis-keyed): an old `destinationToken` with no `defaultDestination`; a bare old
+ * `sourceToken` (no recorded owner); a bare `defaultDestination`. Reading performs
+ * NO disk write — old fields leave disk only on the next {@link mergeConfig}.
  *
  * Warns (does not throw) if the file's permissions have been loosened so that
  * group or other can read it.
@@ -164,37 +230,55 @@ export function readConfig(): Config | null {
   const obj = parsed as Record<string, unknown>;
   const cfg: Config = {};
 
-  // Each slot is validated independently: a present-but-malformed slot is
-  // warned about and dropped, while a valid sibling slot survives.
-  if (obj.sourceToken !== undefined) {
-    if (isTokenSlot(obj.sourceToken)) {
-      cfg.sourceToken = {
-        token: obj.sourceToken.token,
-        username: obj.sourceToken.username,
-        source: obj.sourceToken.source,
-      };
-    } else {
-      warn(`Config file ${filePath} sourceToken is malformed; ignoring it.`);
+  // --- New keyed maps (each entry validated independently, keys lowercased). ---
+  if (obj.sandboxes !== undefined) {
+    const map = readKeyedMap<RepoRef>(
+      obj.sandboxes,
+      "sandboxes",
+      filePath,
+      isRepoRef,
+    );
+    if (map) {
+      cfg.sandboxes = map;
+    }
+  }
+  if (obj.destinationTokens !== undefined) {
+    const map = readKeyedMap<TokenSlot>(
+      obj.destinationTokens,
+      "destinationTokens",
+      filePath,
+      isTokenSlot,
+    );
+    if (map) {
+      cfg.destinationTokens = map;
+    }
+  }
+  if (obj.sourceTokens !== undefined) {
+    const map = readKeyedMap<TokenSlot>(
+      obj.sourceTokens,
+      "sourceTokens",
+      filePath,
+      isTokenSlot,
+    );
+    if (map) {
+      cfg.sourceTokens = map;
     }
   }
 
-  if (obj.destinationToken !== undefined) {
-    if (isTokenSlot(obj.destinationToken)) {
-      cfg.destinationToken = {
-        token: obj.destinationToken.token,
-        username: obj.destinationToken.username,
-        source: obj.destinationToken.source,
-      };
-    } else {
-      warn(
-        `Config file ${filePath} destinationToken is malformed; ignoring it.`,
-      );
-    }
-  }
+  // --- N6 migration: fold OLD single fields into the new maps (in memory). ---
+  // New keys ALWAYS win; old fields only FILL keys not already present.
 
+  // Salvage: an old defaultDestination doubles as the destination repo, so an
+  // old destinationToken migrates to destinationTokens[<defaultDestination>] IFF
+  // that key is free. A bare defaultDestination (no token) salvages nothing and
+  // is DROPPED (it is the deprecated single-slot default, not part of the new
+  // schema). A bare destinationToken (no defaultDestination) is DROPPED — we will
+  // not guess a key. This reads the RAW on-disk object, not a Config field, so it
+  // survives the removal of `defaultDestination` from the Config type.
+  let oldDefault: RepoRef | undefined;
   if (obj.defaultDestination !== undefined) {
-    if (isSavedDestination(obj.defaultDestination)) {
-      cfg.defaultDestination = {
+    if (isRepoRef(obj.defaultDestination)) {
+      oldDefault = {
         owner: obj.defaultDestination.owner,
         repo: obj.defaultDestination.repo,
       };
@@ -205,11 +289,38 @@ export function readConfig(): Config | null {
     }
   }
 
-  // A file with zero recognized fields is treated as no config at all.
+  if (obj.destinationToken !== undefined) {
+    if (isTokenSlot(obj.destinationToken)) {
+      if (oldDefault) {
+        const key = destKey(oldDefault.owner, oldDefault.repo);
+        const existing = cfg.destinationTokens ?? {};
+        if (existing[key] === undefined) {
+          existing[key] = {
+            token: obj.destinationToken.token,
+            username: obj.destinationToken.username,
+            source: obj.destinationToken.source,
+          };
+          cfg.destinationTokens = existing;
+        }
+      }
+      // else: bare old destinationToken with no defaultDestination → DROP.
+    } else {
+      warn(`Config file ${filePath} destinationToken is malformed; ignoring it.`);
+    }
+  }
+
+  // A bare old sourceToken has no recorded owner → DROP (do not mis-key it).
+  if (obj.sourceToken !== undefined && !isTokenSlot(obj.sourceToken)) {
+    warn(`Config file ${filePath} sourceToken is malformed; ignoring it.`);
+  }
+
+  // A file with zero recognized fields is treated as no config at all. A bare
+  // old defaultDestination is NOT a recognized field — it salvages nothing on its
+  // own and is not part of the new schema — so it does not keep the config alive.
   if (
-    cfg.sourceToken === undefined &&
-    cfg.destinationToken === undefined &&
-    cfg.defaultDestination === undefined
+    cfg.sandboxes === undefined &&
+    cfg.destinationTokens === undefined &&
+    cfg.sourceTokens === undefined
   ) {
     return null;
   }
@@ -235,22 +346,39 @@ export function writeConfig(cfg: Config): void {
 /**
  * Merge a partial update into the existing config (read-modify-write).
  *
- * Unlike {@link writeConfig}, which replaces the whole object, this preserves
- * fields not present in `update`: saving a `destinationToken` keeps a saved
- * `sourceToken` and `defaultDestination`, and vice versa. Re-asserts mode 0600
- * on every write, exactly as {@link writeConfig} does.
+ * N5 — merge, never replace. Each keyed map in `update` is deep-merged into the
+ * existing map so writing ONE key preserves the other keys AND their values:
+ * saving `destinationTokens[B]` leaves `destinationTokens[A]` byte-identical.
+ * Re-asserts mode 0600 on every write, exactly as {@link writeConfig}.
  */
 export function mergeConfig(update: Partial<Config>): void {
   const existing = readConfig() ?? {};
-  const merged: Config = { ...existing, ...update };
+  const merged: Config = { ...existing };
+
+  if (update.sandboxes !== undefined) {
+    merged.sandboxes = { ...(existing.sandboxes ?? {}), ...update.sandboxes };
+  }
+  if (update.destinationTokens !== undefined) {
+    merged.destinationTokens = {
+      ...(existing.destinationTokens ?? {}),
+      ...update.destinationTokens,
+    };
+  }
+  if (update.sourceTokens !== undefined) {
+    merged.sourceTokens = {
+      ...(existing.sourceTokens ?? {}),
+      ...update.sourceTokens,
+    };
+  }
+
   writeConfig(merged);
 }
 
 /**
  * Delete the config file (used by `logout`).
  *
- * Removes the whole file, including both token slots and the
- * `defaultDestination`. Tolerates an already-absent file (ENOENT).
+ * Removes the whole file, including every saved sandbox and token slot.
+ * Tolerates an already-absent file (ENOENT).
  */
 export function deleteConfig(): void {
   const filePath = configPath();

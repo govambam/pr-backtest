@@ -52,7 +52,14 @@ import {
   makeOctokit,
   verifyRepo,
 } from "./github.js";
-import { readConfig, type RepoRef, type TokenSource } from "./config.js";
+import {
+  mergeConfig,
+  readConfig,
+  sandboxKey,
+  type Config,
+  type RepoRef,
+  type TokenSource,
+} from "./config.js";
 import {
   DestinationApiError,
   DestinationArgsError,
@@ -60,7 +67,6 @@ import {
   makeConfirmCreate,
   makeMenuPrompt,
   makePrimaryFallbackPrompt,
-  makeRememberPrompt,
   makeSandboxCreator,
   makeSlugPrompt,
   resolveDestinationChoice,
@@ -74,6 +80,7 @@ import {
   makeLandingChoicePrompt,
   makeLandInSourcePrompt,
   makeSandboxNamePrompt,
+  makeScopedLandingPrompt,
   resolveAuthFirstChoice,
   type AuthFirstResolvers,
 } from "./authFirst.js";
@@ -131,6 +138,8 @@ export interface RunBacktestDeps {
   makeSandboxNamePrompt: typeof makeSandboxNamePrompt;
   /** Build the scoped-fork "Land in the original source repo? [Y/n]" prompt. */
   makeLandInSourcePrompt: typeof makeLandInSourcePrompt;
+  /** Build the scoped-fork three-option landing prompt (saved-sandbox present). */
+  makeScopedLandingPrompt: typeof makeScopedLandingPrompt;
   /** Scoped-sandbox READ-only source paste seam (the resolver's own getter). */
   sandboxReadPaste: typeof defaultGetSandboxReadPaste;
   /** Scoped-sandbox READ+WRITE destination paste seam (the resolver's own getter). */
@@ -145,7 +154,6 @@ export interface RunBacktestDeps {
   makeSandboxCreator: typeof makeSandboxCreator;
   makeMenuPrompt: typeof makeMenuPrompt;
   makeSlugPrompt: typeof makeSlugPrompt;
-  makeRememberPrompt: typeof makeRememberPrompt;
   /** Interactive "create this sandbox?" confirm seam (TTY only). */
   makeConfirmCreate: typeof makeConfirmCreate;
   /**
@@ -155,6 +163,12 @@ export interface RunBacktestDeps {
    */
   makePrimaryFallbackPrompt: typeof makePrimaryFallbackPrompt;
   readConfig: typeof readConfig;
+  /**
+   * Persist a partial config update (the chosen sandbox on success — N4). The
+   * token resolvers own their own token-slot saves; this seam is ONLY for the
+   * `sandboxes` map. Defaults to {@link mergeConfig} (merge, never replace).
+   */
+  saveConfig: (update: Partial<Config>) => void;
   getPullRequest: typeof getPullRequest;
   listPullRequestCommits: typeof listPullRequestCommits;
   getMergeBase: typeof getMergeBase;
@@ -179,6 +193,7 @@ const defaultDeps: RunBacktestDeps = {
   makeAuthOfferPrompt,
   makeLandingChoicePrompt,
   makeLandInSourcePrompt,
+  makeScopedLandingPrompt,
   makeSandboxNamePrompt,
   sandboxReadPaste: defaultGetSandboxReadPaste,
   sandboxWritePaste: defaultGetSandboxWritePaste,
@@ -189,10 +204,10 @@ const defaultDeps: RunBacktestDeps = {
   makeSandboxCreator,
   makeMenuPrompt,
   makeSlugPrompt,
-  makeRememberPrompt,
   makeConfirmCreate,
   makePrimaryFallbackPrompt,
   readConfig,
+  saveConfig: mergeConfig,
   getPullRequest,
   listPullRequestCommits,
   getMergeBase,
@@ -332,10 +347,12 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   let destOwner: string;
   let destRepo: string;
   let isSandbox: boolean;
-  // Whether to offer remember-as-default — but only on the SUCCESS path (step
-  // 13). Persisting here, before the destination is verified/created and before
-  // the run succeeds, would poison the saved default with an unusable repo.
-  let offerRemember = false;
+  // The saved sandbox for THIS source repo, if any (N7). Keyed by the lowercased
+  // source `owner/repo`. Offered as a landing option on every destination path
+  // (interactive forks + the menu) and used as the non-TTY/no-flag default. Plain
+  // config — independent of how the user later authenticates.
+  const getSavedSandbox = (): RepoRef | undefined =>
+    deps.readConfig()?.sandboxes?.[sandboxKey(source.owner, source.repo)];
   // The accepted inherited credential (interactive YES fork only); null on every
   // other path. When present it is threaded into the write/read resolvers as the
   // `getInheritedCredential` source so the inherited token is USED (no paste).
@@ -358,16 +375,18 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
         promptLandInSource: deps.makeLandInSourcePrompt(source, {
           isTTY: () => isTTY,
         }),
+        promptScopedLanding: deps.makeScopedLandingPrompt(source, {
+          isTTY: () => isTTY,
+        }),
         promptForSlug: deps.makeSlugPrompt(),
         getSandboxReadPaste: deps.sandboxReadPaste,
         getSandboxWritePaste: deps.sandboxWritePaste,
-        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+        getSavedSandbox,
       };
       const choice = await deps.resolveAuthFirstChoice(source, authResolvers);
       destOwner = choice.owner;
       destRepo = choice.repo;
       isSandbox = choice.isSandbox;
-      offerRemember = choice.offerRemember;
       inheritedCredential = choice.inheritedCredential;
       scopedSandboxPastes = choice.scopedSandboxPastes;
     } else {
@@ -377,7 +396,7 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
           sandbox: opts.sandbox,
           createSandbox: opts.createSandbox,
         }),
-        getDefaultDestination: () => deps.readConfig()?.defaultDestination,
+        getSavedSandbox,
         getIsTTY: () => isTTY,
         prompt: deps.makeMenuPrompt({ isTTY: () => isTTY }),
         promptForSlug: deps.makeSlugPrompt(),
@@ -386,7 +405,6 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
       destOwner = choice.owner;
       destRepo = choice.repo;
       isSandbox = choice.isSandbox;
-      offerRemember = choice.offerRemember;
     }
   } catch (err) {
     if (err instanceof DestinationArgsError) {
@@ -886,21 +904,30 @@ export async function runBacktest(opts: RunBacktestOptions): Promise<void> {
   openTrace.done();
   deps.cleanup(tmpDir);
 
-  // 13. Success. Offer remember-as-default ONLY now — after the PR is created and
-  //     the run has actually succeeded. This is the single place
-  //     `defaultDestination` may be persisted, so no non-success exit path (verify
+  // 13. Success. Persist the chosen sandbox for this SOURCE repo ONLY now — after
+  //     the PR is created and the run has actually succeeded (N4). This is the
+  //     single place `sandboxes` is written, so no non-success exit path (verify
   //     /create failure, read-token exit 1, git failure, decline, dup exit 4) can
   //     save a destination the run never proved usable.
   //
-  //     BOTH guards are load-bearing — do not drop `&& isSandbox`. `offerRemember`
-  //     is fixed at the choice stage (a non-default interactively-chosen Sandbox),
-  //     but `isSandbox` is recomputed above after destination resolution: a 403 →
+  //     This is AUTH-METHOD-AGNOSTIC: it fires on any successful run whose
+  //     destination is a sandbox, whether the sandbox came from the inherited
+  //     offer, the scoped/paste flow, an env-token run, or the `--sandbox` flag.
+  //     The saved sandbox is plain config, independent of authentication.
+  //
+  //     `isSandbox` is recomputed above after destination resolution: a 403 →
   //     Primary fallback settles the destination to the SOURCE and flips
-  //     `isSandbox` to false while `offerRemember` stays true. Without `&& isSandbox`
-  //     the fallback would prompt "remember <source> as your default sandbox" for
-  //     the Primary repo — wrong: the source is never a sandbox to remember.
-  if (offerRemember && isSandbox) {
-    await deps.makeRememberPrompt()({ owner: destOwner, repo: destRepo });
+  //     `isSandbox` to false, so the fallback persists nothing (N4). We also skip
+  //     the write when the same sandbox is already saved for this source (no
+  //     redundant rewrite on a reuse run).
+  if (isSandbox) {
+    const settled: RepoRef = { owner: destOwner, repo: destRepo };
+    const already = getSavedSandbox();
+    if (!(already && sameRepo(already, settled))) {
+      deps.saveConfig({
+        sandboxes: { [sandboxKey(source.owner, source.repo)]: settled },
+      });
+    }
   }
 
   // The PR URL is the final line on stdout (pipe-friendly).

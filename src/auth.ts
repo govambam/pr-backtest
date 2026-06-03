@@ -6,10 +6,13 @@
  * the need from the user's destination choice and resolves a token per capability
  * in a fixed precedence order, accepting the first candidate that VALIDATES:
  *
- *   write:  GITHUB_TOKEN env -> saved destinationToken -> interactive paste
- *   read:   GITHUB_SOURCE_TOKEN env -> saved sourceToken
+ *   write:  GITHUB_TOKEN env -> saved destinationTokens[dest] -> interactive paste
+ *   read:   GITHUB_SOURCE_TOKEN env -> saved sourceTokens[srcOwner]
  *           -> the already-resolved write token IFF it reads the source (single-PAT)
  *           -> interactive paste
+ *
+ * The "saved" step is keyed per repo (N1: keys lowercased at write and lookup),
+ * so each destination repo / source owner remembers its own token.
  *
  * Validation is the cheap, pre-write `repos.get` the tool already runs:
  *   read valid  <=> repos.get(source) succeeds.
@@ -25,9 +28,11 @@ import { Octokit } from "@octokit/rest";
 import prompts from "prompts";
 
 import {
+  destKey,
   inferTokenSource,
   mergeConfig,
   readConfig,
+  sourceKey,
   type Config,
   type RepoRef,
   type TokenSlot,
@@ -488,9 +493,9 @@ export interface ResolveWriteTokenOptions {
   makeOctokit?: MakeOctokit;
   /** Read GITHUB_TOKEN. Defaults to the process env. */
   getEnvToken?: () => string | undefined;
-  /** Read the persisted config (for the saved destinationToken slot). Defaults to {@link readConfig}. */
+  /** Read the persisted config (for the saved `destinationTokens[dest]` slot). Defaults to {@link readConfig}. */
   getConfig?: () => Config | null;
-  /** Persist the destinationToken slot on a fresh accepted paste. Defaults to {@link mergeConfig}. */
+  /** Persist the `destinationTokens[dest]` slot on a fresh accepted paste. Defaults to {@link mergeConfig}. */
   saveConfig?: (update: Partial<Config>) => void;
   /** Interactive paste getter. Defaults to the Primary/Sandbox-write copy per `isPrimary`. */
   getPaste?: (destination: RepoRef, isPrimary: boolean) => Promise<string | null>;
@@ -528,12 +533,12 @@ export interface ResolveWriteTokenOptions {
 /**
  * Resolve a DESTINATION/write token via an injected `accept` predicate.
  *
- * Precedence: `GITHUB_TOKEN` env → saved `destinationToken` → interactive paste
- * (bounded 3 attempts; Primary or Sandbox-write copy). Each
+ * Precedence: `GITHUB_TOKEN` env → saved `destinationTokens[dest]` → interactive
+ * paste (bounded 3 attempts; Primary or Sandbox-write copy). Each
  * candidate is registered with the scrubber before its first request and offered
  * to `accept`; the first accepted wins. A freshly pasted accepted token is
  * validated via `users.getAuthenticated` for its `@login` and persisted to the
- * `destinationToken` slot. When nothing is accepted: throws the underlying
+ * `destinationTokens[dest]` slot. When nothing is accepted: throws the underlying
  * {@link DestinationApiError} if every source was rejected by one (the real
  * destination problem, mapped to exit 2), otherwise throws
  * {@link NoTokenNonInteractiveError} (names `GITHUB_TOKEN`, exit 1) when there
@@ -553,9 +558,11 @@ export async function resolveWriteToken(
       primary ? defaultGetPrimaryPaste(dest) : defaultGetSandboxWritePaste(dest));
 
   const cfg = getConfig();
+  const savedSlot =
+    cfg?.destinationTokens?.[destKey(destination.owner, destination.repo)];
 
   const resolved = await resolveWithAccept(
-    [envCandidate(getEnv()), slotCandidate(cfg?.destinationToken)],
+    [envCandidate(getEnv()), slotCandidate(savedSlot)],
     accept,
     make,
     () => getPaste(destination, isPrimary),
@@ -578,10 +585,12 @@ export async function resolveWriteToken(
     login = await captureLogin(make(resolved.token));
     success(`Authenticated as @${login}`);
     saveConfig({
-      destinationToken: {
-        token: resolved.token,
-        username: login,
-        source: resolved.source,
+      destinationTokens: {
+        [destKey(destination.owner, destination.repo)]: {
+          token: resolved.token,
+          username: login,
+          source: resolved.source,
+        },
       },
     });
     success(`Token saved (mode 0600).`);
@@ -600,9 +609,9 @@ export interface ResolveReadTokenOptions {
   makeOctokit?: MakeOctokit;
   /** Read GITHUB_SOURCE_TOKEN. Defaults to the process env. */
   getEnvToken?: () => string | undefined;
-  /** Read the persisted config (for the saved sourceToken slot). Defaults to {@link readConfig}. */
+  /** Read the persisted config (for the saved `sourceTokens[srcOwner]` slot). Defaults to {@link readConfig}. */
   getConfig?: () => Config | null;
-  /** Persist the sourceToken slot on a fresh accepted paste. Defaults to {@link mergeConfig}. */
+  /** Persist the `sourceTokens[srcOwner]` slot on a fresh accepted paste. Defaults to {@link mergeConfig}. */
   saveConfig?: (update: Partial<Config>) => void;
   /** Interactive paste getter (read-only copy). Defaults to {@link defaultGetSandboxReadPaste}. */
   getPaste?: (source: RepoRef) => Promise<string | null>;
@@ -628,12 +637,12 @@ export interface ResolveReadTokenOptions {
  * Resolve a SOURCE/read token. `accept` is fixed to {@link canRead} on
  * the source — a read token is valid iff `repos.get(source)` succeeds.
  *
- * Precedence: `GITHUB_SOURCE_TOKEN` env → saved `sourceToken` → reuse the
- * already-resolved `writeToken` IFF it reads the source (single-PAT detection) →
- * interactive paste (bounded 3 attempts; read-only copy). Each
+ * Precedence: `GITHUB_SOURCE_TOKEN` env → saved `sourceTokens[srcOwner]` → reuse
+ * the already-resolved `writeToken` IFF it reads the source (single-PAT detection)
+ * → interactive paste (bounded 3 attempts; read-only copy). Each
  * candidate is registered with the scrubber before its first request. A freshly
  * pasted accepted token is validated via `users.getAuthenticated` for its
- * `@login` and persisted to the `sourceToken` slot. Throws
+ * `@login` and persisted to the `sourceTokens[srcOwner]` slot. Throws
  * {@link NoSourceTokenNonInteractiveError} (names `GITHUB_SOURCE_TOKEN`) when
  * nothing reads the source and there is no interactive path.
  */
@@ -648,6 +657,7 @@ export async function resolveReadToken(
   const getPaste = options.getPaste ?? defaultGetSandboxReadPaste;
 
   const cfg = getConfig();
+  const savedSlot = cfg?.sourceTokens?.[sourceKey(source.owner)];
   const accept: AcceptToken = (octokit) => canRead(octokit, source);
 
   // The write token is offered AFTER env + saved slot: single-PAT detection.
@@ -657,7 +667,7 @@ export async function resolveReadToken(
       : null;
 
   const resolved = await resolveWithAccept(
-    [envCandidate(getEnv()), slotCandidate(cfg?.sourceToken), writeReuse],
+    [envCandidate(getEnv()), slotCandidate(savedSlot), writeReuse],
     accept,
     make,
     () => getPaste(source),
@@ -679,10 +689,12 @@ export async function resolveReadToken(
     login = await captureLogin(make(resolved.token));
     success(`Authenticated as @${login}`);
     saveConfig({
-      sourceToken: {
-        token: resolved.token,
-        username: login,
-        source: resolved.source,
+      sourceTokens: {
+        [sourceKey(source.owner)]: {
+          token: resolved.token,
+          username: login,
+          source: resolved.source,
+        },
       },
     });
     success(`Token saved (mode 0600).`);

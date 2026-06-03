@@ -43,12 +43,13 @@ import {
 } from "../src/auth.js";
 import {
   DestinationApiError,
+  resolveDestinationChoice,
   SandboxCreateForbiddenError,
   verifyOrCreateDestination,
 } from "../src/destination.js";
 import { resolveAuthFirstChoice, sandboxCreateWarning } from "../src/authFirst.js";
 import type { InheritedCredential } from "../src/inheritedAuth.js";
-import type { RepoRef } from "../src/config.js";
+import { sandboxKey, type Config, type RepoRef } from "../src/config.js";
 import { redact, setTtyOverride, setVerbose } from "../src/log.js";
 
 /** An `Error` tagged with the exit code a stubbed `process.exit` was given. */
@@ -166,9 +167,9 @@ function makeDeps(
     makeSandboxCreator: () => async () => ({ owner: "x", repo: "y" }),
     makeMenuPrompt: () => async (rows) => rows[0]!,
     makeSlugPrompt: () => async () => ({ owner: SANDBOX_OWNER, repo: SANDBOX_REPO }),
-    makeRememberPrompt: () => async () => false,
     makeConfirmCreate: () => async () => false,
     readConfig: () => null,
+    saveConfig: () => {},
     getPullRequest: async () => {
       order.push("read-pr");
       return {
@@ -785,54 +786,52 @@ test("VAL-BRANCH-003: a CLOSED prior backtest PR does NOT block — the run proc
   assert.ok(order.includes("open-pr"), "the run reached create");
 });
 
-// --- VAL-CORR-001: remember-as-default only after a successful run ----------
+// --- VAL-MEM-001 / N4: persist the chosen sandbox on SUCCESS only -----------
 
-const REMEMBER_SANDBOX = { owner: SANDBOX_OWNER, repo: SANDBOX_REPO };
+/** The lowercased sandboxes key for the default source repo (acme/api). */
+const SOURCE_SANDBOX_KEY = sandboxKey(SOURCE_OWNER, SOURCE_REPO);
 
 /**
- * Build deps for a non-default interactive Sandbox run that flags
- * `offerRemember`, recording every remember-prompt invocation. The recorded
- * array is empty unless the orchestrator actually offers remember.
+ * Build deps for a non-default Sandbox run, recording every `saveConfig` call so
+ * a test can assert WHAT (if anything) is written to the `sandboxes` map and
+ * whether the success path was reached.
  */
-function makeRememberDeps(
+function makePersistDeps(
   overrides: Partial<RunBacktestDeps> = {},
-): { deps: Partial<RunBacktestDeps>; remembered: RepoRef[] } {
-  const remembered: RepoRef[] = [];
+): { deps: Partial<RunBacktestDeps>; saved: Partial<Config>[] } {
+  const saved: Partial<Config>[] = [];
   const { deps } = makeDeps(
     {
       resolveDestinationChoice: async () => ({
         owner: SANDBOX_OWNER,
         repo: SANDBOX_REPO,
         isSandbox: true,
-        offerRemember: true,
       }),
       // In sandbox mode the source fetch needs a read remote; keep it inert.
       addSourceRemote: async () => {},
-      makeRememberPrompt:
-        () =>
-        async (dest: RepoRef): Promise<void> => {
-          remembered.push(dest);
-        },
+      saveConfig: (update) => {
+        saved.push(update);
+      },
       ...overrides,
     },
     { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
   );
-  return { deps, remembered };
+  return { deps, saved };
 }
 
-test("VAL-CORR-001: a successful non-default Sandbox run offers remember after success", async () => {
-  const { deps, remembered } = makeRememberDeps();
+test("VAL-MEM-001: a successful Sandbox run persists sandboxes[source] via the write seam", async () => {
+  const { deps, saved } = makePersistDeps();
   const { exit } = await run({ deps });
   assert.equal(exit, 0);
   assert.deepEqual(
-    remembered,
-    [REMEMBER_SANDBOX],
-    "remember is offered exactly once, on the success path",
+    saved,
+    [{ sandboxes: { [SOURCE_SANDBOX_KEY]: { owner: SANDBOX_OWNER, repo: SANDBOX_REPO } } }],
+    "the chosen sandbox is persisted exactly once, on the success path",
   );
 });
 
-test("VAL-CORR-001: a Sandbox run that fails verify/create never offers remember", async () => {
-  const { deps, remembered } = makeRememberDeps({
+test("VAL-MEM-001: a Sandbox run that fails verify/create persists nothing", async () => {
+  const { deps, saved } = makePersistDeps({
     // The write resolver's accept rejects every candidate → terminal exit 2,
     // never reaching the success path.
     resolveWriteToken: async () => {
@@ -841,31 +840,194 @@ test("VAL-CORR-001: a Sandbox run that fails verify/create never offers remember
   });
   const { exit } = await run({ deps });
   assert.equal(exit, 2, "an unverifiable destination is exit 2");
-  assert.deepEqual(
-    remembered,
-    [],
-    "no remember/persist on a non-success exit path",
-  );
+  assert.deepEqual(saved, [], "no sandbox persisted on a non-success exit path");
 });
 
-test("VAL-CORR-001: a declined plan never offers remember", async () => {
-  const { deps, remembered } = makeRememberDeps({
+test("VAL-MEM-001: a declined plan persists nothing", async () => {
+  const { deps, saved } = makePersistDeps({
     confirmPlan: async () => false,
   });
   const { exit } = await run({ deps });
   assert.equal(exit, 0, "a decline is a clean exit 0");
-  assert.deepEqual(remembered, [], "a decline does not persist a default");
+  assert.deepEqual(saved, [], "a decline does not persist a sandbox");
 });
 
-test("VAL-CORR-001: a git failure never offers remember", async () => {
-  const { deps, remembered } = makeRememberDeps({
+test("VAL-MEM-001: a git failure persists nothing", async () => {
+  const { deps, saved } = makePersistDeps({
     pushBranchFromSha: async () => {
       throw new Error("push failed");
     },
   });
   const { exit } = await run({ deps });
   assert.equal(exit, 3, "a git failure is exit 3");
-  assert.deepEqual(remembered, [], "a git failure does not persist a default");
+  assert.deepEqual(saved, [], "a git failure does not persist a sandbox");
+});
+
+test("VAL-MEM-001: a Primary run (dest === source) persists nothing", async () => {
+  // The default makeDeps run is Primary (isSandbox false) → no sandbox to save.
+  const saved: Partial<Config>[] = [];
+  const { deps } = makeDeps({
+    saveConfig: (update) => {
+      saved.push(update);
+    },
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+  assert.deepEqual(saved, [], "a Primary destination is never persisted as a sandbox");
+});
+
+test("VAL-MEM-001: a reuse run (the same sandbox already saved) does NOT rewrite it", async () => {
+  // readConfig already returns the saved sandbox for this source → the success
+  // path skips the redundant write.
+  const { deps, saved } = makePersistDeps({
+    readConfig: () => ({
+      sandboxes: { [SOURCE_SANDBOX_KEY]: { owner: SANDBOX_OWNER, repo: SANDBOX_REPO } },
+    }),
+  });
+  const { exit } = await run({ deps });
+  assert.equal(exit, 0);
+  assert.deepEqual(saved, [], "an already-saved sandbox is not rewritten");
+});
+
+test("VAL-MEM-001: two-run round-trip — run 1 persists, run 2 reuses with zero re-entry", async () => {
+  // A shared in-memory config: run 1 (interactive inherited) saves sandboxes[X];
+  // run 2 reads it back and resolves the destination with ZERO landing/slug
+  // prompts.
+  const store: Config = {};
+  const sharedSaveConfig = (update: Partial<Config>): void => {
+    if (update.sandboxes) {
+      store.sandboxes = { ...(store.sandboxes ?? {}), ...update.sandboxes };
+    }
+  };
+  const sharedReadConfig = (): Config | null =>
+    Object.keys(store).length > 0 ? store : null;
+
+  // --- Run 1: interactive inherited new-sandbox, no saved sandbox yet. ---
+  const run1Prompts: string[] = [];
+  const { deps: deps1 } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "sandbox",
+    overrides: {
+      readConfig: sharedReadConfig,
+      saveConfig: sharedSaveConfig,
+      makeLandingChoicePrompt: () => async () => {
+        run1Prompts.push("landing");
+        return "sandbox";
+      },
+      makeSandboxNamePrompt: () => async (d) => {
+        run1Prompts.push("name");
+        return d;
+      },
+      addSourceRemote: async () => {},
+    },
+    tokenOpts: { writeToken: INHERITED_TOKEN, readToken: INHERITED_TOKEN },
+  });
+  const r1 = await withTty(() => run({ deps: deps1 }));
+  assert.equal(r1.exit, 0);
+  // Persisted under the lowercased source key, as the default <src-repo>-backtest.
+  assert.deepEqual(store.sandboxes, {
+    [SOURCE_SANDBOX_KEY]: { owner: SOURCE_OWNER, repo: `${SOURCE_REPO}-backtest` },
+  });
+
+  // --- Run 2: against the same source. The destination resolves to the saved
+  //     sandbox with ZERO landing/slug re-entry. ---
+  const run2Prompts: string[] = [];
+  const { deps: deps2 } = makeAuthFirstDeps({
+    detected: INHERITED_CRED,
+    useInherited: true,
+    landing: "saved", // the saved sandbox is offered and chosen
+    overrides: {
+      readConfig: sharedReadConfig,
+      saveConfig: sharedSaveConfig,
+      makeLandingChoicePrompt: () => async (saved) => {
+        // The saved sandbox was passed to the landing prompt (offered).
+        if (saved) run2Prompts.push(`offered:${saved.owner}/${saved.repo}`);
+        return "saved";
+      },
+      makeSlugPrompt: () => async () => {
+        run2Prompts.push("slug");
+        return { owner: "should", repo: "not-happen" };
+      },
+      makeSandboxNamePrompt: () => async (d) => {
+        run2Prompts.push("name");
+        return d;
+      },
+      addSourceRemote: async () => {},
+    },
+    tokenOpts: { writeToken: INHERITED_TOKEN, readToken: INHERITED_TOKEN },
+  });
+  const r2 = await withTty(() => run({ deps: deps2 }));
+  assert.equal(r2.exit, 0);
+  // The saved sandbox was offered; the slug/name re-entry prompts were NOT used.
+  assert.deepEqual(run2Prompts, [
+    `offered:${SOURCE_OWNER}/${SOURCE_REPO}-backtest`,
+  ]);
+});
+
+// --- VAL-MEM-004: reuse regardless of auth method + the non-TTY path ---------
+
+test("VAL-MEM-004: persist-via-inherited then reuse-via-env (non-TTY) resolves to the saved sandbox", async () => {
+  // A run that authenticates via an ENV token on the NON-TTY path (no flag) must
+  // resolve the destination to sandboxes[source] persisted by an earlier run.
+  const SAVED = { owner: "me", repo: "saved-sb" };
+  const store: Config = {
+    sandboxes: { [SOURCE_SANDBOX_KEY]: SAVED },
+  };
+  const verifyTargets: string[] = [];
+  const { deps } = makeDeps(
+    {
+      // The REAL choice resolver on the non-TTY/no-flag path reads getSavedSandbox.
+      resolveDestinationChoice,
+      readConfig: () => store,
+      saveConfig: () => {},
+      addSourceRemote: async () => {},
+      verifyOrCreateDestination: async (dest) => {
+        verifyTargets.push(`${dest.owner}/${dest.repo}`);
+        return dest;
+      },
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+  // No TTY (default), no flag → resolveDestinationChoice uses sandboxes[source].
+  const { stdout, exit } = await run({ deps });
+  assert.equal(exit, 0);
+  assert.equal(stdout, CREATED_URL + "\n");
+  // The destination verified/created was the SAVED sandbox, not the source.
+  assert.ok(
+    verifyTargets.includes(`${SAVED.owner}/${SAVED.repo}`),
+    "the destination resolved to the saved sandbox on the non-TTY/no-flag path",
+  );
+});
+
+test("VAL-MEM-004: --sandbox flag overrides the saved sandbox", async () => {
+  const SAVED = { owner: "me", repo: "saved-sb" };
+  const FLAG = { owner: "you", repo: "flag-sb" };
+  const store: Config = { sandboxes: { [SOURCE_SANDBOX_KEY]: SAVED } };
+  const verifyTargets: string[] = [];
+  const { deps } = makeDeps(
+    {
+      resolveDestinationChoice,
+      readConfig: () => store,
+      saveConfig: () => {},
+      addSourceRemote: async () => {},
+      verifyOrCreateDestination: async (dest) => {
+        verifyTargets.push(`${dest.owner}/${dest.repo}`);
+        return dest;
+      },
+    },
+    { writeToken: WRITE_TOKEN, readToken: READ_TOKEN },
+  );
+  const { exit } = await run({ deps, sandbox: `${FLAG.owner}/${FLAG.repo}` });
+  assert.equal(exit, 0);
+  assert.ok(
+    verifyTargets.includes(`${FLAG.owner}/${FLAG.repo}`),
+    "the --sandbox flag value overrides the saved sandbox",
+  );
+  assert.ok(
+    !verifyTargets.includes(`${SAVED.owner}/${SAVED.repo}`),
+    "the saved sandbox is NOT used when --sandbox is passed",
+  );
 });
 
 // --- VAL-BRANCH-004: 422 backstop -------------------------------------------
@@ -2404,28 +2566,27 @@ test("VAL-CREATE-004: 403 + ACCEPT → destination becomes the source; confirmPl
   assert.equal(creates.length, 1, "the creator was attempted exactly once");
 });
 
-test("VAL-CREATE-004: 403 + ACCEPT (Primary fallback) does NOT offer remember-as-default for the source repo", async () => {
+test("VAL-MEM-001 / N4: 403 + ACCEPT (Primary fallback) persists NO sandbox for the source repo", async () => {
   // Regression for the Macroscope finding: a 403 → Primary fallback recomputes
-  // `isSandbox` to false (dest === source) while `offerRemember` stays true from
-  // the choice stage. The remember prompt is gated on BOTH, so a Primary
-  // destination must NEVER be offered as a "default sandbox". Dropping the
-  // `&& isSandbox` guard at the success path makes this fail.
-  const remembered: RepoRef[] = [];
+  // `isSandbox` to false (dest === source). The success-path persist is gated on
+  // `isSandbox`, so a Primary destination must NEVER be saved as a sandbox.
+  // Dropping the `isSandbox` guard at the success path makes this fail.
+  const saved: Partial<Config>[] = [];
   const { deps } = makeInheritedSandboxDeps({
     createOutcome: "403",
     fallback: "accept",
     overrides: {
-      makeRememberPrompt: () => async (dest: RepoRef): Promise<void> => {
-        remembered.push(dest);
+      saveConfig: (update) => {
+        saved.push(update);
       },
     },
   });
   const { exit } = await withTty(() => run({ deps }));
   assert.equal(exit, 0, "the run proceeds to success after the Primary fallback");
   assert.deepEqual(
-    remembered,
+    saved,
     [],
-    "the source (Primary) repo is never offered as a default sandbox after a 403 fallback",
+    "the source (Primary) repo is never persisted as a sandbox after a 403 fallback",
   );
 });
 
@@ -2467,7 +2628,6 @@ test("VAL-CREATE-004: non-interactive --create-sandbox 403 → exit 2 (unchanged
       owner: SANDBOX_OWNER,
       repo: SANDBOX_REPO,
       isSandbox: true,
-      offerRemember: false,
     }),
     verifyRepo: async () => ({ exists: false, canPush: false }),
     makeSandboxCreator: () => async (req) => {
