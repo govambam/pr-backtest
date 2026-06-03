@@ -10,6 +10,111 @@ Recreate a GitHub pull request — all of its commits — so a PR-review bot can
 
 Node.js `>=18` and a `git` binary on your `PATH` (the tool shells out to `git` for clone/fetch/push).
 
+## Quickstart
+
+Recreate your first PR end to end and have a review bot review the result, in a few minutes. This section is self-contained — you don't need the rest of the README to finish it.
+
+The shape is always the same: pr-backtest reads a PR from its **source** repo and writes a fresh "backtest" PR into a **destination** repo. That destination is where the review bot (Macroscope) reviews it. The two decisions you make are *how to authenticate* and *which repo is the destination*.
+
+### 1. Install the CLI
+
+```bash
+git clone https://github.com/govambam/pr-backtest.git
+cd pr-backtest
+npm install        # install dependencies
+npm install -g .   # build and install the `pr-backtest` command globally
+```
+
+Check it: `pr-backtest --version`. To update later, run `npm run update` from this folder — it always installs the latest `main` and prints the commit it installed.
+
+### 2. Pick your path
+
+| Path | Use it when | Trade-off |
+|---|---|---|
+| **A — Your GitHub login** | You just want to try it on your own machine | Easiest, nothing to create; acts with your full GitHub permissions; needs an interactive terminal |
+| **B — Scoped tokens → sandbox repo** | Backtesting a PR you don't own (a company repo) without touching it | The source repo is only ever read; you create a throwaway repo and (optionally) use two tokens |
+| **B — Scoped tokens → source repo** | The PR is in a repo you own and don't mind writing to | One token, the backtest sits next to the original PR — but it writes branches + a PR into the real repo |
+
+The **destination** is the sandbox in the sandbox paths, and the PR's own repo in the source path.
+
+### 3. Connect Macroscope to your destination repo
+
+Macroscope reviews the backtest PR in whatever repo it lands in, so connect it to your **destination** repo. Connect it *before* you run so the correctness check fires automatically when the PR opens.
+
+1. If you haven't already, install the Macroscope GitHub app and give it access to your destination repo.
+2. Enable **correctness checks** on that repo in your Macroscope settings: `https://app.macroscope.com/<your-org>/settings#Repos` (for example `https://app.macroscope.com/govambam/settings#Repos`).
+
+**Order matters for a sandbox:** the repo must exist before Macroscope can see it. So **create the sandbox first → enable correctness on it → then run pr-backtest.** If you let pr-backtest auto-create the sandbox (Path A), the repo won't exist until after the run; enable correctness on the new repo afterward and trigger the review by hand.
+
+**To trigger a review at any time**, comment on the backtest PR:
+
+```
+@macroscope-app review
+```
+
+### 4. Run it
+
+#### Path A — your existing GitHub login (easiest)
+
+pr-backtest uses the GitHub credential your terminal already has (via `git` / the `gh` CLI) — no tokens to create. It needs an interactive terminal and acts with your account's full permissions. To create a sandbox inside an org, your account must be allowed to create repos there.
+
+```bash
+pr-backtest https://github.com/OWNER/REPO/pull/NUMBER
+```
+
+Then:
+
+1. **Use your existing GitHub login? [Y/n]** → `y`.
+2. **Where should the backtest PR land?**
+   - **A new sandbox repo** — pr-backtest creates a private `OWNER/REPO-backtest` (you can rename it) and only ever *reads* the source. To have Macroscope review it automatically, pre-create that repo and connect Macroscope first (step 3), then type its name here — pr-backtest reuses an existing repo it can write to. Otherwise let it create the repo and trigger the review with a comment afterward.
+   - **Original repo** — the branches and backtest PR go into the PR's own repo.
+3. Confirm the printed plan (it shows `Head:` / `Base:` and the commit count).
+4. pr-backtest prints the new PR's URL.
+
+#### Path B — scoped tokens
+
+You pass tokens explicitly via environment variables. No inherited login, works non-interactively (CI), and lets you grant the least privilege needed. Create fine-grained tokens at <https://github.com/settings/personal-access-tokens/new>.
+
+**Sandbox repo (recommended for PRs you don't own).** A separate private repo you control; the source repo is only ever read.
+
+- **Pros:** the original repo is never written to; review noise is isolated in the sandbox; the source token can be scoped read-only, so writing to the source is impossible by scope.
+- **Cons:** you create the sandbox yourself; the backtest PR lives in a different repo than the original.
+
+```bash
+# 1. Create a private sandbox repo on GitHub, e.g. you/pr-backtest-sandbox
+# 2. Connect Macroscope to it (step 3)
+# 3. Create two tokens:
+#      SOURCE (read-only): Contents: Read, Pull requests: Read, Metadata: Read   — on the source repo
+#      DEST   (read+write): Contents: R/W, Pull requests: R/W, Metadata: Read     — on the sandbox
+# 4. Run:
+GITHUB_SOURCE_TOKEN=<source-read-token> \
+GITHUB_TOKEN=<dest-write-token> \
+  pr-backtest https://github.com/OWNER/REPO/pull/NUMBER --sandbox you/pr-backtest-sandbox
+```
+
+If a single token can both read the source and write the sandbox, drop `GITHUB_SOURCE_TOKEN` and pass only `GITHUB_TOKEN` — pr-backtest detects that one token covers both. (Add `--create-sandbox` to have pr-backtest create the repo if it's missing; the destination token then also needs repo-creation rights, and you'll connect Macroscope after the run.)
+
+**Original (source) repo.** The branches and backtest PR land in the PR's own repo. This is `--primary`.
+
+- **Pros:** simplest — one token, no extra repo, and the backtest sits right next to the original PR.
+- **Cons:** it writes to the real repo (a new branch pair and a PR), which can notify teammates and trigger CI. Use only on a repo you own and don't mind writing to.
+
+```bash
+# 1. Connect Macroscope to the source repo (step 3)
+# 2. Create one token with Contents: R/W + Pull requests: R/W + Metadata: Read on the repo
+# 3. Run:
+GITHUB_TOKEN=<token> pr-backtest https://github.com/OWNER/REPO/pull/NUMBER --primary
+```
+
+### 5. Read the review
+
+pr-backtest prints the backtest PR's URL. Open it:
+
+- If Macroscope was connected before the PR opened, its correctness check runs automatically.
+- Otherwise, enable correctness on the destination repo (step 3) and comment `@macroscope-app review` on the PR to start it.
+
+That's a full backtest: you replayed a PR at its original state and had a bot review it. Everything below — saved tokens, the `--commit` cutoff, the activity trace, exit codes — is detail you can reach for later.
+
 ## Install
 
 ```bash
