@@ -12,7 +12,7 @@ Node.js `>=18` and a `git` binary on your `PATH` (the tool shells out to `git` f
 
 ## Quickstart
 
-Recreate your first PR end to end and have a review bot review the result, in a few minutes. This section is self-contained — you don't need the rest of the README to finish it.
+Recreate your first PR end to end and have a review bot review the result, in a few minutes.
 
 The shape is always the same: pr-backtest reads a PR from its **source** repo and writes a fresh "backtest" PR into a **destination** repo. That destination is where the review bot (Macroscope) reviews it. The two decisions you make are *how to authenticate* and *which repo is the destination*.
 
