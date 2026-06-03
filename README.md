@@ -140,9 +140,9 @@ npm run reinstall  # rebuild dist/ and reinstall globally from the current branc
 
 ## Setup
 
-There is no separate setup step. **In a terminal the tool asks about your GitHub login first**, then asks where the backtest PR lands — see [Guided setup](#guided-setup-auth-first) below. Only then does it resolve the exact token(s) the chosen destination needs. The source is only ever *read* for a Sandbox; see [Destination](#destination).
+There is no separate setup step — pr-backtest resolves credentials inside the run. This section is the reference for how: the interactive prompts, the two environment variables, and where tokens are saved. For a first run, follow the [Quickstart](#quickstart) instead.
 
-A backtest needs exactly two capabilities: **read** the source and **write** the destination. One token may provide both, or you may split them across two; the tool detects which you gave.
+A backtest needs two capabilities — **read** the source and **write** the destination. One token may provide both, or you may split them across two; the tool detects which you gave.
 
 ### Guided setup (auth-first)
 
@@ -235,7 +235,7 @@ cutoff.
 | `pr-backtest status` | Print the saved per-repo sandboxes and the source/destination token logins + types. Never prints a token value; makes no network call. |
 | `pr-backtest logout` | Delete the saved config (all token slots and any saved per-repo sandboxes). |
 
-On first run in a terminal it offers your existing GitHub login, then asks where the backtest PR lands (see [Guided setup](#guided-setup-auth-first)) and resolves the token(s) that destination needs. The new PR's URL is printed to stdout. `pr-backtest status` shows what is saved:
+`pr-backtest status` shows what's saved:
 
 ```
 $ pr-backtest status
@@ -247,30 +247,7 @@ Destination tokens:
   octocat/api-backtest → @octocat · classic
 ```
 
-Each section reads `none saved` when nothing is stored for it. Sandboxes are keyed per source repo, source tokens per source owner, and destination tokens per destination repo. Run `pr-backtest logout` to remove the saved tokens (this also deletes the saved per-repo sandboxes — see [Destination](#destination)).
-
-Running against a **Primary** destination (the PR's own repo) prints a plan like this:
-
-```
-$ pr-backtest https://github.com/acme/api/pull/123 --primary
-
-PR:      acme/api#123 "Add retry logic to webhook handler" by @stevem
-Head:    a1b2c3d (PR head — 7 commits)
-Base:    f0e9d8c (merge-base with main)
-
-Plan:
-  1. Clone acme/api into a temp directory
-  2. Fetch commits a1b2c3d and f0e9d8c from origin
-  3. Push f0e9d8c → acme/api:backtest-pr123-a1b2c3d-base
-  4. Push a1b2c3d → acme/api:backtest-pr123-a1b2c3d-head
-  5. Open PR in acme/api: backtest-pr123-a1b2c3d-head → backtest-pr123-a1b2c3d-base
-
-Continue? [y/N] y
-
-https://github.com/acme/api/pull/451
-```
-
-A **Sandbox** destination reads the PR from its own repo but writes everything to the repo you choose. The source is tagged `(read-only)` and the write target is named on an `Into:` line:
+Before any writes, pr-backtest prints the plan and asks to confirm. A Sandbox run reads the PR from its own repo, writes everything to your chosen repo, and tags the source `(read-only)`:
 
 ```
 $ pr-backtest https://github.com/acme/api/pull/123 --sandbox myuser/pr-backtest-sandbox
@@ -337,48 +314,18 @@ To recreate the backtest, **close that PR and re-run** — a *closed* prior back
 
 ## Live activity trace
 
-pr-backtest shows each operation as it runs, so you can watch that it only ever **reads** the source PR, only **writes** the destination you chose, and only talks to `api.github.com`.
+pr-backtest prints each step as it runs — a `✓` line for auth, read PR, clone, fetch, push, and open PR — so you can watch that it only **reads** the source, only **writes** your chosen destination, and only talks to `api.github.com`. Everything goes to **stderr**; stdout stays exactly the final PR URL, so `pr-backtest … | pbcopy` works. On a terminal, slow steps (clone/fetch/push) show an in-progress line that's overwritten on completion.
 
-**Default view.** Each operation prints a friendly `✓` completion marker as it finishes (a sandbox run, which also shows the `source` remote step):
-
-```
-✓ Authenticated as @octocat
-✓ Verified destination  github.com/octocat/pr-backtest-sandbox
-✓ Read PR github.com/acme/api#123  "Add retry logic to webhook handler"
-✓ Cloning github.com/octocat/pr-backtest-sandbox
-✓ Adding source remote github.com/acme/api
-✓ Fetching f0e9d8c from source
-✓ Fetching a1b2c3d from source
-✓ Pushing f0e9d8c → backtest-pr123-a1b2c3d-base
-✓ Pushing a1b2c3d → backtest-pr123-a1b2c3d-head
-✓ Opened backtest PR
-✓ Backtest PR created.
-```
-
-On a terminal, a slow step (clone/fetch/push) first shows an in-progress line that is replaced in place by its completion line; piped to a file, only the completion line is written. All of this goes to **stderr** — stdout stays exactly the final PR URL, so `pr-backtest … | pbcopy` still works.
-
-**`--verbose`.** Add `--verbose` to also see, in real time, one dim line per **GitHub API request** and per **git command**, each with method/path (or argv) and an elapsed time:
-
-```bash
-pr-backtest https://github.com/acme/api/pull/123 --verbose
-```
+Add `--verbose` to also print one line per GitHub API request and per git command, with method/path (or argv) and timing:
 
 ```
-→ GET   /repos/acme/api/pulls/123  200  142ms
-$ git clone --no-checkout https://x-access-token@github.com/octocat/pr-backtest-sandbox.git <tmp>/repo  1100ms
-$ git remote add source https://x-access-token@github.com/acme/api.git  18ms
-$ git fetch source f0e9d8c  312ms
-$ git fetch source a1b2c3d  298ms
-$ git push origin f0e9d8c:refs/heads/backtest-pr123-a1b2c3d-base  640ms
+→ GET  /repos/acme/api/pulls/123  200  142ms
+$ git clone --no-checkout https://x-access-token@github.com/octocat/sandbox.git <tmp>/repo  1100ms
 $ git push origin a1b2c3d:refs/heads/backtest-pr123-a1b2c3d-head  635ms
-→ POST  /repos/octocat/pr-backtest-sandbox/pulls  201  301ms
+→ POST /repos/octocat/sandbox/pulls  201  301ms
 ```
 
-Each git command shows the real argv (the token never appears — see below); each API line shows method, path, status, and elapsed time.
-
-`--verbose` is off by default and has no short alias (`-v` is `--version`).
-
-**The displayed git commands are real, and they carry no token.** The `x-access-token@` in the clone URL is only a non-secret username — the token reaches git through `GIT_ASKPASS`, never the URL or the command line, so the output is safe to share. See [Security](#security) for how that (and the redaction net behind it) is enforced.
+The `x-access-token@` in those URLs is only a non-secret username — the token reaches git through `GIT_ASKPASS`, never the URL or the argv, so the output is safe to share (see [Security](#security)). Verbose has no short alias (`-v` is `--version`).
 
 ## Recommendations
 
