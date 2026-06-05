@@ -6,7 +6,7 @@ Recreate a GitHub pull request — all of its commits — so a PR-review bot can
 
 > **Just want a quick one-off?** If you only need to recreate a PR as a temporary PR in **its own repo**, and you already use `git` + the [`gh` CLI](https://cli.github.com), you don't need to install anything — a single shell script does it: **[pr-backtest-script](https://github.com/govambam/pr-backtest-script)**.
 >
-> Use this full CLI when you need to backtest a repo you **don't own** without writing to it — it lands the PR in a separate **sandbox** repo and reads the source through a scoped, read-only token, so the source can't be written even by accident. Everything else, including replaying a PR *as it was opened* or up to a chosen commit, the script handles.
+> Use this full CLI when you need to backtest a repo you **don't own** without writing to it — it lands the PR in a separate **sandbox** repo and reads the source through a scoped, read-only token, so the source can't be written even by accident — or to replay a PR **as it was originally opened** rather than the full PR. The script handles the full PR, or a cutoff at a commit you name.
 
 **Security:** pr-backtest only ever talks to GitHub — `api.github.com` and `github.com`, nothing else. No telemetry, no analytics, no third-party calls. Your token stays on your machine (read from `GITHUB_TOKEN` / `GITHUB_SOURCE_TOKEN`, or saved locally with `0600` permissions) and is never sent anywhere except GitHub. See [Security](#security) for the data flow and where each guarantee is enforced.
 
